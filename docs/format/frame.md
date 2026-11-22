@@ -697,7 +697,10 @@ branches, and a reload over an overwritten copy), 40/40 after. A third unseen se
 through the graph planners, also when it has only convs and pools): the outputs come from `common.net_outputs`
 (lowered.json's npu_outputs), `exec_order` takes them all, each output's UNFLATTEN and data node take their two
 positions, one output group per output with its read-back and OT vector (`plan["outputs"]`, each with `v_out` and
-`layer`; `intrinsics()` writes each group's own vector). Tiling inside the graph (6.11) works unchanged under heads
+`layer`; `intrinsics()` writes each group's own vector). `npunet.py lower --output T [--output T2 ...]` cuts a TFLite
+or npu-net/1 model at those tensors (`tflite_cut`, `graph_cut`: only the ops they need), so a detector's heads become
+the outputs and its reshapes, concatenations and post-process stay on the CPU (one `--output`: the single-output
+path). Tiling inside the graph (6.11) works unchanged under heads
 (o-tiled-stem: a tiled stride-2 stem under two heads; the SSD model at 300 px: its first conv in 2 row tiles; both
 exact). Refused: an output whose read-back NPUC cuts in rows (o-tiled-head, a 96x96x64 head NPUC tiles;
 o-big-readback, a 128x128x40 1x1 head: a tiled read-back in a graph, as for one output; `tests/regress.sh` knows these

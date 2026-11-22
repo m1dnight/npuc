@@ -3,6 +3,7 @@
 Python 3: no numpy, no flatbuffers package (a minimal FlatBuffer reader and writer are below).
 
   npunet.py lower <model.tflite|net.json> <dir> [--quant 1|3] [--allow-none] [--fold-per-channel]
+                  [--output TENSOR]...   (cut the model at those tensors: one, or several outputs; tflite_cut)
         the model as the NPU will compute it: <dir>/lowered.json (every parameter explicit) and <dir>/net.npuc (the
         phone's compiler harness input, oracle/harness/npuc-net.cpp)
   npunet.py ref <lowered.json> <input.bin> <output.bin>        the CPU reference: the model's output bytes (several
@@ -402,14 +403,91 @@ def _ints(data, dtype):
     return list(struct.unpack("<%d%s" % (n, fmt), data[:n * struct.calcsize(fmt)]))
 
 
+def _cut_list(output):
+    """--output's value(s): one tensor (an index or an exact name) or a list of them"""
+    return list(output) if isinstance(output, (list, tuple)) else [output]
+
+
+def tflite_cut(tf, output):
+    """the model cut at one or several tensors (each an index or an exact name; --output TENSOR, repeatable): those
+    tensors its outputs, in that order, only the ops they need kept (the NPU part of a model whose tail runs on the
+    CPU: a detector's box and class heads before its reshapes, concatenations and post-process). One tensor: that
+    tensor the model's only output (the single-output path); several: the model's outputs, which NPUC must see as
+    tensors no op reads (lower() checks, docs/format/frame.md 12)"""
+    T = tf["tensors"]
+    outs = []
+    for o in _cut_list(output):
+        if isinstance(o, str) and not o.isdigit():
+            idx = [i for i, t in enumerate(T) if t["name"] == o]
+            if len(idx) != 1:
+                raise Refused("--output %r: %d tensors of that name" % (o, len(idx)))
+            o = idx[0]
+        outs.append(int(o))
+    if len(set(outs)) != len(outs):
+        raise Refused("--output names a tensor twice")
+    prod = {o["outputs"][0]: k for k, o in enumerate(tf["ops"]) if o["outputs"]}
+    need, todo = set(), []
+    for o in outs:
+        if o not in prod:
+            raise Refused("--output %d: no op writes tensor %d" % (o, o))
+        todo.append(o)
+    while todo:
+        t = todo.pop()
+        k = prod.get(t)
+        if k is not None and k not in need:
+            need.add(k)
+            todo += [i for i in tf["ops"][k]["inputs"] if i >= 0]
+    return dict(tf, ops=[o for k, o in enumerate(tf["ops"]) if k in need], outputs=outs)
+
+
+def graph_cut(g, output):
+    """an npu-net/1 graph cut at one or several tensors (a layer's "name" or "id"; --output): the layers they need,
+    every input made explicit; several tensors become its "outputs" (tflite_cut's rule)"""
+    io = g["input"]
+    ref = {str(io.get("id") or io.get("name") or "input"): None}
+    layers, prev = [], None
+    for i, L in enumerate(g["layers"]):
+        L = dict(L)
+        key = str(L.get("id") or L.get("name") or "#%d" % (i + 1))
+        if "input" not in L and "inputs" not in L:
+            if prev is not None and prev.startswith("#"):
+                raise Refused("--output on an npu-net/1 graph: layer %d reads an unnamed layer" % (i + 1))
+            L["input"] = prev if prev is not None else str(io.get("id") or io.get("name") or "input")
+        layers.append(L)
+        for r in (L.get("name"), L.get("id")):
+            if r is not None:
+                ref[str(r)] = len(layers) - 1
+        prev = key
+    outs = [str(o) for o in _cut_list(output)]
+    if len(set(outs)) != len(outs):
+        raise Refused("--output names a tensor twice")
+    need, todo = set(), []
+    for o in outs:
+        if ref.get(o) is None:
+            raise Refused("--output %r: no layer writes it" % o)
+        todo.append(ref[o])
+    while todo:
+        k = todo.pop()
+        if k is None or k in need:
+            continue
+        need.add(k)
+        L = layers[k]
+        todo += [ref.get(str(r)) for r in (L["inputs"] if "inputs" in L else [L["input"]])]
+    h = dict(g, layers=[L for k, L in enumerate(layers) if k in need])
+    h.pop("outputs", None)
+    if len(outs) > 1:
+        h["outputs"] = outs
+    return h
+
+
 def tflite_to_graph(tf, src):
     """TFLite (subgraph 0) -> our graph JSON ("npu-net/1"), unchanged values. Every layer gets "id" = "t<index>" of
     its output tensor and "inputs" = the ids it reads (TFLite's own tensor names may be empty or repeat); its "name"
     stays the tensor's name (the lowered layer's name comes from it)."""
     T = tf["tensors"]
     if len(tf["inputs"]) != 1 or not tf["outputs"]:
-        raise Refused("%d inputs, %d outputs (one input and at least one output are supported)"
-                      % (len(tf["inputs"]), len(tf["outputs"])))
+        raise Refused("%d inputs, %d outputs (one input and at least one output are supported; --output TENSOR cuts "
+                      "the model at one or several tensors)" % (len(tf["inputs"]), len(tf["outputs"])))
     tin = T[tf["inputs"][0]]
     if tin["dtype"] not in ("int8", "uint8"):
         raise Refused("input %r is %s (a quantized int8 or uint8 input is needed; float models are not supported)" % (tin["name"], tin["dtype"]))
@@ -1531,17 +1609,21 @@ def npuc_text(low):
     return "\n".join(out) + "\n"
 
 
-def load_model(path, quant=1, fold=False, allow_none=False):
-    """a TFLite file or an npu-net/1 JSON -> lowered.json's dict (lower())"""
+def load_model(path, quant=1, fold=False, allow_none=False, output=None):
+    """a TFLite file or an npu-net/1 JSON -> lowered.json's dict (lower()); output: cut the model at that tensor, or
+    at each tensor of a list (--output, repeatable: tflite_cut, graph_cut)"""
     data = open(path, "rb").read()
     tfl = is_tflite(data) and not data.lstrip()[:1] == b"{"
     if tfl:
-        g = tflite_to_graph(read_tflite(data), path)
+        tf = read_tflite(data)
+        g = tflite_to_graph(tflite_cut(tf, output) if output is not None else tf, path)
     else:
         try:
             g = json.loads(data)
         except ValueError:
             raise Refused("%s is neither a TFLite file nor JSON" % path)
+        if output is not None:
+            g = graph_cut(g, output)
     low = lower(g, quant=quant, fold=fold, allow_none=allow_none)
     low["source"] = {"path": os.path.basename(path), "sha256": hashlib.sha256(data).hexdigest(),
                      "kind": "tflite" if tfl else "npu-net/1 json"}
@@ -2596,6 +2678,25 @@ def selftest_outputs():
     ok.append(("outputs: the TFLite form (3 subgraph outputs) lowers to the same network",
                npuc_text(l2).split("\n", 2)[2] == t.split("\n", 2)[2] and [o["name"] for o in l2["outputs"]] ==
                ["ha", "hb", "hc"]))
+    # --output: a model cut at its heads (the CPU tail left out), one or several tensors, TFLite or npu-net/1
+    gt = json.loads(json.dumps(g))
+    gt["layers"].append({"op": "reshape", "name": "ra", "input": "ha", "shape": [1, 16 * 16 * 8]})
+    gt["outputs"] = ["ra", "hb", "hc"]
+    tf = read_tflite(graph_to_tflite(gt))
+    names = {t["name"]: i for i, t in enumerate(tf["tensors"])}
+    c2 = tflite_cut(tf, ["ha", "hb", "hc"])
+    l2c = lower(tflite_to_graph(c2, "heads.tflite"), quant=3)
+    ok.append(("--output ha --output hb --output hc: the reshape dropped, three outputs as the JSON's",
+               c2["outputs"] == [names["ha"], names["hb"], names["hc"]] and "reshape" not in [o["op"] for o in c2["ops"]]
+               and npuc_text(l2c).split("\n", 2)[2] == t.split("\n", 2)[2]))
+    c1 = tflite_cut(tf, "ha")
+    ok.append(("--output ha: one output, only the ops it needs (camera's single-tensor cut)",
+               c1["outputs"] == [names["ha"]] and len(c1["ops"]) == 2 and "outputs" not in lower(tflite_to_graph(c1, "a"))))
+    ok.append(("--output f --output ha refused (f is read by ha: NPUC outputs only unread tensors)",
+               "also read by a layer" in _refusal(lambda: lower(tflite_to_graph(tflite_cut(tf, ["f", "ha"]), "a")))))
+    gj = graph_cut(gt, ["ha", "hb", "hc"])
+    ok.append(("--output on an npu-net/1 graph: the same three outputs", npuc_text(lower(gj, quant=3)).split("\n", 2)[2]
+               == t.split("\n", 2)[2] and "ra" not in [L["name"] for L in gj["layers"]]))
     # the NCP side: one OT_FMAP per output in NPUC's order; the OFMs back to the model's outputs
     ncp = _synthetic_ncp_outputs((8, 16, 16), [(6, 8, 8), (12, 16, 16), (8, 16, 16)])
     lay = ncp_layout(low, ncp)
@@ -3113,7 +3214,7 @@ def _selftest_strides():
 # ---- commands -------------------------------------------------------------------------------------------------------
 def cmd_lower(a):
     """lowered.json and net.npuc for a model, and a line per layer"""
-    low = load_model(a.model, a.quant, a.fold_per_channel, a.allow_none)
+    low = load_model(a.model, a.quant, a.fold_per_channel, a.allow_none, a.output)
     os.makedirs(a.dir, exist_ok=True)
     json.dump(low, open(os.path.join(a.dir, "lowered.json"), "w"), indent=1)
     open(os.path.join(a.dir, "net.npuc"), "w").write(npuc_text(low))
@@ -3234,6 +3335,9 @@ def main(argv=None):
     p.add_argument("--quant", type=int, default=1)
     p.add_argument("--fold-per-channel", action="store_true")
     p.add_argument("--allow-none", action="store_true")
+    p.add_argument("--output", action="append", metavar="TENSOR",
+                   help="cut the model at this tensor (an index or a name; repeat it for several outputs: a detector's "
+                        "heads, its post-process left to the CPU)")
     p.set_defaults(fn=cmd_lower)
     for name, fn, args in (("ref", cmd_ref, ("lowered", "input", "output")),
                            ("layout", cmd_layout, ("lowered", "ncp", "layout")),
