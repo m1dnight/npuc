@@ -6,8 +6,8 @@ int8 distribution and per-layer scales that keep every activation inside its ran
 
   zoo.py list [--md] [model...]              the models: task, input, ops, quantisation, adaptations
   zoo.py write <dir> [--no-tflite] [model...]
-        <dir>/<model>.json (npu-net/1, ncpgen/npunet.py) and <dir>/<model>.tflite where npunet's graph_to_tflite
-        can write it (kept only when the TFLite lowers to the same network as the JSON)
+        <dir>/<model>.json (npu-net/1, ncpgen/npunet.py) and <dir>/<model>.tflite (npunet's graph_to_tflite; kept
+        only when npunet lowers the TFLite to the same lowered network as the JSON: "tflite: ok")
   zoo.py compile [--jobs N] [model...]
         each model into $NCPGEN_WORK/sweep/zoo/<model>/ (default work/sweep/zoo): model.json, npunet lower + NPUC
         (oracle/npuc-local.sh: lowered.json, net.npuc, net.ncp, log.txt), then npunet.py ref on a seeded random
@@ -802,30 +802,30 @@ def ops_summary(g):
 
 
 # ---- write --------------------------------------------------------------------------------------------------------
-TFLITE_OPS = ("conv2d", "depthwise_conv2d", "max_pool2d", "add", "concat", "relu")  # what npunet.graph_to_tflite writes
-
-
-def _strip(low):
-    """a lowered network without its names, for comparing two lowerings of the same model"""
-    keep = [{k: v for k, v in l.items() if k not in ("name", "src_name", "input", "inputs")} for l in low["layers"]]
-    return json.dumps([keep, low["cpu_tail"], low["output"]], sort_keys=True)
+def _same_lowering(a, b):
+    """two lowerings of one model (lower() of its JSON and of its TFLite) are the same network: every field but the
+    network's name"""
+    return {k: v for k, v in a.items() if k != "name"} == {k: v for k, v in b.items() if k != "name"}
 
 
 def tflite_for(g, n):
-    """the model as TFLite through npunet.graph_to_tflite, or (None, why)"""
-    bad = sorted({L["op"] for L in g["layers"] if L["op"] not in TFLITE_OPS})
-    if bad:
-        return None, "graph_to_tflite does not write %s" % ", ".join(bad)
-    if any(L["op"] == "max_pool2d" and (L.get("padding") != "valid") for L in g["layers"]):
-        return None, "graph_to_tflite writes every max pool as VALID"
+    """the model as TFLite through npunet.graph_to_tflite, or (None, why): kept only when npunet lowers the TFLite to
+    the same lowered network as the JSON (or refuses both the same way)"""
     try:
         tfl = npunet.graph_to_tflite(g)
-        q = n.quant
-        a = npunet.lower(g, quant=q, allow_none=n.none)
-        b = npunet.lower(npunet.tflite_to_graph(npunet.read_tflite(tfl), "model.tflite"), quant=q, allow_none=n.none)
     except npunet.Refused as e:
-        return None, "round trip: %s" % e
-    if _strip(a) != _strip(b):
+        return None, "graph_to_tflite: %s" % e
+    q = n.quant
+    res = []
+    for src in (lambda: g, lambda: npunet.tflite_to_graph(npunet.read_tflite(tfl), "model.tflite")):
+        try:
+            res.append(npunet.lower(src(), quant=q, allow_none=n.none))
+        except npunet.Refused as e:
+            res.append("refused: %s" % e)
+    if isinstance(res[0], str) or isinstance(res[1], str):
+        return (tfl, "ok (both refused)") if res[0] == res[1] else (None, "round trip: %s / %s" % tuple(
+            r if isinstance(r, str) else "lowered" for r in res))
+    if not _same_lowering(*res):
         return None, "round trip: the TFLite lowers to another network"
     return tfl, "ok"
 

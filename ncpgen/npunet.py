@@ -1714,8 +1714,12 @@ def example_graph():
 
 
 def graph_to_tflite(g):
-    """our graph JSON -> a TFLite flatbuffer (the subset above: conv2d, max_pool2d, add, concat, relu; inputs by name
-    as lower() reads them), written by FWriter"""
+    """our graph JSON -> a TFLite flatbuffer, written by FWriter: CONV_2D, DEPTHWISE_CONV_2D, MAX/AVERAGE_POOL_2D (SAME or
+    VALID), FULLY_CONNECTED, ADD, CONCATENATION, RELU/RELU6, RESHAPE, SOFTMAX and MEAN, as TFLite's converter writes
+    them: int8/uint8 tensors with their quantisation (per-channel weight scales on axis 0, depthwise on axis 3), int32
+    biases at scale in x w, constant shape and axes tensors, an [1, N] or NHWC input; layers read their inputs by name
+    or id as lower() does (a graph, not only a chain). tflite_to_graph reads it back to the same network (selftest; the
+    zoo's every model, models/zoo.py)."""
     tensors, buffers = [], [b""]  # buffer 0: empty, by convention
     ops, codes = [], []
     acts = {"none": 0, "relu": 1, "relu6": 3}
@@ -1739,6 +1743,22 @@ def graph_to_tflite(g):
         if OPCODE[name] not in codes:
             codes.append(OPCODE[name])
         return codes.index(OPCODE[name])
+
+    def weights(L, shape, qdim):
+        w = L["weights"]
+        ws, wz = lst(w["scale"]), lst(w.get("zero_point", 0))
+        return tensor(L["name"] + "/weights", shape, w["dtype"], ws, wz * (len(ws) // len(wz) or 1),
+                      struct.pack("<%d%s" % (len(w["data"]), "b" if w["dtype"] == "int8" else "B"), *w["data"]),
+                      qdim=qdim if len(ws) > 1 else 0), ws
+
+    def bias(L, n, sc, ws):
+        b = L.get("bias") or [0] * n
+        return tensor(L["name"] + "/bias", [n], "int32", [sc * s for s in ws], [0] * len(ws),
+                      struct.pack("<%di" % len(b), *b))
+
+    def outq(L, sc, zp):
+        q = L.get("output") or {}
+        return [q["scale"] if q.get("scale") is not None else sc], [q["zero_point"] if q.get("zero_point") is not None else zp]
     io = g["input"]
     dt = io["dtype"]
     cur = tensor(io["name"], io["shape"], dt, [io["scale"]], [io["zero_point"]])
@@ -1749,61 +1769,78 @@ def graph_to_tflite(g):
         ins = [tmap[str(k)] for k in refs] if refs is not None else [cur]
         x = tensors[ins[0]]
         shape, sc, zp = x["shape"], x["scale"][0], x["zp"][0]
-        if L["op"] == "conv2d":
-            w = L["weights"]
-            kh, kw = L["kernel"]
-            cin = shape[3]
-            wt = tensor(L["name"] + "/weights", [L["filters"], kh, kw, cin], "int8", [w["scale"]], [0],
-                        struct.pack("<%db" % len(w["data"]), *w["data"]))
-            bt = tensor(L["name"] + "/bias", [L["filters"]], "int32", [sc * w["scale"]], [0],
-                        struct.pack("<%di" % len(L["bias"]), *L["bias"]))
-            if L["padding"] == "same":
-                ho = (shape[1] + L["strides"][0] - 1) // L["strides"][0]
-                wo = (shape[2] + L["strides"][1] - 1) // L["strides"][1]
-            else:
-                ho = (shape[1] - kh) // L["strides"][0] + 1
-                wo = (shape[2] - kw) // L["strides"][1] + 1
-            o = tensor(L["name"], [1, ho, wo, L["filters"]], dt, [L["output"]["scale"]], [L["output"]["zero_point"]])
-            ops.append(("CONV_2D", [ins[0], wt, bt], [o], 1, [(0, "b", 0 if L["padding"] == "same" else 1),
-                                                               (1, "i", L["strides"][1]), (2, "i", L["strides"][0]),
-                                                               (3, "b", acts[L["activation"]]),
-                                                               (4, "i", 1), (5, "i", 1)]))
-        elif L["op"] == "depthwise_conv2d":
-            w = L["weights"]
+        op = L["op"]
+        if op == "conv2d":
             kh, kw = L["kernel"]
             sh, sw = L.get("strides", [1, 1])
-            C = len(w["data"]) // (kh * kw)
-            ws, wz = lst(w["scale"]), lst(w.get("zero_point", 0))
-            wt = tensor(L["name"] + "/weights", [1, kh, kw, C], w["dtype"], ws, wz * (len(ws) // len(wz) or 1),
-                        struct.pack("<%d%s" % (len(w["data"]), "b" if w["dtype"] == "int8" else "B"), *w["data"]),
-                        qdim=3 if len(ws) > 1 else 0)
-            bt = tensor(L["name"] + "/bias", [C], "int32", [sc * s for s in ws], [0] * len(ws),
-                        struct.pack("<%di" % len(L["bias"]), *L["bias"]))
             pad = L.get("padding", "same")
-            o = tensor(L["name"], [1, osz(shape[1], kh, sh, pad), osz(shape[2], kw, sw, pad), C], dt,
-                       [L["output"]["scale"]], [L["output"]["zero_point"]])
+            wt, ws = weights(L, [L["filters"], kh, kw, shape[3]], 0)
+            bt = bias(L, L["filters"], sc, ws)
+            o = tensor(L["name"], [1, osz(shape[1], kh, sh, pad), osz(shape[2], kw, sw, pad), L["filters"]], dt,
+                       *outq(L, sc, zp))
+            ops.append(("CONV_2D", [ins[0], wt, bt], [o], 1, [(0, "b", 0 if pad == "same" else 1), (1, "i", sw),
+                                                               (2, "i", sh), (3, "b", acts[L.get("activation", "none")]),
+                                                               (4, "i", 1), (5, "i", 1)]))
+        elif op == "depthwise_conv2d":
+            kh, kw = L["kernel"]
+            sh, sw = L.get("strides", [1, 1])
+            pad = L.get("padding", "same")
+            C = len(L["weights"]["data"]) // (kh * kw)
+            wt, ws = weights(L, [1, kh, kw, C], 3)
+            bt = bias(L, C, sc, ws)
+            o = tensor(L["name"], [1, osz(shape[1], kh, sh, pad), osz(shape[2], kw, sw, pad), C], dt, *outq(L, sc, zp))
             ops.append(("DEPTHWISE_CONV_2D", [ins[0], wt, bt], [o], 2, [
                 (0, "b", 0 if pad == "same" else 1), (1, "i", sw), (2, "i", sh),
                 (3, "i", int(L.get("depth_multiplier", 1))), (4, "b", acts[L.get("activation", "none")]),
                 (5, "i", 1), (6, "i", 1)]))
-        elif L["op"] == "max_pool2d":
+        elif op == "fully_connected":
+            K = 1
+            for v in shape[1:]:
+                K *= v
+            wt, ws = weights(L, [L["units"], K], 0)
+            bt = bias(L, L["units"], sc, ws)
+            o = tensor(L["name"], [1, L["units"]], dt, *outq(L, sc, zp))
+            ops.append(("FULLY_CONNECTED", [ins[0], wt, bt], [o], 8, [(0, "b", acts[L.get("activation", "none")]),
+                                                                     (1, "b", 0), (2, "B", 0)]))
+        elif op in ("max_pool2d", "average_pool2d"):
             kh, kw = L["pool"]
-            sh, sw = L["strides"]
-            o = tensor(L["name"], [1, (shape[1] - kh) // sh + 1, (shape[2] - kw) // sw + 1, shape[3]], dt, [sc], [zp])
-            ops.append(("MAX_POOL_2D", [ins[0]], [o], 5, [(0, "b", 1), (1, "i", sw), (2, "i", sh), (3, "i", kw), (4, "i", kh), (5, "b", 0)]))
-        elif L["op"] == "add":
+            sh, sw = L.get("strides", [kh, kw])
+            pad = L.get("padding", "valid")
+            o = tensor(L["name"], [1, osz(shape[1], kh, sh, pad), osz(shape[2], kw, sw, pad), shape[3]], dt,
+                       *outq(L, sc, zp))
+            ops.append(("MAX_POOL_2D" if op == "max_pool2d" else "AVERAGE_POOL_2D", [ins[0]], [o], 5, [
+                (0, "b", 0 if pad == "same" else 1), (1, "i", sw), (2, "i", sh), (3, "i", kw), (4, "i", kh),
+                (5, "b", acts[L.get("activation", "none")])]))
+        elif op == "add":
             o = tensor(L["name"], shape, dt, [L["output"]["scale"]], [L["output"]["zero_point"]])
             ops.append(("ADD", ins, [o], 11, [(0, "b", acts[L.get("activation", "none")])]))
-        elif L["op"] == "concat":
+        elif op == "concat":
             cs = sum(tensors[t]["shape"][3] for t in ins)
             o = tensor(L["name"], shape[:3] + [cs], dt, [L["output"]["scale"]], [L["output"]["zero_point"]])
             ops.append(("CONCATENATION", ins, [o], 10, [(0, "i", L.get("axis", 3)), (1, "b", acts[L.get("activation", "none")])]))
-        elif L["op"] in ("relu", "relu6"):
+        elif op in ("relu", "relu6"):
             q = L.get("output") or {"scale": sc, "zero_point": zp}
             o = tensor(L["name"], shape, dt, [q["scale"]], [q["zero_point"]])
-            ops.append((L["op"].upper(), ins, [o], 0, []))
+            ops.append((op.upper(), ins, [o], 0, []))
+        elif op == "reshape":
+            ns = list(L["shape"])
+            st = tensor(L["name"] + "/shape", [len(ns)], "int32", data=struct.pack("<%di" % len(ns), *ns))
+            o = tensor(L["name"], ns, dt, [sc], [zp])
+            ops.append(("RESHAPE", [ins[0], st], [o], 17, [(0, "ref", lambda ns=ns: fb.vec_scalars("i", ns))]))
+        elif op == "softmax":
+            o = tensor(L["name"], shape, dt, *outq(L, sc, zp))
+            ops.append(("SOFTMAX", ins, [o], 9, [(0, "f", float(L.get("beta", 1.0)))]))
+        elif op == "mean":
+            ax = [int(a) for a in L.get("axis", [1, 2])]
+            keep = bool(L.get("keep_dims", False))
+            at = tensor(L["name"] + "/axes", [len(ax)], "int32", data=struct.pack("<%di" % len(ax), *ax))
+            red = [a % len(shape) for a in ax]
+            oshape = [1 if i in red else v for i, v in enumerate(shape)] if keep else \
+                [v for i, v in enumerate(shape) if i not in red]
+            o = tensor(L["name"], oshape, dt, *outq(L, sc, zp))
+            ops.append(("MEAN", [ins[0], at], [o], 27, [(0, "B", 1 if keep else 0)]))
         else:
-            raise Refused("graph_to_tflite: %s" % L["op"])
+            raise Refused("graph_to_tflite: %s" % op)
         tmap[str(L.get("id") or L["name"])] = o
         cur = o
     fb = FWriter()
@@ -2359,6 +2396,56 @@ def selftest_models():
     ok.append(("depthwise dilation refused (TFLite)", "dilation 2x1" in _refusal(lambda: tflite_to_graph(td, "d"))))
     ok += _selftest_patterns(strip)
     ok += _selftest_gap()
+    ok += _selftest_tflite()
+    return ok
+
+
+def _tflite_same(g, **kw):
+    """g and its graph_to_tflite form lower to the same network (everything but the network's name)"""
+    a = lower(g, **kw)
+    b = lower(tflite_to_graph(read_tflite(graph_to_tflite(g)), "m.tflite"), **kw)
+    for low in (a, b):
+        low.pop("name")
+    return a == b
+
+
+def _selftest_tflite():
+    """graph_to_tflite writes every op npunet lowers, and tflite_to_graph reads it back to the same network"""
+    ok, r = [], random.Random(12)
+    dw = _dwgraph(C=8, r=r)["layers"][0]
+    ga = _sgraph([_sconv("c1", 8, 8, r), dict(dw, name="dw"),
+                  {"op": "max_pool2d", "name": "p1", "pool": [3, 3], "strides": [2, 2], "padding": "same"},
+                  _sconv("c2", 8, 8, r, k=1, inp="p1"), _sconv("c3", 8, 8, r, inp="p1"),
+                  {"op": "concat", "name": "cat", "inputs": ["c2", "c3"], "axis": 3, "output": {"scale": 1 / 128, "zero_point": 0}},
+                  {"op": "average_pool2d", "name": "p2", "pool": [2, 2], "strides": [2, 2], "padding": "valid"},
+                  {"op": "mean", "name": "m", "axis": [1, 2], "keep_dims": False, "output": {"scale": 1 / 128, "zero_point": 0}},
+                  {"op": "fully_connected", "name": "fc", "units": 10, "activation": "none",
+                   "weights": {"dtype": "int8", "layout": "OI", "scale": 1 / 512, "zero_point": 0,
+                               "data": [r.randint(-60, 60) for _ in range(160)]}, "bias": [r.randint(-99, 99) for _ in range(10)],
+                   "output": {"scale": 1 / 32, "zero_point": 3}},
+                  {"op": "softmax", "name": "sm", "beta": 1.0, "output": {"scale": 1 / 256, "zero_point": -128}}],
+                 shape=(1, 16, 16, 8))
+    ok.append(("TFLite round trip: conv, depthwise, SAME max pool, two branches, concat, average pool, MEAN, FC, softmax",
+               _tflite_same(ga, allow_none=True)))
+    gb = _sgraph([dict(ga["layers"][8], name="f1", units=16, activation="relu", weights=dict(
+        ga["layers"][8]["weights"], data=[r.randint(-60, 60) for _ in range(64 * 16)]), bias=[0] * 16,
+        output={"scale": 1 / 64, "zero_point": -128}), dict(ga["layers"][8], name="f2",
+        weights=dict(ga["layers"][8]["weights"], data=[r.randint(-60, 60) for _ in range(160)]))], shape=(1, 64))
+    ok.append(("TFLite round trip: an [1, 64] input, FC, FC", _tflite_same(gb, allow_none=True)))
+    gc = _sgraph([dict(_sconv("c", 4, 4, r), padding="valid"), {"op": "reshape", "name": "flat", "shape": [1, 144]},
+                  dict(ga["layers"][8], name="f", units=4, weights=dict(ga["layers"][8]["weights"],
+                                                                         data=[r.randint(-60, 60) for _ in range(576)]),
+                       bias=[0] * 4), ga["layers"][9]], shape=(1, 8, 8, 4))
+    tc = read_tflite(graph_to_tflite(gc))
+    ok.append(("TFLite: RESHAPE with its constant shape [1, 144], FULLY_CONNECTED weights [4, 144], SOFTMAX beta 1",
+               [o["op"] for o in tc["ops"]] == ["CONV_2D", "RESHAPE", "FULLY_CONNECTED", "SOFTMAX"] and
+               tc["tensors"][tc["ops"][2]["inputs"][1]]["shape"] == [4, 144] and tc["ops"][3]["opt"]["beta"] == 1.0
+               and _tflite_same(gc, allow_none=True)))
+    pc = _dwgraph(scale=[1 / 256 * (1 + c / 16) for c in range(8)])
+    pc["layers"][1]["weights"]["scale"] = [1 / 256 * (1 + c / 8) for c in range(8)]
+    ok.append(("TFLite round trip with per-channel scales (conv axis 0, depthwise axis 3), folded", _tflite_same(pc, fold=True)))
+    ok.append(("TFLite round trip of the residual block (ADD with fused RELU, quant 3)",
+               _tflite_same(residual_graph(), quant=3, allow_none=True)))
     return ok
 
 

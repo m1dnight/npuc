@@ -33,9 +33,10 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
   weights (the same function). NPUC itself compiles a depthwise layer exactly this way on the device path, its weight
   format skipping the zeros with bitmaps (docs/format/depthwise.md), and npunet now lowers DEPTHWISE_CONV_2D to it:
   the `-dense` variants remain as the cross-check (their NCP is their depthwise model's, byte for byte).
-- **TFLite**: `write` adds `<model>.tflite` when `npunet.graph_to_tflite` can write the model and the TFLite lowers to
-  the same network as the JSON. It can write none of the zoo today (it writes conv2d, VALID max_pool2d, add, concat and
-  relu only; every model here has a fully_connected, average_pool2d, reshape, softmax, a SAME pool or a depthwise conv).
+- **TFLite**: `write` adds `<model>.tflite` (`npunet.graph_to_tflite`: CONV_2D, DEPTHWISE_CONV_2D, MAX/AVERAGE_POOL_2D,
+  FULLY_CONNECTED, ADD, CONCATENATION, RELU, RESHAPE, SOFTMAX and MEAN with their quantisation, as TFLite's converter
+  writes them), kept when npunet lowers it to the same lowered network as the JSON (or refuses both alike): every one of
+  the 24 (`tests/run.sh` checks it). That is the path a converted model takes.
 
 ## Status (2026-11-22, NPUC root-314e61a6)
 
@@ -78,11 +79,12 @@ Per published model: LeNet-5, the Keras MNIST convnet and MLP, the TensorFlow CI
 DCASE/MLPerf Tiny autoencoder, the TFLM sine model, SqueezeNet 1.1, VGG-11, Tiny YOLOv2 and ResNet-8 are **exact as
 published** (with the generic adaptations above; ResNet-8's SAME 1x1 stride-2 shortcuts, the vector models' `[1, N]`
 inputs and SqueezeNet's MEAN as Keras writes them). The Hello Edge KWS CNN, magic wand and AlexNet are **exact after an
-exact rewrite** (`-npu`; npunet refuses the published forms up front, where NPUC would assert, and names the rewrite). MobileNet v1 is **exact as published**
-(DEPTHWISE_CONV_2D and TFLite's ReLU6 quantisation: npunet lowers each depthwise layer to the dense block-diagonal
-conv, and NPUC's NCP for the depthwise form is the `-dense` form's byte for byte); MobileNet v2 lowers and compiles the
-same way and is exact too (with its adaptations; its MEAN as Keras writes it); DS-CNN is **exact as published** too
-(its 25x5 global average pool as the identity conv, item 5). micro_speech **fails in NPUC**.
+exact rewrite** (`-npu`; npunet refuses the published forms up front, where NPUC would assert, and names the rewrite).
+MobileNet v1 is **exact as published** (DEPTHWISE_CONV_2D and TFLite's ReLU6 quantisation: npunet lowers each depthwise
+layer to the dense block-diagonal conv, and NPUC's NCP for the depthwise form is the `-dense` form's byte for byte);
+MobileNet v2 lowers and compiles the same way and is exact too (with its adaptations; its MEAN as Keras writes it);
+DS-CNN is **exact as published** too (its 25x5 global average pool as the identity conv, item 5). micro_speech **fails
+in NPUC**.
 
 ## What ncpgen and npunet need, ranked
 
@@ -197,8 +199,8 @@ What unblocks the most models for the least work comes first. Items marked done 
 9. **Beyond the zoo**: leaky ReLU (Tiny YOLOv2's activation; the GReLU table could hold the slope, docs/format/grelu.md
    section 6, needs NPU experiments: days), per-channel weight scales (TFLite's default for every conv: NPUC's
    on-device filler takes one scale per layer, so this needs the per-DRU slopes NPUC fills anyway, studied on the
-   NPU: days), and `graph_to_tflite` for FULLY_CONNECTED, AVERAGE_POOL_2D, padded pools, RESHAPE, SOFTMAX and
-   DEPTHWISE_CONV_2D, so the zoo writes TFLite and the TFLite path is tested on real topologies (**two hours**).
+   NPU: days). Done (2026-11-22): `graph_to_tflite` for every op npunet lowers, so the zoo writes TFLite and the
+   TFLite path is tested on real topologies (all 24 lower as their JSON; `tests/run.sh`).
 
 ## NPUC limits met here (V, the oracle)
 
