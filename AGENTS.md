@@ -53,5 +53,6 @@ to the dense block-diagonal conv NPUC itself compiles (docs/format/depthwise.md;
 off on the device and unproven on the NPU). Not supported yet: trim and spill and weight rings inside a graph, a CMDQ cut in a tiled
 plan's single blocks, channel split/slice, other
 activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling (NPUC's deconvolution crashed in the
-harness), several outputs. Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the
+harness). Several outputs (detection heads) are supported (docs/format/frame.md 12; the harness's `output` line needs
+root-f7b580ef or later). Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the
 nervesinator porting kit).

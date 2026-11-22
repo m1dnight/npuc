@@ -88,12 +88,22 @@ def topology(low):
     return ins, cons, by, src
 
 
+def net_outputs(low):
+    """the network's output layers in NPUC's order: lowered.json's "npu_outputs" when it has several (every layer no
+    layer reads, in execution order: docs/format/frame.md 12), else its one output (npu_output, or the last layer)"""
+    if low.get("npu_outputs"):
+        return list(low["npu_outputs"])
+    return [low.get("npu_output") or low["layers"][-1]["name"]]
+
+
 def exec_order(out, ins, cons, src):
     """NPUC's layer order, the names (V: its NODE ORDER logs, every graph compile of the sweeps with one, 278; resnet8
     and its variants: an eltwise's input order does not change it, the layer list's order does). NPUC numbers its
     graph's nodes breadth first from the network input, each tensor's readers in layer-list order (cons as topology()
     builds it; run/ir_graph_init.txt), then runs, of the layers whose inputs are all done, the one with the highest
-    number. Only the layers the output `out` depends on are run."""
+    number. Only the layers the output `out` depends on are run (out: a layer name, or a list of the outputs' names
+    when the network has several: V, the outputs sweep, frame.md 12)."""
+    outs = [out] if isinstance(out, str) else list(out)
     nid, q, seen = {}, collections.deque([src]), {src}
     while q:
         for c in cons.get(q.popleft(), []):
@@ -101,7 +111,7 @@ def exec_order(out, ins, cons, src):
                 seen.add(c)
                 nid[c] = len(nid) + 1
                 q.append(c)
-    need, stack = {out}, [out]
+    need, stack = set(outs), list(outs)
     while stack:
         for t in ins.get(stack.pop(), []):
             if t != src and t not in need:
@@ -147,9 +157,9 @@ def concat_in_sram(name, out, by, ins, cons):
     at the top of SRAM, each core holding [input 1's planes, input 2's, ...] (V: cat16, cat16-3, cat16-chain,
     cat16-relu, cat-32-16, g021, g118; in DRAM: cat2, cat-8-16, cat-4-12, cat-16-8, cat16-pool, cat16-out, g029,
     g144), when every input is a pool or a conv with a multiple of 16 channels (a conv writes 16-channel OFMs), the
-    concat is not the network output `out`, no eltwise reads it and it does not fork into branches an eltwise joins
-    (V: g012, a concat whose one reader forks, stays in SRAM)"""
-    if name == out or any(i not in by for i in ins[name]):
+    concat is not the network output `out` (a name, or the outputs' names), no eltwise reads it and it does not fork
+    into branches an eltwise joins (V: g012, a concat whose one reader forks, stays in SRAM)"""
+    if (name == out if isinstance(out, str) else name in out) or any(i not in by for i in ins[name]):
         return False
     if not all(by[i]["kind"] == "pool" or (by[i]["kind"] == "conv" and by[i]["out_chw"][0] % 16 == 0)
                for i in ins[name]):
@@ -162,7 +172,39 @@ def concat_in_sram(name, out, by, ins, cons):
     readers = cons.get(name, [])
     if any(by[r]["kind"] == "eltwise" for r in readers):
         return False
-    return not (len(readers) > 1 and feeds_eltwise(name, by, cons))
+    if len(readers) > 1 and feeds_eltwise(name, by, cons):
+        return False
+    # read by several layers, the concat stays in SRAM only as the root of a later concat's branches that all its
+    # readers start (a layer-block its forwarding keeps in SRAM: V g021, g141, g169, g172, t1024, t1029, t2023, t2032);
+    # readers that never meet again (detection heads, each a network output) load it from DRAM (V: outputs-random
+    # m004, m016, m039), as when one of them leaves the later concat's branches (V: outputs-unseen2 m2028)
+    return len(readers) < 2 or any(all(bulb_root(i, by, cons) == name for i in ins[k]) and
+                                   set(readers) <= branch_heads(k, name, by, cons)
+                                   for k in by if by[k]["kind"] == "concat" and k != name)
+
+
+def branch_heads(k, root, by, cons):
+    """the readers of root that start one of concat k's branches (the layers on the way from root to k: one input,
+    one reader each), and k itself when it reads root directly"""
+    heads = set()
+    for i in by[k].get("inputs", [by[k].get("input")]):
+        t = i
+        while t in by and by[t]["kind"] in ("conv", "pool", "relu") and len(cons.get(t, [])) == 1:
+            if by[t]["input"] == root:
+                heads.add(t)
+                break
+            t = by[t]["input"]
+        if i == root:
+            heads.add(k)
+    return heads
+
+
+def bulb_root(t, by, cons):
+    """where a concat's branch through tensor t starts: back through one-input layers (conv, pool, ReLU) read by one
+    layer each, to a tensor several layers read (or the network input)"""
+    while t in by and by[t]["kind"] in ("conv", "pool", "relu") and len(cons.get(t, [])) == 1:
+        t = by[t]["input"]
+    return t
 
 
 # ---- CMDQ instructions (docs/format/cmdq.md 1) ----------------------------------------------------------------------

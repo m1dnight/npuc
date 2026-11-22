@@ -33,7 +33,8 @@ It writes `work/n3/root-<sha8>/` (Bionic + NPUC + the programs, SHA256SUMS) and 
 (not with `LINK_CURRENT=0`, e.g. `docker run -e LINK_CURRENT=0 ...`, for a trial build while other runs use the current
 one). The build is reproducible from any path (the repository and the NDK are mapped to `.` and `/ndk` in the debug
 info): with this firmware's files and NDK r27d it gives **`root-fd659af2`** (`npuc-net-acc7a456`, `npuc-probe-85fe33b0`,
-`npuc-conv-6e2aa54d`; with `dwconv`, docs/format/depthwise.md); before that, root-314e61a6 (`npuc-net-6f90837b`,
+`npuc-conv-6e2aa54d`; with `dwconv`, docs/format/depthwise.md; **root-f7b580ef** adds npuc-net's `output` line for
+several outputs, npuc-net-3c235038, docs/harness-ops.md 4); before that, root-314e61a6 (`npuc-net-6f90837b`,
 `npuc-conv-5500f56c`), which gives the same NCPs on every earlier input (docs/harness-ops.md section 4). `check-symbols.py` checks every import binds in Bionic's lookup scopes before anything runs.
 
 ## 3. Run it

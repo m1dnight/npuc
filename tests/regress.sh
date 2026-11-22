@@ -9,7 +9,8 @@
 # mobilenet-v2-100-224, resnet18-96, resnet18-224: NPUC's trim and spill inside a graph, weight rings in a graph: not
 # modelled, models/README.md); graph-large 9 (5 trim and spill or graph rings, a tiled read-back in a graph, a tiled
 # layer whose input heads a concat's branches, a layer-block only a weight ring fits, t1016's io batch id: frame.md
-# 6.11). Every other set must be exact. Exit 0 when only those known misses remain.
+# 6.11); outputs 2 (o-tiled-head, o-big-readback: an output whose read-back NPUC cuts in rows inside a graph, refused
+# as for one output: frame.md 12). Every other set must be exact. Exit 0 when only those known misses remain.
 # The sets are checked in parallel: REGRESS_JOBS (default: the CPU count).
 set -uo pipefail
 . "$(dirname "$0")/../oracle/env.sh"
@@ -19,7 +20,7 @@ if [ $# -gt 0 ]; then sets=("$@"); else
   mapfile -t sets < <(find . -mindepth 3 -name lowered.json -path '*/*/lowered.json' | sed 's|^\./||; s|/[^/]*/lowered.json$||' | sort -u)
 fi
 tot=0; ok=0; bad=0
-declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=4 [graph-large]=9)
+declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=4 [graph-large]=9 [outputs]=2)
 J=${REGRESS_JOBS:-$(sysctl -n hw.ncpu 2> /dev/null || nproc 2> /dev/null || echo 4)}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # one check per set, J at a time; the results are printed in the sets' order

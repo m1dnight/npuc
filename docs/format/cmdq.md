@@ -530,6 +530,14 @@ rows; g134: a 4-channel eltwise's
 second operand load skips a flag: fixed since (that load, the second plane slot of a 4-channel operand, takes the
 network's next flag the group does not use, like META_DATA; V: g134, rc4-*, g120).
 
+**Several outputs (frame.md 12; V: the outputs sweeps, 132 compiles).** Each output's UNFLATTEN and output data node
+take two positions right after the output layer in the node order (its chunk lives to that UNFLATTEN). The groups
+follow NPUC's policy groups rather than the layer order: a layer reading from DRAM starts one, every UNFLATTEN is one,
+any other layer joins the group holding its input in SRAM; the NCP lists them in order (`Plan.emit_order`), each output
+group's stream the single output group's with its own index. A reader skips an identical load only when the layer
+just before loaded the same tensor into the same chunk and did not write its output over it, and never right after an
+UNFLATTEN. One output: the layer order and the unflatten last, as above.
+
 ## 7d. NPUC's "CMDQ seems too big" cut (V: the cut sweep `stream_variants_cut.txt` in `$NCPGEN_WORK/sweep/cut`, 49
 networks; big4; MobileNet's 1024 x 1024 1x1 at 7x7 and 14x14)
 
