@@ -141,6 +141,9 @@ zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b45
 zoo-mobilenet-v1-050-224|zoo:mobilenet-v1-050-224|--allow-none|5fd12f486586d06f3a145e67248c24df6245dd42454b0435f52bd423b8baed82
 zoo-mobilenet-v2-035-224|zoo:mobilenet-v2-035-224|--quant 3 --allow-none|5e85515a63d6f07c7ce4ca15d3c1e2bfc7c591d2fd76922f5cdc4dc5d16b15cc
 zoo-squeezenet11-224-npu|zoo:squeezenet11-224-npu||bd99ab41ec3d242b784b1773a329fd1434226d3610b35e6adc007dd34700f461
+zoo-ssd-mobilenet-v1-025-128|zoo:ssd-mobilenet-v1-025-128|--allow-none|51a90f529eba7988cb3f66627f1c585ac3a50d10b94cbb224d9bc5e5aecbca38
+zoo-ssd-mobilenet-v1-025-224|zoo:ssd-mobilenet-v1-025-224|--allow-none|0bf6f6642561e426c4157199513da9eee682a961032f0881e60a2ce49f679ded
+zoo-ssd-mobilenet-v1-025-300|zoo:ssd-mobilenet-v1-025-300|--allow-none|b7e204214d9348b4d1a3cb5aecb547f24d579f475b89bda7587c21beedeba43a
 restride-s-conv2x1-fc|restride:s-conv2x1-fc|--allow-none|5d3a8bda7bc46578996776bd6e151cef3df381ecf89e06f1868e2b57e1dd191e
 restride-s-conv1x3-fc|restride:s-conv1x3-fc|--allow-none|dd96df281f1fb8bae7f7d7700cbc0e2a6ec012df30ed92bb3e6cda54d68eae14
 restride-s-conv3-fc|restride:s-conv3-fc|--allow-none|cbd3e6dbdc0be6b81461a918ec2afc11350e9fd1dffe2e1a916e8f552ae3565e
