@@ -3,6 +3,7 @@
 # ncpgen/npunet.py) or a ready net.npuc, through oracle/run.sh local (natively on aarch64 Linux, else in an arm64
 # Linux container). The oracle for the NCP format (docs/oracle.md).
 #   oracle/npuc-local.sh <net.json|model.tflite|net.npuc> <outdir> [--quant 1|3] [--allow-none] [--env NAME=VALUE]...
+#                        [--intermediate <layer>]   (npuc-net's probe of an output a layer also reads: frame.md 12)
 # Writes <outdir>/{net.npuc, lowered.json (when lowered here), net.ncp, net.json (NPUC's shapes), log.txt (NPUC's log,
 # with every instruction it emitted), run (the run directory, with NPUC's IR dumps)}. Prints
 # "npuc-local: PASS <outdir>/net.ncp <sha256>". Exit 0 PASS, 1 bad input or lowering refused, else run.sh's.
@@ -13,12 +14,13 @@ set -uo pipefail
 ROOT=$NPU_ROOT
 [ $# -ge 2 ] || { sed -n '2,10p' "$0"; exit 1; }
 SRC=$1 OUT=$2; shift 2
-LOW=(); ENVS=()
+LOW=(); ENVS=(); XARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --quant) LOW+=(--quant "${2:?}"); shift 2 ;;
     --allow-none) LOW+=(--allow-none); shift ;;
     --env) ENVS+=(--env "${2:?}"); shift 2 ;;
+    --intermediate) XARGS+=(--intermediate "${2:?}"); shift 2 ;;
     *) echo "npuc-local: unknown option $1"; exit 1 ;;
   esac
 done
@@ -31,7 +33,7 @@ case "$SRC" in
        || { cat "$OUT/lower.txt"; echo "npuc-local: FAIL: lowering refused"; exit 1; } ;;
 esac
 out=$(N3_RUNS=$OUT/.runs bash "$ORACLE/run.sh" local "$ROOT" --prog npuc-net "${ENVS[@]}" \
-  --push "$OUT/net.npuc" --net net.npuc --out net.ncp 2>&1); rc=$?
+  --push "$OUT/net.npuc" --net net.npuc --out net.ncp "${XARGS[@]}" 2>&1); rc=$?
 run=$(printf '%s\n' "$out" | sed -n 's/^log: \(.*\)\/log\.txt (exit [0-9]*)$/\1/p' | tail -n 1)
 [ -n "$run" ] && [ -d "$run" ] || { printf '%s\n' "$out" | tail -n 20; echo "npuc-local: FAIL: no run directory"; exit 1; }
 rm -f "$OUT/run"; ln -s ".runs/$(basename "$run")" "$OUT/run"   # relative: the folder can move

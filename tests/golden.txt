@@ -146,6 +146,9 @@ zoo-resnet18-224|zoo:resnet18-224|--quant 3 --allow-none|9be7e2c2342854ecd1ee063
 zoo-resnet18-96|zoo:resnet18-96|--quant 3 --allow-none|46d6c9a342317c911c80596a29d95cd57728799269a0fa8d7333c12f8232d00f
 zoo-squeezenet11-224|zoo:squeezenet11-224||bd99ab41ec3d242b784b1773a329fd1434226d3610b35e6adc007dd34700f461
 zoo-squeezenet11-224-npu|zoo:squeezenet11-224-npu||bd99ab41ec3d242b784b1773a329fd1434226d3610b35e6adc007dd34700f461
+zoo-ssd-mobilenet-v1-025-128|zoo:ssd-mobilenet-v1-025-128|--allow-none|51a90f529eba7988cb3f66627f1c585ac3a50d10b94cbb224d9bc5e5aecbca38
+zoo-ssd-mobilenet-v1-025-224|zoo:ssd-mobilenet-v1-025-224|--allow-none|0bf6f6642561e426c4157199513da9eee682a961032f0881e60a2ce49f679ded
+zoo-ssd-mobilenet-v1-025-300|zoo:ssd-mobilenet-v1-025-300|--allow-none|b7e204214d9348b4d1a3cb5aecb547f24d579f475b89bda7587c21beedeba43a
 restride-s-conv2x1-fc|restride:s-conv2x1-fc|--allow-none|5d3a8bda7bc46578996776bd6e151cef3df381ecf89e06f1868e2b57e1dd191e
 restride-s-conv1x3-fc|restride:s-conv1x3-fc|--allow-none|dd96df281f1fb8bae7f7d7700cbc0e2a6ec012df30ed92bb3e6cda54d68eae14
 restride-s-conv3-fc|restride:s-conv3-fc|--allow-none|cbd3e6dbdc0be6b81461a918ec2afc11350e9fd1dffe2e1a916e8f552ae3565e

@@ -22,11 +22,14 @@ Operations: CONV_2D (kernels 1..13, VALID up to 14, stride 1/2, SAME/VALID, ReLU
 or none), DEPTHWISE_CONV_2D (any multiplier; compiled, as NPUC does on this path, as a dense block-diagonal conv),
 MAX/AVERAGE_POOL_2D (strides up to 2-3, as NPUC allows), global average pooling and MEAN (as a conv within NPUC's
 packing limits, else at stride 1 up to 8x8, else on the CPU when it ends the network), FULLY_CONNECTED (as a conv), ADD (quant mode 3, power-of-two scales), CONCATENATION (channels),
-standalone RELU; RESHAPE and SOFTMAX after the NPU part run on the CPU. Quant modes 1 (uint8, any weight zero point) and 3
+standalone RELU; RESHAPE and SOFTMAX after the NPU part run on the CPU. Several outputs (detection heads: every tensor
+no layer reads, docs/format/frame.md 12; `npunet.py lower --output T --output T2` cuts a model at its heads; the zoo's
+SSD MobileNet models exact). Quant modes 1 (uint8, any weight zero point) and 3
 (int8), one multiplier per layer: per-channel weight scales as one slope and per-channel shifts (`--per-channel-shifts`,
 less than a bit folded; docs/format/perchannel.md) or folded (`--fold-per-channel`). Large layers: NPUC's tiling policy (read
 from its code), inside graphs too, weight rings, its command-queue split, its trim and spill, its batch scheduling.
-Not yet: other activations (leaky ReLU, SiLU), upsampling, channel split, several outputs.
+Not yet: other activations (leaky ReLU, SiLU), upsampling, channel split, an output another layer also reads (NPUC
+crashes on it).
 
 NPUC's defects ncpgen knows (`docs/format/grelu.md`, `docs/format/frame.md` section 9): its activation (GReLU) table is
 the DRUs' slope and zero-point slots read as one piece table, right only when ceil(Cout/8) is even; ncpgen writes the

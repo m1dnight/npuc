@@ -54,6 +54,7 @@ resolution model as published). Depthwise is lowered to the dense block-diagonal
 (docs/format/depthwise.md; NPUC's own depthwise-optimised path is off on the device and unproven on the NPU). Camera
 models: models/camera.md (person_detect exact as published; per-channel scales as per-channel shifts,
 docs/format/perchannel.md; the harness's setScale hook needs root-40bb3e3f). Not supported yet: channel split/slice, other activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling
-(NPUC's deconvolution crashed in the harness), several outputs, a layer-block only a weight ring fits, strata joined to
-each other. Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the nervesinator
+(NPUC's deconvolution crashed in the harness), an output another layer also reads (NPUC crashes on it), a layer-block
+only a weight ring fits, strata joined to each other. Several outputs (detection heads) are supported (docs/format/frame.md
+12; the harness's `output` line needs root-38925a6d or later). Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the nervesinator
 porting kit).

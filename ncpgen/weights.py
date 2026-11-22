@@ -48,7 +48,7 @@ if not __package__:     # run as a script: the package is this file's directory
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ncpgen.common import (Memo, cdiv, concat_in_sram, exec_order as _exec_names, has_graph_ops, ncp_parts,  # noqa
-                           topology, weights_digest)
+                           net_outputs, topology, weights_digest)
 
 ROW = 64            # bytes per row of a batch (the io descriptor's w)
 SLOTS = 8           # chunks per batch
@@ -357,12 +357,22 @@ def weight_blocks(low):
     """The exact bytes of each WEIGHT block, in the NCP's order. A chain (convs and pools): one per conv, layer order.
     A graph (an eltwise, a concat or a standalone ReLU): one per conv, eltwise and ReLU layer, in NPUC's execution
     order (layer_blocks). Raises ValueError where NPUC aborts (the checks NPUC asserts on: sub-batch counts above
-    maxPossibleBatches in either pass, chunks over 511 non-zero values, the stride-1 planner abort)."""
-    return [blk for _, _, blk in layer_blocks(low)]
+    maxPossibleBatches in either pass, chunks over 511 non-zero values, the stride-1 planner abort). Several outputs:
+    the NCP's group order (stream.Plan's emit_order: NPUC's policy groups, docs/format/frame.md 12); the other functions
+    here keep NPUC's layer order."""
+    blocks = layer_blocks(low)
+    if low.get("npu_outputs"):
+        from ncpgen import stream          # here: stream imports this module
+        pos = {n: i for i, n in enumerate(stream.Plan(low).emit_order)}
+        blocks = sorted(blocks, key=lambda b: pos[b[0]])
+    return [blk for _, _, blk in blocks]
 
 
 def _output(low, cons):
-    """the network's output layer: its only sink, else npu_output or the last layer"""
+    """the network's output layer: its only sink, else npu_output or the last layer; a network with several outputs:
+    the list of them (lowered.json's npu_outputs, common.net_outputs)"""
+    if low.get("npu_outputs"):
+        return net_outputs(low)
     sinks = [L["name"] for L in low["layers"] if L["name"] not in cons]
     return sinks[0] if len(sinks) == 1 else (low.get("npu_output") or low["layers"][-1]["name"])
 
@@ -524,6 +534,12 @@ def relu_identity_block(C, quant_mode=1):
     return b"".join(x + bytes(R * ROW - len(x)) for x in groups)
 
 
+def _graph_order(low):
+    """the blocks follow NPUC's execution order: a network with graph ops, or with several outputs (its heads branch
+    off: frame.md 12); a chain keeps its layer order (the same)"""
+    return has_graph_ops(low) or bool(low.get("npu_outputs"))
+
+
 def _relu_zero_conv(L):
     c = L["cout"]
     return {"kind": "conv", "name": L.get("name", "relu"), "cout": c, "in_chw": [c, 1, 1], "k": [1, 1],
@@ -533,7 +549,7 @@ def _relu_zero_conv(L):
 def layer_blocks(low):
     """[(layer name, kind, WEIGHT block)] in the NCP's order"""
     q = low.get("quant_mode", 1)
-    if not has_graph_ops(low):
+    if not _graph_order(low):
         return [(L["name"], L["kind"], conv_block(L if L["kind"] == "conv" else _relu_zero_conv(L), q)[1])
                 for L in low["layers"] if L["kind"] in ("conv", "relu")]
     ins, cons, by, src = topology(low)
@@ -644,9 +660,9 @@ def weight_planning_sizes(low):
             return len(blk)
         return len(conv_block(L, q, True)[1])
 
-    if not has_graph_ops(low):
+    if not _graph_order(low):
         convs = [L for L in low["layers"] if L["kind"] == "conv"]
-        return [plan_len(L, b) for L, b in zip(convs, weight_blocks(low))]
+        return [plan_len(L, b) for L, b in zip(convs, [b for _, _, b in layer_blocks(low)])]
     ins, cons, by, src = topology(low)
     out = []
     for name, kind, blk in layer_blocks(low):
@@ -678,7 +694,7 @@ def weight_layer_info(low):
     lb = layer_blocks(low)
     ps = weight_planning_sizes(low)
     by = {L["name"]: L for L in low["layers"]}
-    graph = has_graph_ops(low)
+    graph = _graph_order(low)
     if graph:
         ins, cons, _, src = topology(low)
     out = []
@@ -715,8 +731,9 @@ def weight_layers(low):
 
 
 def weight_block_sizes(low):
-    """the byte size of each WEIGHT block, in the NCP's order"""
-    return [len(b) for b in weight_blocks(low)]
+    """the byte size of each WEIGHT block, in NPUC's layer order (the NCP's order but for several outputs, whose
+    blocks weight_blocks puts in the NCP's group order; the planners take these by layer)"""
+    return [len(b) for _, _, b in layer_blocks(low)]
 
 
 def weight_geometry(low):

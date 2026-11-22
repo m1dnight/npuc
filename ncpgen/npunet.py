@@ -3,24 +3,31 @@
 Python 3: no numpy, no flatbuffers package (a minimal FlatBuffer reader and writer are below).
 
   npunet.py lower <model.tflite|net.json> <dir> [--quant 1|3] [--allow-none] [--fold-per-channel | --per-channel-shifts]
-                  [--output TENSOR] [--relu6-range]
+                  [--output TENSOR]... [--relu6-range]   (--output: cut the model at those tensors: one, or several
+                  outputs, a detector's heads; tflite_cut, graph_cut)
         the model as the NPU will compute it: <dir>/lowered.json (every parameter explicit) and <dir>/net.npuc (the
         phone's compiler harness input, oracle/harness/npuc-net.cpp)
-  npunet.py ref <lowered.json> <input.bin> <output.bin>        the CPU reference: the model's output bytes
+  npunet.py ref <lowered.json> <input.bin> <output.bin>        the CPU reference: the model's output bytes (several
+        outputs: <out0.bin>,<out1.bin>,... one per output in the model's order, or one file holding them all)
   npunet.py layout <lowered.json> <net.ncp> <layout.json>      the NPU's IFM/OFM formats from the NCP's descriptors
   npunet.py to-npu <lowered.json> <layout.json> <input.bin> <npu-in.bin>
   npunet.py from-npu <lowered.json> <layout.json> <ofm.bin> <output.bin>
   npunet.py compare <lowered.json> <layout.json> <input.bin>:<ofm.bin>...   the NPU's output against the CPU
+        several outputs: the OT_FMAP buffers comma-separated in the layout's "ofms" order (NPUC's), the model's
+        outputs comma-separated in the model's order (from-npu <ofm0>,<ofm1> <out0>,<out1>; compare in:<ofm0>,<ofm1>)
   npunet.py example <dir>        the tiny example: tiny-net.json, tiny.tflite, input.bin, expected.bin
   npunet.py example-residual <dir>   a residual block (conv+relu, conv, add with the block input, relu):
         residual-net.json, residual.tflite, input.bin, input2.bin, expected.bin, expected2.bin (--quant 3 --allow-none)
   npunet.py variants <dir>       the example taken apart (v1-pool ... v5-tiny), for journal/plans/npu-run-0218/nr-variants.sh
   npunet.py selftest
 
-Model formats. (1) A quantized TFLite file (int8 or uint8, one subgraph, one input, one output; ops in graph order,
-a tensor may feed several ops). (2) Our graph JSON "npu-net/1" (example_graph() below; the porting kit's npu/README.md): the same
+Model formats. (1) A quantized TFLite file (int8 or uint8, one subgraph, one input, one or several outputs; ops in
+graph order, a tensor may feed several ops). (2) Our graph JSON "npu-net/1" (example_graph() below; the porting kit's npu/README.md): the same
 information, written by hand or by a script. Each layer reads the previous layer's output unless it names its
 input(s): "input": "<tensor>" or "inputs": ["<a>", "<b>", ...] (a tensor = the network input's or a layer's "name").
+Several outputs (detection heads): "outputs": ["<tensor>", ...] (a TFLite subgraph's outputs list); they must be
+exactly the tensors no layer reads, as NPUC outputs those and nothing else (docs/format/frame.md 12); lowered.json's
+"outputs" (the model's order) and "npu_outputs" (NPUC's, its execution order); no CPU op after them.
 input.bin / output.bin are the model's own tensors: NHWC, in the model's dtype (int8 or uint8), as a TFLite
 interpreter takes and gives them.
 
@@ -87,7 +94,8 @@ from fractions import Fraction
 if not __package__:     # run as a script, or loaded from its path (the porting kit's npu/npunet.py): the package is
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))    # this file's directory
 
-from ncpgen.common import f32, f32_hex, has_graph_ops, hex_f32, multiplier, ncp_header, requant  # noqa: E402
+from ncpgen.common import (exec_order, f32, f32_hex, has_graph_ops, hex_f32, multiplier, ncp_header, requant,  # noqa: E402
+                           topology)
 
 ROUNDINGS = ("half_away", "half_even", "half_up")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -399,27 +407,81 @@ def _ints(data, dtype):
     return list(struct.unpack("<%d%s" % (n, fmt), data[:n * struct.calcsize(fmt)]))
 
 
+def _cut_list(output):
+    """--output's value(s): one tensor (an index or an exact name) or a list of them"""
+    return list(output) if isinstance(output, (list, tuple)) else [output]
+
+
 def tflite_cut(tf, output):
-    """the model cut at one tensor (its index, or its exact name): that tensor its only output, only the ops it needs
-    kept (the NPU part of a model whose tail runs on the CPU, e.g. one head of a detector before its post-process)"""
+    """the model cut at one or several tensors (each an index or an exact name; --output TENSOR, repeatable): those
+    tensors its outputs, in that order, only the ops they need kept (the NPU part of a model whose tail runs on the
+    CPU: a detector's box and class heads before its reshapes, concatenations and post-process). One tensor: that
+    tensor the model's only output (the single-output path); several: the model's outputs, which NPUC must see as
+    tensors no op reads (lower() checks, docs/format/frame.md 12)"""
     T = tf["tensors"]
-    if isinstance(output, str) and not output.isdigit():
-        idx = [i for i, t in enumerate(T) if t["name"] == output]
-        if len(idx) != 1:
-            raise Refused("--output %r: %d tensors of that name" % (output, len(idx)))
-        output = idx[0]
-    output = int(output)
+    outs = []
+    for o in _cut_list(output):
+        if isinstance(o, str) and not o.isdigit():
+            idx = [i for i, t in enumerate(T) if t["name"] == o]
+            if len(idx) != 1:
+                raise Refused("--output %r: %d tensors of that name" % (o, len(idx)))
+            o = idx[0]
+        outs.append(int(o))
+    if len(set(outs)) != len(outs):
+        raise Refused("--output names a tensor twice")
     prod = {o["outputs"][0]: k for k, o in enumerate(tf["ops"]) if o["outputs"]}
-    if output not in prod:
-        raise Refused("--output %d: no op writes tensor %d" % (output, output))
-    need, todo = set(), [output]
+    need, todo = set(), []
+    for o in outs:
+        if o not in prod:
+            raise Refused("--output %d: no op writes tensor %d" % (o, o))
+        todo.append(o)
     while todo:
         t = todo.pop()
         k = prod.get(t)
         if k is not None and k not in need:
             need.add(k)
             todo += [i for i in tf["ops"][k]["inputs"] if i >= 0]
-    return dict(tf, ops=[o for k, o in enumerate(tf["ops"]) if k in need], outputs=[output])
+    return dict(tf, ops=[o for k, o in enumerate(tf["ops"]) if k in need], outputs=outs)
+
+
+def graph_cut(g, output):
+    """an npu-net/1 graph cut at one or several tensors (a layer's "name" or "id"; --output): the layers they need,
+    every input made explicit; several tensors become its "outputs" (tflite_cut's rule)"""
+    io = g["input"]
+    ref = {str(io.get("id") or io.get("name") or "input"): None}
+    layers, prev = [], None
+    for i, L in enumerate(g["layers"]):
+        L = dict(L)
+        key = str(L.get("id") or L.get("name") or "#%d" % (i + 1))
+        if "input" not in L and "inputs" not in L:
+            if prev is not None and prev.startswith("#"):
+                raise Refused("--output on an npu-net/1 graph: layer %d reads an unnamed layer" % (i + 1))
+            L["input"] = prev if prev is not None else str(io.get("id") or io.get("name") or "input")
+        layers.append(L)
+        for r in (L.get("name"), L.get("id")):
+            if r is not None:
+                ref[str(r)] = len(layers) - 1
+        prev = key
+    outs = [str(o) for o in _cut_list(output)]
+    if len(set(outs)) != len(outs):
+        raise Refused("--output names a tensor twice")
+    need, todo = set(), []
+    for o in outs:
+        if ref.get(o) is None:
+            raise Refused("--output %r: no layer writes it" % o)
+        todo.append(ref[o])
+    while todo:
+        k = todo.pop()
+        if k is None or k in need:
+            continue
+        need.add(k)
+        L = layers[k]
+        todo += [ref.get(str(r)) for r in (L["inputs"] if "inputs" in L else [L["input"]])]
+    h = dict(g, layers=[L for k, L in enumerate(layers) if k in need])
+    h.pop("outputs", None)
+    if len(outs) > 1:
+        h["outputs"] = outs
+    return h
 
 
 def tflite_to_graph(tf, src):
@@ -427,9 +489,9 @@ def tflite_to_graph(tf, src):
     its output tensor and "inputs" = the ids it reads (TFLite's own tensor names may be empty or repeat); its "name"
     stays the tensor's name (the lowered layer's name comes from it)."""
     T = tf["tensors"]
-    if len(tf["inputs"]) != 1 or len(tf["outputs"]) != 1:
-        raise Refused("%d inputs, %d outputs (one each is supported; --output TENSOR cuts the model at one)"
-                      % (len(tf["inputs"]), len(tf["outputs"])))
+    if len(tf["inputs"]) != 1 or not tf["outputs"]:
+        raise Refused("%d inputs, %d outputs (one input and at least one output are supported; --output TENSOR cuts "
+                      "the model at one or several tensors)" % (len(tf["inputs"]), len(tf["outputs"])))
     tin = T[tf["inputs"][0]]
     if tin["dtype"] not in ("int8", "uint8"):
         raise Refused("input %r is %s (a quantized int8 or uint8 input is needed; float models are not supported)" % (tin["name"], tin["dtype"]))
@@ -520,7 +582,13 @@ def tflite_to_graph(tf, src):
         g["layers"].append(L)
         known.add(o["outputs"][0])
         last = o["outputs"][0]
-    if last != tf["outputs"][0]:
+    if len(tf["outputs"]) > 1:
+        # several outputs (detection heads): lower() checks they are exactly the tensors no op reads (NPUC's outputs)
+        for t in tf["outputs"]:
+            if t not in known or t == tf["inputs"][0]:
+                raise Refused("model output tensor %d (%r) is not an op's output" % (t, T[t]["name"] if 0 <= t < len(T) else "?"))
+        g["outputs"] = ["t%d" % t for t in tf["outputs"]]
+    elif last != tf["outputs"][0]:
         raise Refused("the last op's output is not the model's output")
     return g
 
@@ -621,7 +689,7 @@ def _resolve(g):
                              % (show[key], L["op"].upper(), show[ins[0]]))
                 continue
         out.append(e)
-    return out, "#in", warns, show
+    return out, "#in", warns, show, {n: alias.get(k, k) for n, k in names.items()}
 
 
 def relu6_top(zp, scale):
@@ -1431,7 +1499,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, re
            "io_dtype": dtype, "input": {"name": "data0", "chw": [C, H, W], "scale": f32_hex(sc), "zp": zp_in,
                                         "nhwc": [1, H, W, C]},
            "layers": [], "cpu_tail": [], "warnings": [], "unproven": []}
-    ents, inkey, fwarn, show = _resolve(g)
+    ents, inkey, fwarn, show, names = _resolve(g)
     low["warnings"] += fwarn
     if list(io["shape"]) != shp:
         low["input"]["shape"] = list(io["shape"])
@@ -1487,18 +1555,23 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, re
         raise Refused("no conv or fully-connected layer: NPUC compiles it (no WEIGHT vector), but N2's npu-lite refuses an NCP "
                       "without weights at ncp map (\"weights end 0\", npu-run v1-pool 2026-11-21; the driver change is in "
                       "journal/plans/npu-run-0218/README.md)")
-    # one network output: NPUC makes every blob no layer reads an output of the network
+    # the network's outputs: NPUC makes every blob no layer reads an output of the network (and only those: V,
+    # NNGraphCgObject::appendNewOutData, docs/format/frame.md 12), so the model's outputs must be exactly its sinks
     read = set(n_ for l in low["layers"] for n_ in l.get("inputs", [l["input"]]))
-    for l in low["layers"][:-1]:
-        if l["name"] not in read:
-            raise Refused("%s (%s) is read by no later layer: NPUC would make it a second network output (one output "
-                          "supported; the network's output is its last layer)" % (l["name"], l.get("src_name") or l["kind"]))
+    decl = g.get("outputs")
+    if decl is None:
+        for l in low["layers"][:-1]:
+            if l["name"] not in read:
+                raise Refused("%s (%s) is read by no later layer: NPUC would make it a second network output (declare "
+                              "the model's outputs with \"outputs\"; else the network's output is its last layer)"
+                              % (l["name"], l.get("src_name") or l["kind"]))
+    multi = decl is not None and _lower_outputs(low, lw, decl, names, read, dtype)
     # two suspected NPUC defects (G until the NPU runs P9 / P11 of docs/format/frame.md 8.5): named, not refused
-    lastl = low["layers"][-1]
-    if lastl["out_chw"][0] in (3, 5, 7):
-        low["unproven"].append("%s: an NPU output with %d channels: NPUC reads it back with a negative plane stride (IM "
-                               "c_stride -2 x plane, docs/format/frame.md 9.1): channels 2.. are likely wrong"
-                               % (lastl["name"], lastl["out_chw"][0]))
+    for lastl in [l for l in low["layers"] if l["name"] in low["npu_outputs"]] if multi else low["layers"][-1:]:
+        if lastl["out_chw"][0] in (3, 5, 7):
+            low["unproven"].append("%s: an NPU output with %d channels: NPUC reads it back with a negative plane stride "
+                                   "(IM c_stride -2 x plane, docs/format/frame.md 9.1): channels 2.. are likely wrong"
+                                   % (lastl["name"], lastl["out_chw"][0]))
     for i, l in enumerate(low["layers"]):
         if l["kind"] == "pool" and not any(l["pads"]):
             (_, Hc, Wc), (kh, kw), (sh, sw), (_, ho, wo) = l["in_chw"], l["k"], l["stride"], l["out_chw"]
@@ -1516,6 +1589,9 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, re
             raise Refused("quant mode 3 (native s8) ignores zero points: every zero point must be 128 (int8 0); got %s: use --quant 1" % sorted(set(zps)))
     elif quant != 1:
         raise Refused("quant mode %d (1 or 3)" % quant)
+    if multi:
+        low["npuc_net"] = 2
+        return low
     last = low["layers"][-1]
     low["npu_output"] = last["name"]
     low["npu_out_chw"] = last["out_chw"]
@@ -1537,10 +1613,60 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, re
 is_graph = has_graph_ops     # a network with a layer only "npuc-net 2" files carry
 
 
+def _lower_outputs(low, lw, decl, names, read, dtype):
+    """the model's declared outputs ("outputs": tensor names, or a TFLite subgraph's outputs) -> False for one (the
+    single-output path, unchanged), else True with low["outputs"] (the model's order: each output's lowered layer, CHW
+    shape, NHWC shape and size) and low["npu_outputs"] (NPUC's order: its execution order, docs/format/frame.md 12).
+    NPUC makes exactly the blobs no layer reads outputs (NNGraphCgObject::appendNewOutData: an output data node for a
+    node without successors), so the declared outputs must be those sinks: an output that a layer also reads, the
+    network input, or a sink the model does not declare is refused"""
+    decl = [str(d) for d in decl]
+    if not decl:
+        raise Refused("\"outputs\" is empty")
+    if len(set(decl)) != len(decl):
+        raise Refused("\"outputs\" names a tensor twice: %s" % decl)
+    byname = {l["name"]: l for l in low["layers"]}
+    outs = []
+    for d in decl:
+        k = names.get(d)
+        if k is None or k not in lw.blobs:
+            raise Refused("output %r is neither the network input nor a layer's output" % d)
+        b = lw.blobs[k]
+        if k == "#in" or b["name"] == "data0":
+            raise Refused("output %r is the network input (NPUC computes nothing for it)" % d)
+        if b.get("tail") or b.get("flat") or b.get("select"):
+            raise Refused("output %r is a CPU op's or a rewritten tensor (several outputs: each must be an NPU layer's)" % d)
+        if b["name"] in read:
+            raise Refused("output %r (%s) is also read by a layer: NPUC makes only the blobs no layer reads network "
+                          "outputs (NNGraphCgObject::appendNewOutData; the HAL marks nothing else)" % (d, b["name"]))
+        outs.append((d, byname[b["name"]], b))
+    sinks = [l["name"] for l in low["layers"] if l["name"] not in read]
+    miss = [n for n in sinks if n not in [o[1]["name"] for o in outs]]
+    if miss:
+        raise Refused("%s %s read by no layer but not declared in \"outputs\": NPUC would make %s network outputs"
+                      % (", ".join(miss), "is" if len(miss) == 1 else "are", "it" if len(miss) == 1 else "them"))
+    if len(outs) == 1:
+        return False
+    if low["cpu_tail"]:
+        raise Refused("a CPU part (RESHAPE, SOFTMAX) after a network with %d outputs (not supported)" % len(outs))
+    low["outputs"] = []
+    for d, l, b in outs:
+        C2, H2, W2 = l["out_chw"]
+        low["outputs"].append({"name": lw.show.get(names[d], d), "layer": l["name"], "chw": [C2, H2, W2],
+                               "shape": b.get("nhwc", [1, H2, W2, C2]), "dtype": dtype, "bytes": C2 * H2 * W2})
+    # NPUC's order: its execution order (exec_order over every output), in which it appends each output's data node
+    # and unflatten (V: its "Network Output:" lines, frame.md 12)
+    ins, cons, _, src = topology(low)
+    low["npu_outputs"] = [n for n in exec_order(sinks, ins, cons, src) if n in sinks]
+    return True
+
+
 def npuc_text(low):
     """the input of oracle/harness/npuc-net.cpp: "npuc-net 1" for conv/pool layers (as always), "npuc-net 2" when
-    the network has an eltwise, concat or relu layer (docs/harness-ops.md 4)"""
-    out = ["npuc-net %d" % (2 if is_graph(low) else 1), "# %s (npu/npunet.py lower)" % low["name"], "soc %d" % low["soc"],
+    the network has an eltwise, concat or relu layer (docs/harness-ops.md 4) or several outputs (its "output" line,
+    in the model's order: docs/format/frame.md 12)"""
+    multi = bool(low.get("npu_outputs"))
+    out = ["npuc-net %d" % (2 if is_graph(low) or multi else 1), "# %s (npu/npunet.py lower)" % low["name"], "soc %d" % low["soc"],
            "quant %d" % low["quant_mode"], "input data0 %d %d %d" % tuple(low["input"]["chw"])]
     for l in low["layers"]:
         if l["kind"] == "conv":
@@ -1566,13 +1692,15 @@ def npuc_text(low):
             out.append("relu %s %s %s" % (l["name"], l["input"], l["type"]))
         else:
             raise Refused("layer %s: kind %s" % (l["name"], l["kind"]))
+    if multi:
+        out.append("output %d %s" % (len(low["outputs"]), " ".join(o["layer"] for o in low["outputs"])))
     out.append("end")
     return "\n".join(out) + "\n"
 
 
 def load_model(path, quant=1, fold=False, allow_none=False, output=None, relu6_range=False):
-    """a TFLite file or an npu-net/1 JSON -> lowered.json's dict (lower()); output: cut a TFLite model at that tensor
-    (tflite_cut)"""
+    """a TFLite file or an npu-net/1 JSON -> lowered.json's dict (lower()); output: cut the model at that tensor, or
+    at each tensor of a list (--output, repeatable: tflite_cut, graph_cut)"""
     data = open(path, "rb").read()
     tfl = is_tflite(data) and not data.lstrip()[:1] == b"{"
     if tfl:
@@ -1583,6 +1711,8 @@ def load_model(path, quant=1, fold=False, allow_none=False, output=None, relu6_r
             g = json.loads(data)
         except ValueError:
             raise Refused("%s is neither a TFLite file nor JSON" % path)
+        if output is not None:
+            g = graph_cut(g, output)
     low = lower(g, quant=quant, fold=fold, allow_none=allow_none, relu6_range=relu6_range)
     low["source"] = {"path": os.path.basename(path), "sha256": hashlib.sha256(data).hexdigest(),
                      "kind": "tflite" if tfl else "npu-net/1 json"}
@@ -1727,9 +1857,24 @@ def layer_deps(low):
 
 
 def ref_npu(low, x_chw, rounding="half_away", none_defect=False, add="sum", relu="max", memo=None):
-    """the NPU part on the CPU: CHW uint8 in -> CHW uint8 out (the lowered network's last layer); the layers in their
-    order, each reading its input blob(s). rounding, none_defect, add and relu are the hypotheses compare tries (the
-    defaults: the reference); memo (a dict per input) shares the blobs whose hypotheses agree"""
+    """the NPU part on the CPU: CHW uint8 in -> CHW uint8 out (the lowered network's last layer; a network with
+    several outputs: the concatenation of its outputs' CHW bytes in the model's order, ref_npu_outputs); the layers in
+    their order, each reading its input blob(s). rounding, none_defect, add and relu are the hypotheses compare tries
+    (the defaults: the reference); memo (a dict per input) shares the blobs whose hypotheses agree"""
+    if low.get("outputs"):
+        return b"".join(ref_npu_outputs(low, x_chw, rounding, none_defect, add, relu, memo))
+    return _ref_vals(low, x_chw, rounding, none_defect, add, relu, memo)[low["layers"][-1]["name"]]
+
+
+def ref_npu_outputs(low, x_chw, rounding="half_away", none_defect=False, add="sum", relu="max", memo=None):
+    """a network with several outputs on the CPU: [CHW uint8 bytes of each output], in the model's order
+    (low["outputs"])"""
+    vals = _ref_vals(low, x_chw, rounding, none_defect, add, relu, memo)
+    return [vals[o["layer"]] for o in low["outputs"]]
+
+
+def _ref_vals(low, x_chw, rounding, none_defect, add, relu, memo):
+    """every blob's CHW uint8 value for an input (ref_npu)"""
     vals = {"data0": x_chw}
     deps = layer_deps(low) if memo is not None else None
     hyp = {"r": rounding, "d": none_defect, "a": add, "u": relu}
@@ -1756,7 +1901,7 @@ def ref_npu(low, x_chw, rounding="half_away", none_defect=False, add="sum", relu
         vals[l["name"]] = y
         if memo is not None:
             memo[mk] = y
-    return vals[low["layers"][-1]["name"]]
+    return vals
 
 
 def cpu_tail(low, y_chw):
@@ -1803,9 +1948,20 @@ def out_to_model(low, y):
     return bytes(b ^ 0x80 for b in y) if low["io_dtype"] == "int8" else bytes(y)
 
 
+def chw_to_nhwc(y, chw):
+    """CHW bytes -> NHWC (H, W, C order) bytes of the same tensor"""
+    C, H, W = chw
+    return bytes(y[(c * H + h) * W + w] for h in range(H) for w in range(W) for c in range(C))
+
+
 def reference(low, data, rounding="half_away", none_defect=False):
-    """the CPU reference: the model's output bytes for its input bytes"""
-    return out_to_model(low, cpu_tail(low, ref_npu(low, model_in_to_chw(low, data), rounding, none_defect)))
+    """the CPU reference: the model's output bytes for its input bytes; a network with several outputs: a list of
+    them, in the model's order (each NHWC in the model's dtype, as a TFLite interpreter gives them)"""
+    x = model_in_to_chw(low, data)
+    if low.get("outputs"):
+        return [out_to_model(low, chw_to_nhwc(y, o["chw"]))
+                for y, o in zip(ref_npu_outputs(low, x, rounding, none_defect), low["outputs"])]
+    return out_to_model(low, cpu_tail(low, ref_npu(low, x, rounding, none_defect)))
 
 
 # ---- the NCP: descriptors -> the NPU's IFM and OFM formats -------------------------------------------------------
@@ -1836,8 +1992,8 @@ def ncp_layout(low, ncp):
     every single-tile shape, any C, NPUC's split IFM loads; frame.md 8.4). A graph network, a plan frame.py does not
     model (tiled, streamed weights), or frame.py missing: ncp_layout_basic (one IFM format, 2 channels per plane)."""
     ncp_parse(ncp)  # an NCP v22, or Refused
-    why = "a graph network"
-    if not is_graph(low):
+    why = "a graph network" if is_graph(low) or not low.get("outputs") else "several outputs"
+    if not is_graph(low) and not low.get("outputs"):
         from ncpgen import frame as fr     # imported here: lowering and the reference do not need the generator
         try:
             lay = fr.ncp_layout(low, ncp)
@@ -1862,8 +2018,10 @@ def ncp_layout_basic(low, ncp):
     C, H, W = low["input"]["chw"]
     ins = [(i, m) for i, m in enumerate(mv) if m[0] == 0]
     outs = [(i, m) for i, m in enumerate(mv) if m[0] == 1]
-    if len(ins) != 1 or len(outs) != 1:
-        raise Refused("the NCP has %d IN_FMAP and %d OT_FMAP memory vectors (one each supported)" % (len(ins), len(outs)))
+    nout = len(low["npu_outputs"]) if low.get("outputs") else 1
+    if len(ins) != 1 or len(outs) != nout:
+        raise Refused("the NCP has %d IN_FMAP and %d OT_FMAP memory vectors (1 and %d expected)"
+                      % (len(ins), len(outs), nout))
     _, (t, pf, mw, mh, mc, ws, cs, ai) = ins[0]
     if (mw, mh, mc) != (W, H, C):
         raise Refused("IN_FMAP is %dx%dx%d (w h c), the model's input %dx%dx%d" % (mw, mh, mc, W, H, C))
@@ -1897,6 +2055,8 @@ def ncp_layout_basic(low, ncp):
                   "probe's npu-map.json, run 20261121-123201; other shapes: the same rule, sized by the NCP's descriptor, G)"}
     if len(rd) > 1:
         ifm["readers"] = len(rd)
+    if low.get("outputs"):
+        return _layout_outputs(low, av, outs, ifm)
     _, (t, pf, ow, oh, oc, ows, ocs, oai) = outs[0]
     C2, H2, W2 = low["npu_out_chw"]
     if (ow, oh, oc) != (W2, H2, C2):
@@ -1910,6 +2070,28 @@ def ncp_layout_basic(low, ncp):
     if last not in ("conv", "pool"):
         ofm["how"] += "; written by an %s layer here: the same OT_FMAP descriptor, never run (G)" % last
     return {"ifm": ifm, "ofm": ofm, "quant_mode": low["quant_mode"]}
+
+
+def _layout_outputs(low, av, outs, ifm):
+    """the layout of a network with several outputs: one OT_FMAP memory vector per output, in NPUC's order (the
+    first right after IN_FMAP, the others after the stored tensors' IMs: docs/format/frame.md 12), each a dense CHW
+    map written by its own output group's intrinsic. "ofms": per vector (NPUC's order) its memory vector index, the
+    output's layer, its index in the model's outputs and its size; "ofm": the first, for single-output readers"""
+    byl = {o["layer"]: (k, o) for k, o in enumerate(low["outputs"])}
+    ofms = []
+    for (mi, (t, pf, ow, oh, oc, ows, ocs, oai)), name in zip(outs, low["npu_outputs"]):
+        k, o = byl[name]
+        C2, H2, W2 = o["chw"]
+        if (ow, oh, oc) != (W2, H2, C2):
+            raise Refused("OT_FMAP %d is %dx%dx%d (w h c), output %s %dx%dx%d" % (mi, ow, oh, oc, name, W2, H2, C2))
+        if av[oai][3] != C2 * H2 * W2 or (ows, ocs) != (0, 0):
+            raise Refused("OT_FMAP %d holds %d B (wstride %d cstride %d) for %d values: not a dense CHW map"
+                          % (mi, av[oai][3], ows, ocs, C2 * H2 * W2))
+        ofms.append({"format": "CHW", "size": C2 * H2 * W2, "mv": mi, "layer": name, "output": k, "chw": [C2, H2, W2],
+                     "proven": False,
+                     "how": "dense CHW, one OT_FMAP per output written by its own output group (the outputs sweep; "
+                            "the format as the single output's, never run on the NPU: G)"})
+    return {"ifm": ifm, "ofm": dict(ofms[0]), "ofms": ofms, "quant_mode": low["quant_mode"]}
 
 
 def ifm_addr(c, y, x, lay):
@@ -1933,8 +2115,27 @@ def to_npu(low, lay, chw):
 
 
 def from_npu(low, lay, ofm, layout="CHW"):
-    """the NPU's OFM buffer -> CHW values (or HWC with layout='HWC')"""
-    C, H, W = low["npu_out_chw"]
+    """the NPU's OFM buffer -> CHW values (or HWC with layout='HWC'). A network with several outputs: ofm is the list
+    of its OT_FMAP buffers in the layout's "ofms" order (NPUC's), and the result their CHW values concatenated in the
+    model's order (from_npu_outputs gives them apart)"""
+    if low.get("outputs"):
+        return b"".join(from_npu_outputs(low, lay, ofm, layout))
+    return _from_npu(low, low["npu_out_chw"], ofm, layout)
+
+
+def from_npu_outputs(low, lay, ofms, layout="CHW"):
+    """the OT_FMAP buffers of a network with several outputs (the layout's "ofms" order) -> [CHW values of each
+    output], in the model's order"""
+    if len(ofms) != len(lay["ofms"]):
+        raise Refused("%d OFM buffers for %d outputs" % (len(ofms), len(lay["ofms"])))
+    got = [None] * len(ofms)
+    for b, o in zip(ofms, lay["ofms"]):
+        got[o["output"]] = _from_npu(low, o["chw"], b, layout)
+    return got
+
+
+def _from_npu(low, chw, ofm, layout):
+    C, H, W = chw
     n = C * H * W
     if len(ofm) < n:
         raise Refused("the OFM is %d B; the network's output is %d" % (len(ofm), n))
@@ -1990,7 +2191,8 @@ def compare(low, lay, pairs, out=print):
         out("compare: rounding %-9s 'none' defect %-5s OFM %s%s: %d of %d bytes differ, max |diff| %d, inputs exact %d/%d"
             % (r, d, ol, (" add %s" % a if elt else "") + (" ReLU %s" % u if rel else ""), s[0], n, s[1], s[2], len(pairs)))
     m = n // len(pairs) if pairs else 0
-    cvals = [o[0] if m and len(o) >= m and o[:m] == bytes([o[0]]) * m else None for _, o in pairs]
+    flat = [b"".join(o) if isinstance(o, list) else o for _, o in pairs]     # several outputs: their buffers
+    cvals = [o[0] if m and len(o) >= m and o[:m] == bytes([o[0]]) * m else None for o in flat]
     if pairs and all(v is not None for v in cvals):
         out("compare: every OFM is constant (byte(s) %s): the activation table of the compiled network writes one value "
             "(dossier/npu-compiler.md 9.11; the GReLU fix under study, oracle/ncp-grelu-patch.py)"
@@ -2186,9 +2388,12 @@ def graph_to_tflite(g):
     for o in ops:
         code(o[0])
 
+    # the subgraph's outputs: the graph's "outputs" (several heads) in their order, else the last layer's tensor
+    gouts = [tmap[str(o)] for o in g["outputs"]] if g.get("outputs") else [cur]
+
     def subgraph():
         return fb.table([(0, "ref", lambda: fb.vec_refs([wtensor(t) for t in tensors])),
-                         (1, "ref", lambda: fb.vec_scalars("i", [first])), (2, "ref", lambda: fb.vec_scalars("i", [cur])),
+                         (1, "ref", lambda: fb.vec_scalars("i", [first])), (2, "ref", lambda: fb.vec_scalars("i", gouts)),
                          (3, "ref", lambda: fb.vec_refs([wop(o) for o in ops])), (4, "ref", lambda: fb.string("main"))])
 
     def opcode(c):
@@ -2441,6 +2646,7 @@ def selftest():
     bad3["input"]["zero_point"] = -5
     ok.append(("quant mode 3 with a zero point != 0 (int8) refused", _refuses(lambda: lower(bad3, quant=3))))
     ok += selftest_graph()
+    ok += selftest_outputs()
     ok += selftest_models()
     for name, v in ok:
         print("selftest: %-70s %s" % (name, "ok" if v else "FAIL"))
@@ -2495,6 +2701,115 @@ def _synthetic_ncp(C, H, W, srcs):
     for k, s in enumerate(srcs):
         b += struct.pack("<31I", *([0, 0, 0, 0, 1 << k, 2, 0, 0, 0] + list(s) + [0] * 11))
     return b
+
+
+def _synthetic_ncp_outputs(cin_hw, outs):
+    """a minimal NCP v22 with several outputs: IN_FMAP (C, H, W) read by one io descriptor, then one OT_FMAP per
+    entry of outs ((C, H, W) in NPUC's order), the first right after IN_FMAP and the others after an IM vector, as
+    NPUC lays them out (docs/format/frame.md 12)"""
+    C, H, W = cin_hw
+    size = (C + 1) // 2 * ((H + 3) // 4 * 4) * 2 * ((W + 7) // 8 * 8)
+    av, mv = [(0, 0, 0, size)], [(0, 1, W, H, C, 0, 0, 0)]
+    for k, (c, h, w) in enumerate(outs):
+        if k == 1:
+            av.append((len(av), 0, 0, 138))
+            mv.append((2, 1, 8, 8, 2, 0, 0, len(av) - 1))
+        av.append((len(av), 0, 0, c * h * w))
+        mv.append((1, 1, w, h, c, 0, 0, len(av) - 1))
+    avo, mvo = 0x80, 0x80 + 16 * len(av)
+    iov = mvo + 32 * len(mv)
+    hd = [0] * 32
+    hd[0], hd[1], hd[31] = 0x0C0FFEE0, 22, 0xC0DEC0DE
+    hd[10:14] = [avo, len(av), mvo, len(mv)]
+    hd[19], hd[20] = iov, 1
+    b = struct.pack("<32I", *hd) + b"".join(struct.pack("<4I", *a) for a in av) + b"".join(struct.pack("<8I", *m) for m in mv)
+    src = (0, 0, 288, 128, 1, (C + 1) // 2, (H + 3) // 4 * 4, 2 * ((W + 7) // 8 * 8), 0, 0, 0)
+    return b + struct.pack("<31I", *([0, 0, 0, 0, 1, 2, 0, 0, 0] + list(src) + [0] * 11))
+
+
+def selftest_outputs():
+    """several network outputs (detection heads): the declaration, NPUC's rule (the outputs are exactly the tensors no
+    layer reads), its order, the harness line, the reference, TFLite, the layout and the conversions"""
+    ok = []
+    r = random.Random(12)
+    g = _sgraph([_sconv("f", 8, 16, r), _sconv("ha", 16, 8, r, inp="f"), _sconv("hb", 16, 12, r, inp="f", k=1),
+                 dict(_sconv("f2", 16, 16, r, inp="f"), strides=[2, 2]), _sconv("hc", 16, 6, r, inp="f2")],
+                shape=(1, 16, 16, 8))
+    g["outputs"] = ["ha", "hb", "hc"]
+    low = lower(g, quant=3)
+    ok.append(("outputs: NPUC's order = its execution order (f2's head, then hb, ha)",
+               low["npu_outputs"] == ["l5_hc", "l3_hb", "l2_ha"] and [o["layer"] for o in low["outputs"]] ==
+               ["l2_ha", "l3_hb", "l5_hc"] and [o["chw"] for o in low["outputs"]] == [[8, 16, 16], [12, 16, 16], [6, 8, 8]]))
+    t = npuc_text(low)
+    ok.append(("outputs: an npuc-net 2 file with 'output 3 l2_ha l3_hb l5_hc'", t.startswith("npuc-net 2\n") and
+               "\noutput 3 l2_ha l3_hb l5_hc\nend\n" in t and "npu_output" not in low and low["npuc_net"] == 2))
+    g1 = _sgraph([_sconv("f", 8, 16, r), _sconv("ha", 16, 8, r, inp="f")])
+    l1 = lower(g1)
+    g1["outputs"] = ["ha"]
+    ok.append(("outputs: one declared output is the single-output network (no 'outputs' key, the same net.npuc)",
+               "outputs" not in lower(g1) and npuc_text(lower(g1)) == npuc_text(l1)))
+    bad = dict(g, outputs=["ha", "hb"])
+    ok.append(("outputs: a tensor read by no layer and not declared refused", "not declared" in _refusal(lambda: lower(bad))))
+    bad = dict(g, outputs=["ha", "hb", "hc", "f"])
+    ok.append(("outputs: an output a layer also reads refused (NPUC outputs only unread tensors)",
+               "also read by a layer" in _refusal(lambda: lower(bad))))
+    bad = dict(g, outputs=["ha", "hb", "hc", "x"])
+    ok.append(("outputs: the network input as an output refused", "network input" in _refusal(lambda: lower(bad))))
+    bad = dict(g, outputs=["ha", "ha", "hb", "hc"])
+    ok.append(("outputs: a tensor named twice refused", "twice" in _refusal(lambda: lower(bad))))
+    bad = dict(g, outputs=["ha", "zz"])
+    ok.append(("outputs: an unknown tensor refused", "neither the network input" in _refusal(lambda: lower(bad))))
+    # the reference: each output as its own conv computes it, NHWC per output
+    x = bytes(r.randrange(256) for _ in range(16 * 16 * 8))
+    xc = model_in_to_chw(low, x)
+    ys = ref_npu_outputs(low, xc)
+    f = ref_conv(low["layers"][0], xc, "half_away", False, 3)
+    ok.append(("outputs: the reference of each output = its conv on the shared feature map",
+               ys[0] == ref_conv(low["layers"][1], f, "half_away", False, 3) and
+               ys[1] == ref_conv(low["layers"][2], f, "half_away", False, 3) and ref_npu(low, xc) == b"".join(ys)))
+    rf = reference(low, x)
+    ok.append(("outputs: reference() gives one NHWC int8 tensor per output, in the model's order",
+               isinstance(rf, list) and [len(v) for v in rf] == [2048, 3072, 384] and
+               rf[1] == bytes(b ^ 0x80 for b in chw_to_nhwc(ys[1], (12, 16, 16)))))
+    # TFLite: several subgraph outputs, read back to the same network
+    g2 = tflite_to_graph(read_tflite(graph_to_tflite(g)), "heads.tflite")
+    l2 = lower(g2, quant=3)
+    ok.append(("outputs: the TFLite form (3 subgraph outputs) lowers to the same network",
+               npuc_text(l2).split("\n", 2)[2] == t.split("\n", 2)[2] and [o["name"] for o in l2["outputs"]] ==
+               ["ha", "hb", "hc"]))
+    # --output: a model cut at its heads (the CPU tail left out), one or several tensors, TFLite or npu-net/1
+    gt = json.loads(json.dumps(g))
+    gt["layers"].append({"op": "reshape", "name": "ra", "input": "ha", "shape": [1, 16 * 16 * 8]})
+    gt["outputs"] = ["ra", "hb", "hc"]
+    tf = read_tflite(graph_to_tflite(gt))
+    names = {t["name"]: i for i, t in enumerate(tf["tensors"])}
+    c2 = tflite_cut(tf, ["ha", "hb", "hc"])
+    l2c = lower(tflite_to_graph(c2, "heads.tflite"), quant=3)
+    ok.append(("--output ha --output hb --output hc: the reshape dropped, three outputs as the JSON's",
+               c2["outputs"] == [names["ha"], names["hb"], names["hc"]] and "reshape" not in [o["op"] for o in c2["ops"]]
+               and npuc_text(l2c).split("\n", 2)[2] == t.split("\n", 2)[2]))
+    c1 = tflite_cut(tf, "ha")
+    ok.append(("--output ha: one output, only the ops it needs (camera's single-tensor cut)",
+               c1["outputs"] == [names["ha"]] and len(c1["ops"]) == 2 and "outputs" not in lower(tflite_to_graph(c1, "a"))))
+    ok.append(("--output f --output ha refused (f is read by ha: NPUC outputs only unread tensors)",
+               "also read by a layer" in _refusal(lambda: lower(tflite_to_graph(tflite_cut(tf, ["f", "ha"]), "a")))))
+    gj = graph_cut(gt, ["ha", "hb", "hc"])
+    ok.append(("--output on an npu-net/1 graph: the same three outputs", npuc_text(lower(gj, quant=3)).split("\n", 2)[2]
+               == t.split("\n", 2)[2] and "ra" not in [L["name"] for L in gj["layers"]]))
+    # the NCP side: one OT_FMAP per output in NPUC's order; the OFMs back to the model's outputs
+    ncp = _synthetic_ncp_outputs((8, 16, 16), [(6, 8, 8), (12, 16, 16), (8, 16, 16)])
+    lay = ncp_layout(low, ncp)
+    ok.append(("outputs: layout: OT_FMAP 1, 3, 4 = outputs 2, 1, 0", [(o["mv"], o["output"]) for o in lay["ofms"]] ==
+               [(1, 2), (3, 1), (4, 0)] and lay["ofm"]["mv"] == 1))
+    ok.append(("outputs: layout: an NCP with one OT_FMAP refused",
+               _refuses(lambda: ncp_layout(low, _synthetic_ncp_outputs((8, 16, 16), [(6, 8, 8)])))))
+    ofms = [bytes(b ^ 0x80 for b in ys[o["output"]]) for o in lay["ofms"]]
+    ok.append(("outputs: from_npu_outputs puts the OFMs back in the model's order", from_npu_outputs(low, lay, ofms) == ys))
+    v = compare(low, lay, [(x, ofms)], out=lambda s: None)
+    w = compare(low, lay, [(x, [ofms[0], ofms[1], bytes(len(ofms[2]))])], out=lambda s: None)
+    ok.append(("outputs: compare: the reference -> bit-exact; one output wrong -> mismatch", v[0] == "bit-exact" and
+               w[0] == "mismatch"))
+    return ok
 
 
 def selftest_graph():
@@ -3139,7 +3454,8 @@ def cmd_lower(a):
         print("lower: unproven: " + u)
     print("lower: PASS: %s (%s %s): input NHWC %s %s, %d NPU layers, output %s %s, quant mode %d -> %s/lowered.json, net.npuc%s"
           % (low["name"], low["source"]["kind"], low["source"]["sha256"][:8], low["input"]["nhwc"], low["io_dtype"],
-             len(low["layers"]), low["output"]["shape"], low["io_dtype"], a.quant, a.dir,
+             len(low["layers"]), low["output"]["shape"] if "output" in low else "%d outputs %s" % (
+                 len(low["outputs"]), " ".join(str(o["shape"]) for o in low["outputs"])), low["io_dtype"], a.quant, a.dir,
              " (npuc-net 2: a graph; compile with a harness that reads it, e.g. $NCPGEN_WORK/n3/root-current)"
              if is_graph(low) else ""))
 
@@ -3148,6 +3464,17 @@ def cmd_ref(a):
     """the CPU reference of an input"""
     low = json.load(open(a.lowered))
     y = reference(low, open(a.input, "rb").read())
+    if isinstance(y, list):
+        # several outputs (the model's order): one file each, or the concatenation in one file
+        paths = a.output.split(",")
+        if len(paths) not in (1, len(y)):
+            die("ref: %d output paths for %d outputs (one, or one per output, comma-separated)" % (len(paths), len(y)))
+        for k, p in enumerate(paths):
+            b = y[k] if len(paths) > 1 else b"".join(y)
+            open(p, "wb").write(b)
+            print("ref: %s -> %s (%s): %d B sha256 %s" % (a.input, p, low["outputs"][k]["name"] if len(paths) > 1 else
+                                                         "%d outputs" % len(y), len(b), hashlib.sha256(b).hexdigest()))
+        return
     open(a.output, "wb").write(y)
     print("ref: %s -> %s: %d B sha256 %s" % (a.input, a.output, len(y), hashlib.sha256(y).hexdigest()))
 
@@ -3157,6 +3484,10 @@ def cmd_layout(a):
     low = json.load(open(a.lowered))
     lay = ncp_layout(low, open(a.ncp, "rb").read())
     json.dump(lay, open(a.layout, "w"), indent=1)
+    if "ofms" in lay:
+        print("layout: %d outputs: %s" % (len(lay["ofms"]), ", ".join(
+            "OT_FMAP %d = output %d (%s) %s %d B" % (o["mv"], o["output"], o["layer"], o["format"], o["size"])
+            for o in lay["ofms"])))
     print("layout: IFM %s, %d B (%d planes of %dx%d)%s; OFM %s %d B%s" % (
         lay["ifm"]["format"], lay["ifm"]["size"], lay["ifm"]["planes"], lay["ifm"]["plane_h"], lay["ifm"]["plane_w"],
         "" if lay["ifm"]["proven"] else " (rule extrapolated to this shape)", lay["ofm"]["format"], lay["ofm"]["size"],
@@ -3175,6 +3506,18 @@ def cmd_to_npu(a):
 def cmd_from_npu(a):
     """the NPU's OFM buffer -> the model's output"""
     low, lay = json.load(open(a.lowered)), json.load(open(a.layout))
+    if low.get("outputs"):
+        # several outputs: the OT_FMAP buffers comma-separated in the layout's order (NPUC's), the model's outputs
+        # comma-separated in the model's order
+        ofms, outs = a.ofm.split(","), a.out.split(",")
+        if len(outs) != len(low["outputs"]):
+            die("from-npu: %d output paths for %d outputs" % (len(outs), len(low["outputs"])))
+        ys = from_npu_outputs(low, lay, [open(p, "rb").read() for p in ofms])
+        for p, y, o in zip(outs, ys, low["outputs"]):
+            y = out_to_model(low, chw_to_nhwc(y, o["chw"]))
+            open(p, "wb").write(y)
+            print("from-npu: -> %s (%s): %d B sha256 %s" % (p, o["name"], len(y), hashlib.sha256(y).hexdigest()))
+        return
     y = out_to_model(low, cpu_tail(low, from_npu(low, lay, open(a.ofm, "rb").read())))
     open(a.out, "wb").write(y)
     print("from-npu: %s -> %s: %d B sha256 %s" % (a.ofm, a.out, len(y), hashlib.sha256(y).hexdigest()))
@@ -3183,7 +3526,9 @@ def cmd_from_npu(a):
 def cmd_compare(a):
     """the NPU's outputs against the CPU reference; 0 when bit-exact or within 1 LSB"""
     low, lay = json.load(open(a.lowered)), json.load(open(a.layout))
-    pairs = [(open(p.split(":", 1)[0], "rb").read(), open(p.split(":", 1)[1], "rb").read()) for p in a.pairs]
+    # several outputs: input.bin:ofm1.bin,ofm2.bin,... (the OT_FMAP buffers in the layout's order)
+    pairs = [(open(p.split(":", 1)[0], "rb").read(), [open(q, "rb").read() for q in p.split(":", 1)[1].split(",")]
+              if low.get("outputs") else open(p.split(":", 1)[1], "rb").read()) for p in a.pairs]
     v, why = compare(low, lay, pairs)
     print("compare: %s (%s)" % (v, why))
     return 0 if v in ("bit-exact", "within 1 LSB") else 2
@@ -3202,12 +3547,13 @@ def main(argv=None):
     p.add_argument("--fold-per-channel", action="store_true")
     p.add_argument("--relu6-range", action="store_true", help="a fused RELU6 clamping inside its output range: the output "
                    "requantised to [0, 6] so the clamp is the saturation (a change of the model)")
-    p.add_argument("--output", metavar="TENSOR", help="a TFLite model cut at this tensor (index or name): its NPU part "
-                   "up to there, the rest left to the CPU")
     p.add_argument("--per-channel-shifts", action="store_true",
                    help="per-channel weight scales as one slope, each channel's power of two in its DRU's shift word "
                         "and the rest folded (docs/format/perchannel.md; the harness's setScale hook compiles it)")
     p.add_argument("--allow-none", action="store_true")
+    p.add_argument("--output", action="append", metavar="TENSOR",
+                   help="cut the model at this tensor (an index or a name): its NPU part up to there, the rest left to "
+                        "the CPU; repeat it for several outputs (a detector's heads, its post-process on the CPU)")
     p.set_defaults(fn=cmd_lower)
     for name, fn, args in (("ref", cmd_ref, ("lowered", "input", "output")),
                            ("layout", cmd_layout, ("lowered", "ncp", "layout")),

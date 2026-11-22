@@ -1,0 +1,6 @@
+# Several outputs, second pass: where NPUC decides a concat stays in SRAM or goes to DRAM when its readers are network
+# outputs (the "Concat in SRAM" layer-block forwarding and the producers' "output DRAM is concatenated" decision)
+str:output DRAM is concatenated in
+str:(Concat in SRAM)
+str:not supported yet for 2020
+str:Concat in SRAM with 0 inputs

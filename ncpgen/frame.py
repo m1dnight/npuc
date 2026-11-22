@@ -44,7 +44,7 @@ if not __package__:     # run as a script: the package is this file's directory
 
 from ncpgen import stream, weights  # noqa: E402
 from ncpgen.common import (MV_IM, MV_IN, MV_OT, MV_P0, MV_WT, Memo, cdiv, decode_isa, exec_order, first_diff,  # noqa
-                           is_graph, ncp_header, ncp_parts, ncp_vectors, network_key, rup, topology)
+                           is_graph, ncp_header, ncp_parts, ncp_vectors, net_outputs, network_key, rup, topology)
 
 # ---- constants of the format (V: NCPObjectGenerator2020::PackingHeader, dossier/npu-compiler.md 1.2) ----------------
 MAGIC1, MAGIC2 = 0x0C0FFEE0, 0xC0DEC0DE
@@ -884,17 +884,29 @@ def plan_graph(low, weight_sizes=None):
     for L in layers:
         for x in ins[L["name"]]:
             cons.setdefault(x, []).append(L["name"])
-    out = low.get("npu_output") or layers[-1]["name"]
-    order = exec_order(out, ins, cons, src)
-    nu = len(P.group_layers) - len(list(itertools.takewhile(lambda x: x is not None, P.group_layers)))
-    gl = P.group_layers[:-nu]                   # the layer of each group but the unflatten's (frame.md 6.8, 6.9)
+    outs = net_outputs(low)                     # several outputs: in NPUC's order (frame.md 12)
+    order = exec_order(outs, ins, cons, src)
+    gl = P.group_layers                         # the layer of each group, None for an output group (frame.md 6.8,
+    #                                             6.9; one output: its read-back's row tiles last, 6.5; several: one
+    #                                             group each, each ending its policy group, 12)
+    nu = gl.count(None)                         # the output groups
+    out = outs[0]
+    ogroups = {}                                # output -> its output groups (several: row tiles of its read-back)
+    for g_, ops_ in enumerate(P.groups):
+        if gl[g_] is None:
+            ogroups.setdefault(next(o_.tensor for o_ in ops_ if o_.kind == "load"), []).append(g_)
     inner = getattr(P, "graph_inner", set())    # a tiled stratum's layers after its head (6.11)
-    if list(dict.fromkeys(gl)) != [n for n in order if by[n]["kind"] != "concat" and n not in inner]:
+    if list(dict.fromkeys(x for x in gl if x is not None)) != \
+            [n for n in getattr(P, "emit_order", order) if by[n]["kind"] != "concat" and n not in inner] or \
+            (len(outs) > 1 and list(ogroups) != outs) or nu < 1:
         raise ValueError("the stream's groups do not follow the layer order")
-    wl = [n for n in order if by[n]["kind"] in ("conv", "relu", "eltwise")]     # the WEIGHT vectors, in order
+    # the WEIGHT vectors, in the NCP's group order (NPUC's layer order for one output; frame.md 12)
+    wl = [n for n in getattr(P, "emit_order", order) if by[n]["kind"] in ("conv", "relu", "eltwise")]
     if weight_sizes is None:
-        weight_sizes = _weight_sizes(low)
-    if len(weight_sizes) != len(wl):
+        # weights.py's sizes come in NPUC's layer order
+        wsz = dict(zip([n for n in order if by[n]["kind"] in ("conv", "relu", "eltwise")], _weight_sizes(low)))
+        weight_sizes = [wsz.get(n) for n in wl]
+    if len(weight_sizes) != len(wl) or None in weight_sizes:
         raise ValueError("%d weight blocks for %d conv/ReLU/eltwise layers" % (len(weight_sizes), len(wl)))
     wsz = dict(zip(wl, weight_sizes))
     chw = {src: tuple(low["input"]["chw"])}
@@ -911,16 +923,31 @@ def plan_graph(low, weight_sizes=None):
         vec(MV_P0 + k, SRAM_VEC)
     C0, H0, W0 = chw[src]
     v_in = vec(MV_IN, cell(C0, H0, W0)["size"], (W0, H0, C0))
-    Co, Ho, Wo = chw[out]
-    v_out = vec(MV_OT, ofm_size(Co, Ho, Wo), (Wo, Ho, Co))
+
+    def ot_vec(o):
+        Co, Ho, Wo = chw[o]
+        return vec(MV_OT, ofm_size(Co, Ho, Wo), (Wo, Ho, Co))
+    v_outs = {outs[0]: ot_vec(outs[0])}
     dmas = [(op, i, g) for g, ops in enumerate(P.groups) for op in ops if op.kind in ("load", "store")
             for i in range(len(op.flags) if op.kind == "store" else 1)]
     vim = {}
-    for op, i, g in dmas:
-        if op.kind == "store" and op.tensor not in vim:
-            c_, h_, w_ = chw[op.tensor]
-            im = _im_vector(c_, h_, w_, c_ * h_ * w_)
-            vim[op.tensor] = vec(MV_IM, im["av"], (im["w"], im["h"], im["c"]))
+    # an IM per stored tensor, in the order of its first store in NPUC's layer order (= the NCP's group order for one
+    # output; several outputs may reorder the groups, not these: V outputs-random m004)
+    xi = {n: j for j, n in enumerate(order)}
+    sts = {}
+    for k_, (op, i, g) in enumerate(dmas):
+        if op.kind == "store":
+            pos = (xi.get(gl[g], len(order)), k_)
+            sts[op.tensor] = min(sts.get(op.tensor, pos), pos)
+    oint = getattr(P, "out_internal", {})      # the outputs' NPUC shapes (a widened pool's one more column)
+    for t in sorted(sts, key=sts.get):
+        c_, h_, w_ = chw[t]
+        hi, wi = oint.get(t, chw[t])[1:]
+        im = _im_vector(c_, hi, wi, c_ * h_ * wi)   # an output's by its NPUC width, as a chain's (f036)
+        vim[t] = vec(MV_IM, im["av"], (im["w"], im["h"], im["c"]))
+    # V (the outputs sweep): the first output's OT_FMAP in its usual place, the others' after the stored tensors' IMs
+    for o in outs[1:]:
+        v_outs[o] = ot_vec(o)
     for n in order:
         if by[n]["kind"] == "concat":
             # V (cat*, g005, g007, g019): every concat also has a vector of its own, by the IM rule on its real
@@ -945,7 +972,7 @@ def plan_graph(low, weight_sizes=None):
         raise ValueError("%s is not an input of %s" % (t, kn))
 
     rows = []           # one (group, direction, src blob, dst blob) per DMA
-    un = (1, Co)
+    un = {}             # output -> the output intrinsic's (n, c)
     k = 0
     while k < len(dmas):
         op, i, g = dmas[k]
@@ -976,16 +1003,18 @@ def plan_graph(low, weight_sizes=None):
             k += 1
             continue
         if what == "dram":
-            c_, h_, w_ = chw[out]
-            if nu == 1:
-                un = _read_back(rows, g, cell(c_, h_, w_), c_, tvec(out), False)
+            o = op.tensor if len(outs) > 1 else out
+            tiles = ogroups[o]
+            c_, h_, w_ = oint.get(o, chw[o])
+            if len(tiles) == 1:
+                un[o] = _read_back(rows, g, cell(chw[o][0], h_, w_), chw[o][0], tvec(o), False)
                 k += 1
                 continue
             # a row tile of a tiled read-back (6.5, plan_tiled's): its rows per IDP from the output's IM
-            uc, uh, uw = P.out_chw
-            u0, u1 = _tile_ranges(uh, nu, 4)[g - (len(P.groups) - nu)]
+            uc, uh, uw = oint.get(o, P.out_chw)
+            u0, u1 = _tile_ranges(uh, len(tiles), 4)[tiles.index(g)]
             got = []
-            _tile_dma(got, cell(uc, uh, uw), (u0, u1, 0, uw - 1), tvec(out), 0, True, g, ns0=True)
+            _tile_dma(got, cell(uc, uh, uw), (u0, u1, 0, uw - 1), tvec(o), 0, True, g, ns0=True)
             j = k + 1
             while j < len(dmas) and dmas[j][2] == g and getattr(dmas[j][0], "what", None) == "dram":
                 j += 1
@@ -1048,8 +1077,11 @@ def plan_graph(low, weight_sizes=None):
                     rows.append((g, 1, _blob(core, op_.srams[i_], 1, 1, sz // 64, 64),
                                  _blob(vim[t], bases[sg] + core * sz, 1, 1, sz // 64, 64)))
                 else:
+                    # SRAM n_stride 0x40000 - segments x h x w, 0 from SRAM offset 0 (as the tiles' and clustered
+                    # loads', 6.5, 6.11; V: g141, g169 at 0, outputs-unseen m1015 at 3328)
                     h, w = segs[0] * lay["Hp"], 2 * lay["Wp"]
-                    rows.append((g, 1, _blob(q, op_.srams[i_], 1, len(segs), h, w),
+                    sr = op_.srams[i_]
+                    rows.append((g, 1, _blob(q, sr, 1, len(segs), h, w, ns=IDP_STRIDE - len(segs) * h * w if sr else 0),
                                  _blob(vim[t], q * h * w, 1, len(segs), h, w, cs=(ncore - 1) * h * w)))
         elif op.kind == "store":
             prod = gl[g]
@@ -1092,21 +1124,44 @@ def plan_graph(low, weight_sizes=None):
         flag = op.flags[i] if op.kind == "store" else op.flag
         io.append([n_ + 1, getattr(op, "bid", 0) or 0, g, 0, flag, 2, 0, 1, 0] + sb + db)
     G = len(P.groups)
-    ol = cell(Co, Ho, Wo)
-    groups = [{"index": g, "kind": "output" if g >= G - nu else ("dma" if any(x[2] == g for x in io) else "plain")}
+    groups = [{"index": g, "kind": "output" if gl[g] is None else ("dma" if any(x[2] == g for x in io) else "plain")}
               for g in range(G)]
-    outs = [{"n": un[0], "c": un[1], "C": Co, "H": Ho, "W": Wo, "Hi": Ho, "Wi": Wo, "Hp": ol["Hp"], "Wp": ol["Wp"],
-             "sram_off": 0, "group": G - 1}]
+    if len(outs) > 1:
+        # one output group per output (or per row tile of its read-back), in NPUC's order, each writing the output's
+        # own OT_FMAP (frame.md 12)
+        ufs = []
+        for o in outs:
+            Co, Ho, Wo = chw[o]
+            _, Hi, Wi = oint.get(o, chw[o])
+            ol = cell(Co, Hi, Wi)
+            tiles = ogroups[o]
+            if len(tiles) == 1:
+                ufs.append({"n": un[o][0], "c": un[o][1], "C": Co, "H": Ho, "W": Wo, "Hi": Hi, "Wi": Wi,
+                            "Hp": ol["Hp"], "Wp": ol["Wp"], "sram_off": 0, "group": tiles[0], "v_out": v_outs[o],
+                            "layer": o})
+                continue
+            for u, (u0, u1) in enumerate(_tile_ranges(Hi, len(tiles), 4)):
+                r_ = u1 - u0 + 1
+                ufs.append({"n": ol["n"], "c": ol["cpi"], "C": Co, "H": r_, "W": Wo, "Hi": r_, "Wi": Wi,
+                            "Hp": rup(r_, 4), "Wp": ol["Wp"], "sram_off": 0, "group": tiles[u], "dst_off": u0 * Wo,
+                            "dst_cs": (Ho - r_) * Wo, "v_out": v_outs[o], "layer": o})
+        return {"graph": True, "keep_bids": True, "av": av, "mv": mv, "io": io, "groups": groups,
+                "v_out": v_outs[out], "v_w": [wvec[n] for n in wl], "wlayers": wl,
+                "chunks": [], "layers": [L["kind"] for L in layers], "unflatten": ufs[0], "outputs": ufs}
+    Co, Ho, Wo = chw[out]
+    _, Hi, Wi = oint.get(out, chw[out])         # a widened pool's one more column (as a chain's)
+    ol = cell(Co, Hi, Wi)
+    outs = [{"n": un[out][0], "c": un[out][1], "C": Co, "H": Ho, "W": Wo, "Hi": Hi, "Wi": Wi, "Hp": ol["Hp"],
+             "Wp": ol["Wp"], "sram_off": 0, "group": G - 1}] if nu == 1 else []
     if nu > 1:
         uc, uh, uw = P.out_chw
         lu = cell(uc, uh, uw)
-        outs = []
         for u, (u0, u1) in enumerate(_tile_ranges(uh, nu, 4)):
             r_ = u1 - u0 + 1
             outs.append({"n": lu["n"], "c": lu["cpi"], "C": Co, "H": r_, "W": Wo, "Hi": r_, "Wi": uw, "Hp": rup(r_, 4),
                          "Wp": lu["Wp"], "sram_off": 0, "group": G - nu + u, "dst_off": u0 * Wo,
                          "dst_cs": (Ho - r_) * Wo})
-    return {"graph": True, "keep_bids": True, "av": av, "mv": mv, "io": io, "groups": groups, "v_out": v_out,
+    return {"graph": True, "keep_bids": True, "av": av, "mv": mv, "io": io, "groups": groups, "v_out": v_outs[out],
             "v_w": [wvec[n] for n in wl], "wlayers": wl,
             "chunks": [], "layers": [L["kind"] for L in layers], "unflatten": outs[0], "outputs": outs}
 
@@ -1693,8 +1748,7 @@ def graph_shapes(low):
     output shapes {name: {"in": (C, H, W), "out": (Co, Ho, Wo)}}, by internal_shapes' rule (a VALID pool that drops
     columns keeps one more); a concat's input is its first input's shape"""
     ins, cons, by, src = topology(low)
-    out = low.get("npu_output") or low["layers"][-1]["name"]
-    order = exec_order(out, ins, cons, src)
+    order = exec_order(net_outputs(low), ins, cons, src)
     chw = {src: tuple(low["input"]["chw"])}
     shp = {}
     for n in order:
@@ -2419,7 +2473,8 @@ def intrinsics(low, p=None):
     outs = {u["group"]: u for u in p.get("outputs", [p["unflatten"]])}
     for g in p["groups"]:
         if g["kind"] == "output":
-            out.append(output_intrinsic(outs[g["index"]], p["v_out"], g["index"]))
+            u = outs[g["index"]]
+            out.append(output_intrinsic(u, u.get("v_out", p["v_out"]), g["index"]))
         elif g["kind"] == "dma":
             out.append(stub_intrinsic())
         else:

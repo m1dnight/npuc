@@ -1,0 +1,18 @@
+# Several network outputs: how NPUC's frontend decides which data nodes are outputs (unread blobs, the HAL's marks),
+# their order, and how the backend lays them out (output groups, read-back descriptors, the output intrinsic)
+sym:appendOutputDataNode
+sym:isIntermediateOutput
+sym:addUnflattenGraphNode
+sym:constructFromRawNetwork
+sym:NNNetwork12setUpNetwork
+sym:NNNetwork10removeFake
+sym:NNNetwork12mulPathsSort
+sym:NNGraphCgObject11getOutputID
+sym:NNGraphCgObject9numOutput
+sym:isConvolutionFakeLayer
+callers:appendOutputDataNode
+callers:addUnflattenGraphNode
+str:outputOrder
+str:Network Output:
+str:Output size is
+str:partial output for node

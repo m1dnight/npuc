@@ -7,10 +7,12 @@ NPUC's Eltwise needs).
   stream_graphs.py write <dir> [--set split]      <dir>/<name>.json for every variant
   stream_graphs.py compile <dir> [name...] [--set split]   write, then npuc-local.sh each into <dir>/<name>/ (NPU_ROOT
                                                            below)
-  stream_graphs.py random <dir> <seed> [count] [--set split|large|camera]   seeded random graphs, compiled (large: 64..160
-                                                           px maps that NPUC tiles inside the graph; camera: the same
-                                                           at 256..320 px inputs, v<seed>)
+  stream_graphs.py random <dir> <seed> [count] [--set split|large|outputs|camera]   seeded random graphs, compiled
+                                                           (large: 64..160 px maps that NPUC tiles inside the graph;
+                                                           outputs: detector-like graphs with several heads, frame.md
+                                                           12; camera: the large ones at 256..320 px inputs, v<seed>)
   --set split: graphs with layers NPUC splits over several groups (its CMDQ cut, cmdq.md 7d) or tiles
+  --set outputs: networks with several outputs (frame.md 12)
 """
 import argparse
 import json
@@ -74,6 +76,10 @@ class Net:
                                  "output": {"scale": out, "zero_point": 0}})
         self.ch[name], self.hw[name], self.sc[name] = sum(self.ch[i] for i in ins), self.hw[ins[0]], out
         return name
+
+    def outputs(self, *names):
+        """the network's outputs (npu-net/1 "outputs"): several heads (NPUC outputs every blob no layer reads)"""
+        self.g["outputs"] = list(names)
 
     def relu(self, name, inp):
         self.g["layers"].append({"op": "relu", "name": name, "input": inp})
@@ -313,6 +319,78 @@ def split_variants():
     return V
 
 
+def output_variants():
+    """{name: Net} of the several-outputs sweep (docs/format/frame.md 12): heads off one feature map, heads at two
+    scales as in SSD, outputs of different sizes and channel counts (3/5/7 included), pool/add/concat outputs, the
+    declared order against the layer order"""
+    V = {}
+
+    def mk(name, h=16, w=16, c=8, seed=1):
+        n = Net(name, h, w, c, seed)
+        V[name] = n
+        return n
+
+    n = mk("o-heads2")                       # two heads off one feature map
+    f = n.conv("c0", "image", 16)
+    n.outputs(n.conv("ha", f, 8), n.conv("hb", f, 16, k=1))
+    n = mk("o-heads2-rev")                   # the same, declared in the other order
+    f = n.conv("c0", "image", 16)
+    a, b = n.conv("ha", f, 8), n.conv("hb", f, 16, k=1)
+    n.outputs(b, a)
+    n = mk("o-heads3")                       # three heads, box/class-like channel counts
+    f = n.conv("c0", "image", 16)
+    n.outputs(n.conv("hbox", f, 12), n.conv("hcls", f, 6), n.conv("hx", f, 4, k=1))
+    n = mk("o-c357", seed=2)                 # 3, 5 and 7 channels (frame.md 9.1)
+    f = n.conv("c0", "image", 16)
+    n.outputs(n.conv("h3", f, 3), n.conv("h5", f, 5), n.conv("h7", f, 7))
+    n = mk("o-ssd2", seed=3)                 # heads at two scales (SSD): 16x16 and 8x8
+    f1 = n.conv("c0", "image", 16)
+    f2 = n.conv("c1", f1, 32, stride=2)
+    n.outputs(n.conv("b1", f1, 12), n.conv("k1", f1, 8), n.conv("b2", f2, 24), n.conv("k2", f2, 16))
+    n = mk("o-ssd2-late", seed=4)            # the first scale's heads defined after the second scale
+    f1 = n.conv("c0", "image", 16)
+    f2 = n.conv("c1", f1, 32, stride=2)
+    b2, k2 = n.conv("b2", f2, 24), n.conv("k2", f2, 16)
+    b1, k1 = n.conv("b1", f1, 12), n.conv("k1", f1, 8)
+    n.outputs(b1, k1, b2, k2)
+    n = mk("o-early", seed=5)                # a head on the stem, the chain going on
+    f1 = n.conv("c0", "image", 16)
+    h = n.conv("h0", f1, 8, k=1)
+    t = n.conv("c2", n.conv("c1", f1, 16), 16)
+    n.outputs(t, h)
+    n = mk("o-sizes", h=20, w=12, seed=6)    # different sizes and channel counts
+    f1 = n.conv("c0", "image", 24)
+    f2 = n.pool("p1", f1)
+    n.outputs(n.conv("ha", f1, 20, k=1), n.conv("hb", f2, 40), n.conv("hc", f2, 9, k=1))
+    n = mk("o-pool", seed=7)                 # a pool output beside a conv output
+    f1 = n.conv("c0", "image", 16)
+    n.outputs(n.pool("p1", f1), n.conv("ha", f1, 8))
+    n = mk("o-add", seed=8)                  # an eltwise output beside a conv output
+    f1 = n.conv("c0", "image", 8)
+    a = n.add("a1", n.conv("c1", f1, 8, act="none", out=1 / 256), n.conv("c2", f1, 8, act="none", out=1 / 256))
+    n.outputs(a, n.conv("ha", f1, 16))
+    n = mk("o-cat", seed=9)                  # a concat output beside a conv output
+    f1 = n.conv("c0", "image", 16)
+    k = n.concat("k1", [n.conv("c1", f1, 16), n.conv("c2", f1, 16)])
+    n.outputs(k, n.conv("ha", f1, 8))
+    n = mk("o-res", seed=10)                 # a residual block's output and a head on its input
+    f1 = n.conv("c0", "image", 8)
+    a = n.add("a1", n.conv("c2", n.conv("c1", f1, 8), 8, act="none", out=1 / 256), f1, act="relu")
+    n.outputs(n.conv("hb", a, 12), n.conv("ha", f1, 6))
+    # large maps (NPUC tiles inside the graph, frame.md 6.11): a tiled backbone layer under two heads; a head NPUC
+    # tiles; a head whose read-back NPUC cuts in rows
+    n = mk("o-tiled-stem", h=160, w=160, c=8, seed=11)
+    f1 = n.pool("p0", n.conv("c0", "image", 32, stride=2))
+    n.outputs(n.conv("ha", f1, 12, k=1), n.conv("hb", f1, 6, k=1))
+    n = mk("o-tiled-head", h=96, w=96, c=16, seed=12)
+    f1 = n.conv("c0", "image", 16)
+    n.outputs(n.conv("ha", f1, 64), n.conv("hb", n.pool("p1", f1), 8, k=1))
+    n = mk("o-big-readback", h=128, w=128, c=8, seed=13)
+    f1 = n.conv("c0", "image", 8)
+    n.outputs(n.conv("ha", f1, 40, k=1), n.conv("hb", n.pool("p1", f1), 8, k=1))
+    return V
+
+
 def random_split_net(name, seed):
     """a seeded random graph with wide layers (the unseen test of the graph-split rules): a 3..8 px map, 1 to 3
     blocks (a residual, an add of two wide branches, a concat, a standalone ReLU after a pool, a wide 1x1 conv NPUC
@@ -408,6 +486,58 @@ def random_camera_net(name, seed):
     return random_large_net(name, seed, sizes=(256, 257, 288, 300, 320))
 
 
+def random_outputs_net(name, seed):
+    """a seeded random detector-like graph with several outputs (the unseen test of frame.md 12): a stem, then 1 to 3
+    feature maps (stride-2 convs or pools between them, sometimes a residual block or a concat in the backbone), each
+    with 1 to 3 heads (box/class-like convs of 1..40 channels, 3, 5 and 7 among them; 1x1 or 3x3; now and then a pool,
+    an add or a concat as an output)"""
+    r = random.Random(seed)
+    h = r.choice([8, 12, 16, 20, 24, 32, 40, 48])
+    w = r.choice([8, 12, 16, 20, 24, 28, 32, 40])
+    c0 = r.choice([3, 4, 8, 12, 16])
+    n = Net(name, h, w, c0, seed)
+    k = [0]
+
+    def nm(p):
+        k[0] += 1
+        return "%s%d" % (p, k[0])
+
+    def conv(t, c, kk=None, s=1, act="relu", out=1 / 128):
+        return n.conv(nm("c"), t, c, k=kk or r.choice([1, 3, 3]), stride=s, act=act, out=out)
+
+    t = conv("image", r.choice([8, 16, 24, 32]), kk=3)
+    outs = []
+    for level in range(r.randint(1, 3)):
+        if level:
+            if min(n.hw[t]) < 6:
+                break
+            t = conv(t, r.choice([16, 24, 32, 48]), kk=3, s=2) if r.random() < 0.7 else \
+                n.pool(nm("p"), t, kind=r.choice(["max", "avg"]))
+        kind = r.random()
+        if kind < 0.2:                       # a residual block in the backbone
+            c = n.ch[t]
+            b = conv(conv(t, c, kk=3), c, kk=3, act="none", out=1 / 256)
+            t = n.add(nm("a"), b, t, act="relu", out=1 / 128)
+        elif kind < 0.3:                     # a concat of two branches
+            t = n.concat(nm("k"), [conv(t, 16), conv(t, 16)])
+        for _ in range(r.randint(1, 3)):
+            hk = r.random()
+            if hk < 0.08 and min(n.hw[t]) >= 4:
+                outs.append(n.pool(nm("p"), t, kind=r.choice(["max", "avg"])))
+            elif hk < 0.14:
+                cc = r.choice([8, 16])
+                outs.append(n.add(nm("a"), conv(t, cc, act="none", out=1 / 256), conv(t, cc, act="none", out=1 / 256)))
+            elif hk < 0.2:
+                outs.append(n.concat(nm("k"), [conv(t, 16), conv(t, r.choice([8, 16]))]))
+            else:
+                cc = r.choice([1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 18, 24, 32, 40])
+                outs.append(conv(t, cc, act=r.choice(["relu", "relu", "none"]), out=r.choice([1 / 128, 1 / 64])))
+    if len(outs) < 2:
+        outs.append(conv(t, r.choice([4, 6, 12, 24]), kk=1))
+    n.outputs(*outs)
+    return n
+
+
 def random_net(name, seed):
     """a seeded random graph: a stem, then 1 to 4 blocks (residual from the input or a computed tensor, add of two
     branches, concat of 2 or 3 branches, a standalone ReLU or ReLU6 after a pool, add or concat, pools between)"""
@@ -475,22 +605,23 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument("dir")
         p.add_argument("names", nargs="*")
-        p.add_argument("--set", choices=("main", "split"), default="main")
+        p.add_argument("--set", choices=("main", "split", "outputs"), default="main")
     p = sub.add_parser("random", help="random graph networks g<seed> (--set split: wide ones, s<seed>; --set large: "
-                                      "64..160 px ones NPUC tiles, t<seed>; --set camera: 256..320 px, v<seed>), "
+                                      "64..160 px ones NPUC tiles, t<seed>; --set outputs: several heads, m<seed>; "
+                                      "--set camera: 256..320 px, v<seed>), "
                                       "compiled")
     p.add_argument("dir")
     p.add_argument("seed", type=int)
     p.add_argument("count", type=int, nargs="?", default=40)
-    p.add_argument("--set", choices=("main", "split", "large", "camera"), default="main")
+    p.add_argument("--set", choices=("main", "split", "large", "outputs", "camera"), default="main")
     a = ap.parse_args(argv)
     if a.cmd == "random":
         f, pre = {"split": (random_split_net, "s"), "large": (random_large_net, "t"),
-                  "camera": (random_camera_net, "v")}.get(a.set, (random_net, "g"))
+                  "outputs": (random_outputs_net, "m"), "camera": (random_camera_net, "v")}.get(a.set, (random_net, "g"))
         V = {"%s%03d" % (pre, s): f("%s%03d" % (pre, s), s) for s in range(a.seed, a.seed + a.count)}
         names = list(V)
     else:
-        V = split_variants() if a.set == "split" else variants()
+        V = {"split": split_variants, "outputs": output_variants}.get(a.set, variants)()
         names = a.names or list(V)
     d = a.dir
     os.makedirs(d, exist_ok=True)

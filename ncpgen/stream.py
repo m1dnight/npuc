@@ -35,7 +35,7 @@ if not __package__:     # run as a script: the package is this file's directory
 
 from ncpgen import frame, grelu, weights  # noqa: E402
 from ncpgen.common import (CMDQ, INTC, MTC, NFU, Memo, cdiv, concat_in_sram, decode_isa, encode_isa,  # noqa: E402
-                           exec_order, is_graph, ncp_parts, network_key, set_reg_addr,
+                           exec_order, is_graph, ncp_parts, net_outputs, network_key, set_reg_addr,
                            set_reg_op, GRAPH_KINDS)
 
 
@@ -1351,12 +1351,15 @@ class Plan:
                 if i != src and i not in by:
                     raise Unsupported("%s reads %s, not an earlier layer" % (L["name"], i))
                 cons.setdefault(i, []).append(L["name"])
-        out = low.get("npu_output") or layers[-1]["name"]
-        if [L["name"] for L in layers if L["name"] not in cons] != [out]:
-            raise Unsupported("not a single output")
-        order = exec_order(out, ins, cons, src)
+        # the network's outputs (several: every layer no layer reads, in NPUC's order; frame.md 12)
+        outs = net_outputs(low)
+        if sorted(L["name"] for L in layers if L["name"] not in cons) != sorted(outs):
+            raise Unsupported("the network's outputs are not the layers no layer reads")
+        order = exec_order(outs, ins, cons, src)
         if len(order) != len(layers):
             raise Unsupported("layers the output does not depend on")
+        if [n for n in order if n in outs] != outs:
+            raise Unsupported("the outputs are not in NPUC's order")
         order = [by[n] for n in order]
         for L in order:
             if L["kind"] == "concat":
@@ -1387,6 +1390,7 @@ class Plan:
         tgeo = {}                                           # stratum head -> its tiles (graph_stratum)
         psize = None
         pos = 1
+        unfl = {}                                           # output -> its UNFLATTEN node's position
         for L in order:
             n, k = L["name"], L["kind"]
             c, (h, w) = chs[ins[n][0]], hw[ins[n][0]]
@@ -1430,9 +1434,13 @@ class Plan:
             if n not in tst:
                 head[n], tail[n] = pos, pos + na - 1
             pos += na
+            if n in outs:
+                # an output's UNFLATTEN node, then its output data node, right after it in NPUC's node order (V: the
+                # outputs sweep's NODE ORDER logs; the last of them for a single output)
+                unfl[n] = pos
+                pos += 2
             chs[n], hw[n] = cout, (ho, wo)
             geo[n] = (c, h, w, cout, ho, wo, pads)
-        unfl = pos
         try:
             winfo = {x["name"]: x for x in weights.weight_layer_info(low) if x["kind"] == "conv"}
         except ValueError as e:
@@ -1442,12 +1450,12 @@ class Plan:
         # block must pass too (frame.forwarding, mode "cs"): a block that fails it (large random t2022: the concat in
         # DRAM, its single reader's chunk a second citizen, the next block's pool output a first citizen) is refused
         fwd = frame.forwarding(low, pol)
-        scats = [kn for kn in cats if concat_in_sram(kn, out, by, ins, cons)
+        scats = [kn for kn in cats if concat_in_sram(kn, outs, by, ins, cons)
                  and not any(x in tst for x in ins[kn] + cons.get(kn, [])) and frame.concat_ofm_shared(kn, cons, fwd)]
         # tensors their readers load from DRAM: the network input, a concat's buffer, a tiled stratum's output read by
         # a layer
-        dsrc = [src] + [kn for kn in cats if kn not in scats and kn != out]
-        dsrc += [st["layers"][-1] for st in pol["strata"] if st["layers"][-1] != out
+        dsrc = [src] + [kn for kn in cats if kn not in scats and kn not in outs]
+        dsrc += [st["layers"][-1] for st in pol["strata"] if st["layers"][-1] not in outs
                  and any(by[r]["kind"] != "concat" for r in cons.get(st["layers"][-1], []))]
         eltd = {L["name"] for L in order if L["kind"] == "eltwise" and any(i in dsrc for i in ins[L["name"]])}
         into = {}                                           # producer -> (SRAM concat, its first plane slot)
@@ -1459,8 +1467,9 @@ class Plan:
                 into[i] = (kn, o)
                 o += Dist(chs[i]).ppc
         stored = {}                                         # tensor -> where its producer stores it
-        if by[out]["kind"] != "concat":
-            stored[out] = ("out", out)
+        for o in outs:
+            if by[o]["kind"] != "concat":
+                stored[o] = ("out", o)
         for e in sorted(eltd):
             for i in ins[e]:
                 if i not in dsrc:
@@ -1472,6 +1481,7 @@ class Plan:
                 if i in stored:
                     raise Unsupported("%s goes to DRAM twice" % i)
                 stored[i] = ("cat", kn)
+        reloads = set()                                     # (tensor, reader) loading a stratum's input back
         for st in pol["strata"]:
             t_in, t_out = ins[st["layers"][0]][0], st["layers"][-1]
             if t_in != src and t_in not in dsrc:
@@ -1480,12 +1490,15 @@ class Plan:
                 if t_in in tst:
                     raise Unsupported("tiling in a graph: two strata joined")
                 stored.setdefault(t_in, ("im", t_in))       # its producer stores it for the tiles
+                # its other readers load it back from DRAM, into its own chunk, which stays live to them (V: outputs
+                # o-big-readback: a pool beside a tiled head)
+                reloads |= {(t_in, r) for r in cons.get(t_in, []) if r not in tst and by[r]["kind"] in ("conv", "pool")}
             stored.setdefault(t_out, ("im", t_out))
 
         def end_of(t):
             e = [head[r] for r in cons.get(t, []) if by[r]["kind"] != "concat" and r not in tst]
-            if t == out:
-                e.append(unfl)
+            if t in unfl:
+                e.append(unfl[t])
             return max(e) if e else tail[t]
 
         chunks = []
@@ -1529,7 +1542,14 @@ class Plan:
         for kn in scats:
             if not bulb_fits(kn, "cs"):
                 raise Unsupported("a concat in SRAM NPUC's forwarding refuses (%s): not modelled" % kn)
-        shared = any(all(bulb_root(i) == src for i in ins[kn]) and bulb_fits(kn, "is") for kn in cats)
+
+        def closed(kn, r):
+            # every reader of the root r lies on one of concat kn's branches: NPUC finds the layer-block (a root read
+            # elsewhere too, e.g. by a detection head, starts none: V outputs-random m028, no "Input sharing" block)
+            on = {x for x in bulb_nodes(kn) if ins[x][0] == r} | ({kn} if r in ins[kn] else set())
+            return set(cons.get(r, [])) <= on
+        shared = any(all(bulb_root(i) == src for i in ins[kn]) and closed(kn, src) and bulb_fits(kn, "is")
+                     for kn in cats)
         # a concat whose branches all start at one computed tensor ("Input sharing" from a layer): when that layer
         # is a single node (a pool, a ReLU, a conv without pad or stride), NPUC stores it to DRAM, its first reader
         # loads it back and the other branches share it in SRAM (V: g005, g008, g009, g030, g047); after a padded
@@ -1538,7 +1558,7 @@ class Plan:
         for kn in cats:
             rs = {bulb_root(i) for i in ins[kn]}
             r = min(rs)
-            if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r]:
+            if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r] and closed(kn, r):
                 if r in tst:
                     raise Unsupported("tiling in a graph: a concat's branches from a tiled stratum's output")
                 if any(x in tst for x in bulb_nodes(kn)):
@@ -1684,8 +1704,8 @@ class Plan:
                 d["ins"] = [rch[i, n] if (i, n) in rch else tens[i] for i in ins[n]]
                 full[n] = True
             else:
-                d["out"] = chunk("CONCAT", Dist(cout).ppc * cells(ho, wo) * 64, [unfl, unfl], bt) \
-                    if n == out else store.get(n)
+                d["out"] = chunk("CONCAT", Dist(cout).ppc * cells(ho, wo) * 64, [unfl[n], unfl[n]], bt) \
+                    if n in outs else store.get(n)
                 full[n] = True
             if k == "pool" and i0 in segs:                  # a pool keeps its input's segments
                 segs[n] = d["segs"] = segs[i0]
@@ -1822,8 +1842,112 @@ class Plan:
             return "core" if nfu and (d["din"].ppc > 1 or d["din"].c % 2) else "whole"     # (g175: 3 channels)
 
         self.info = []
+        self.out_chws, self.out_internal = [], {}
+        multi = len(outs) > 1
+
+        def unflatten_group(out):
+            if by[out]["kind"] == "concat":
+                o = {"dout": Dist(chs[out]), "ho": hw[out][0], "wo": hw[out][1]}
+            else:
+                o = info[out]
+            nu = unflatten_tiles(o, o["ho"], o["wo"])
+            self.out_chw = (o["dout"].c, o["ho"], o["wo"])
+            self.out_chws.append(self.out_chw)
+            self.out_internal[out] = self.out_chw   # NPUC's shape of the output (a widened pool: one more column)
+            if nu == 1:
+                ld = Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out)
+                if multi:
+                    ld.out_chw = self.out_chw       # the read-back's profile: this output's (npuc_profile)
+                self.groups.append([ld, Op("nopop", deps=[0]), Op("unflatten")])
+                self.group_layers.append(None)
+            # a tiled read-back, as a chain's (frame.md 6.5: row tiles by NPUC's policy, each its own output group,
+            # loaded per core with several planes per core; V: large random t1039)
+            # (several outputs: each output's row tiles in a row, V: outputs o-tiled-head, o-big-readback)
+            for u in range(nu if nu > 1 else 0):
+                nl = o["dout"].cores if o["dout"].ppc > 1 else 1
+                ops = [Op("load", what="dram", flag=self.event(), utile=u, core=k if nl > 1 else None, tensor=out)
+                       for k in range(nl)]
+                if multi:
+                    for op in ops:          # the read-back's profile: this output's tiles (npuc_profile)
+                        op.out_chw, op.nu, op.u = self.out_chw, nu, u
+                self.groups.append(ops + [Op("nopop", deps=list(range(nl))), Op("unflatten")])
+                self.group_layers.append(None)
+
+        def loads_first(L, prev, seq):
+            # a reader of a tensor in DRAM loads it, unless the input is shared by a concat's branches and an earlier
+            # branch loaded it, or the layer just before loaded it the same way (NPUC's LIR skips an identical load;
+            # V: add2, in-two vs add-branches, g020; g022: a concat's buffer read by two convs)
+            n, k = L["name"], L["kind"]
+            d = info[n]
+            i0 = ins[n][0]
+            firstr = next(x["name"] for x in seq if x["name"] in cons[i0]) if i0 in cons else None
+            # (the same tensor, the same way, into the same SRAM chunk, which the layer just before did not overwrite
+            # with its output: V outputs-unseen2 m2028 loads again; its partial sums do not count, V: graph-split-random
+            # s001 skips the load over them, G for its PAD and REFORMAT chunks, which no case has overlapped)
+            ld = (i0, load_kind(L, d), d["in"].off) if (i0 in dsrc or (i0, n) in spilled or (i0, n) in reloads) \
+                and k != "eltwise" else None
+            if (i0, n) in spilled or (i0, n) in reloads:
+                first = True                # a spilled tensor's reader past the spill (frame.md 6.12), a stratum
+                #                             input's other reader
+            elif (i0 == src and shared) or i0 in wshared:
+                first = n == firstr
+            elif ld is not None:
+                a, b = d["in"].off, d["in"].off + d["in"].size
+                first = prev is None or ld != prev[0] or any(o < b and a < o + z for o, z in prev[1])
+            else:
+                first = i0 in roots and n == firstr
+            wr = [(c.off, c.size) for c in (d.get("out"),) if c is not None and c.size and c.off is not None]
+            return first, (ld, wr)
+        # the NCP's group order. One output: NPUC's layer order, the output group last. Several: NPUC's policy groups
+        # (its log's "Node n, create group g"; V: the outputs sweeps, frame.md 12): a layer that reads its input from
+        # DRAM (a tiled stratum's tiles too, G) starts a group, as does every output's UNFLATTEN (a group of its own);
+        # any other layer joins its input's group (the latest of its inputs'), so a head reading a feature map in
+        # SRAM runs with that map's producer, before the groups started after it; groups in order, layers in NPUC's
+        # order inside each
+        seq = [("layer", L) for L in order] + [("unf", outs[0])]
+        if multi:
+            home, ng, prev, key = {src: 0}, 0, None, {}     # home: the group holding a tensor in SRAM
+            for j, L in enumerate(order):
+                n, k = L["name"], L["kind"]
+                if j == 0:
+                    g = 0
+                elif n in tst:
+                    g = home[tst[n]["layers"][0]] if n not in tgeo else ng + 1
+                    prev = None
+                elif k == "concat":
+                    g = max(home[i] for i in ins[n])
+                else:
+                    first, prev = loads_first(L, prev, order)
+                    i0 = ins[n][0]
+                    if n in eltd if k == "eltwise" else \
+                            first or (i0 in dsrc and not ((i0 == src and shared) or i0 in wshared)):
+                        # it reads its input(s) from DRAM: a new group (also when the LIR then skips an identical load:
+                        # V graph add2, g022, graph-split-random s001 log a group for both readers), which then holds
+                        # what it loaded (a branch sharing a loaded tensor joins it: V outputs-random m004)
+                        g = ng + 1
+                        for i in ins[n] if k == "eltwise" else ins[n][:1] if first else []:
+                            if k != "eltwise" or i in dsrc:
+                                home[i] = g
+                    else:
+                        g = max(home[i] for i in ins[n])
+                ng = max(ng, g)
+                home[n] = g
+                key[n] = (g, 0, j)
+                if n in outs:
+                    ng += 1
+                    key["unf " + n] = (ng, 1, j)
+                    prev = (("unflatten", n), [])   # its UNFLATTEN runs next: a reader of the same DRAM tensor after it
+                    #                             loads it again (V: outputs-unseen m1006, m1017)
+            seq = sorted([("layer", L) for L in order] + [("unf", o) for o in outs],
+                         key=lambda e: key[e[1]["name"]] if e[0] == "layer" else key["unf " + e[1]])
+        emit = [e[1] for e in seq if e[0] == "layer"]
+        self.emit_order = [L["name"] for L in emit]     # the layers in the NCP's order (frame.plan_graph checks it)
         prev = None                         # what the layer run just before loaded from DRAM, and how
-        for L in order:
+        for what, L in seq:
+            if what == "unf":
+                unflatten_group(L)
+                prev = (("unflatten", L), [])
+                continue
             n, k = L["name"], L["kind"]
             d = info[n]
             i0 = ins[n][0]
@@ -1851,20 +1975,7 @@ class Plan:
                     self.group_layers += [n] * (len(self.groups) - len(self.group_layers))
                 prev = None
                 continue
-            # a reader of a tensor in DRAM loads it, unless the input is shared by a concat's branches and an earlier
-            # branch loaded it, or the layer just before loaded it the same way (NPUC's LIR skips an identical load;
-            # V: add2, in-two vs add-branches, g020; g022: a concat's buffer read by two convs)
-            firstr = next(x["name"] for x in order if x["name"] in cons[i0]) if i0 in cons else None
-            ld = (i0, load_kind(L, d)) if (i0 in dsrc or (i0, n) in spilled) and k != "eltwise" else None
-            if (i0, n) in spilled:
-                first = True
-            elif (i0 == src and shared) or i0 in wshared:
-                first = n == firstr
-            elif ld is not None:
-                first = ld != prev
-            else:
-                first = i0 in roots and n == firstr
-            prev = ld
+            first, prev = loads_first(L, prev, emit)
             if i0 != src and k != "eltwise":
                 # an intermediate loaded whole comes in one DMA per distinct per-core plane count; loaded per core,
                 # in one (V: g008's ReLU, 20 channels: 2; g030, g047's padded convs, 36 and 20 channels: 1)
@@ -1889,24 +2000,6 @@ class Plan:
             if n in copies:                 # a trim-and-spill copy of its output (frame.md 6.12)
                 self.groups.append(self.copy_group(copies[n]))
             self.group_layers += [n] * (len(self.groups) - len(self.group_layers))
-        if by[out]["kind"] == "concat":
-            o = {"dout": Dist(chs[out]), "ho": hw[out][0], "wo": hw[out][1]}
-        else:
-            o = info[out]
-        nu = unflatten_tiles(o, o["ho"], o["wo"])
-        self.out_chw = (o["dout"].c, o["ho"], o["wo"])
-        if nu == 1:
-            self.groups.append([Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out),
-                                Op("nopop", deps=[0]), Op("unflatten")])
-            self.group_layers.append(None)
-        # a tiled read-back, as a chain's (frame.md 6.5: row tiles by NPUC's policy, each its own output group,
-        # loaded per core with several planes per core; V: large random t1039)
-        for u in range(nu if nu > 1 else 0):
-            nl = o["dout"].cores if o["dout"].ppc > 1 else 1
-            ops = [Op("load", what="dram", flag=self.event(), utile=u, core=k if nl > 1 else None, tensor=out)
-                   for k in range(nl)]
-            self.groups.append(ops + [Op("nopop", deps=list(range(nl))), Op("unflatten")])
-            self.group_layers.append(None)
 
     def relu_group(self, L, d, first, last):
         """a standalone ReLU: NPUC's 1x1 dummy conv, one pass per pair of plane slots (V: res, relu-c4..c64)"""
@@ -2530,9 +2623,11 @@ def npuc_profile(ops, plan):
                 for d in ([core] if core is not None else range(c.din.cores)):
                     pushes.append(_span(op.sram + d * IDP_SPAN, 2 * c.wunits * 64))
             elif op.what == "dram":
-                C, H, W = getattr(plan, "out_chw", None) or plan.low["npu_out_chw"]
+                C, H, W = getattr(op, "out_chw", None) or getattr(plan, "out_chw", None) or plan.low["npu_out_chw"]
                 nu = sum(1 for g in plan.groups if any(o.kind == "unflatten" for o in g))
                 u = getattr(plan, "_uf_done", 0)
+                if getattr(op, "out_chw", None):    # one of several outputs: its own read-back (row tiles)
+                    nu, u = getattr(op, "nu", 1), getattr(op, "u", 0)
                 th = cdiv(cdiv(H, nu), 4) * 4
                 rows = min(H, (u + 1) * th) - u * th
                 dd = Dist(C)

@@ -37,7 +37,9 @@ info): with this firmware's files and NDK r27d it gives **`root-fd659af2`** (`np
 `npuc-conv-5500f56c`), which gives the same NCPs on every earlier input (docs/harness-ops.md section 4). With the
 per-channel lines `wscales` and `slopes` and the setScale hook (docs/format/perchannel.md): **root-40bb3e3f**
 (`npuc-net-6673bd35`), the same NCPs on earlier inputs (5 of 5 rechecked: zoo lenet5, resnet8, mobilenet-v1-025,
-squeezenet11-96, a restride net); per-channel probes and `--per-channel-shifts` models need it. `check-symbols.py` checks every import binds in Bionic's lookup scopes before anything runs.
+squeezenet11-96, a restride net); per-channel probes and `--per-channel-shifts` models need it. With npuc-net's `output`
+line for several outputs too (docs/harness-ops.md 4): **root-38925a6d**; the outputs branch's own build without the
+per-channel lines was root-f7b580ef. `check-symbols.py` checks every import binds in Bionic's lookup scopes before anything runs.
 
 ## 3. Run it
 
