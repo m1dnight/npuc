@@ -18,7 +18,8 @@ the compiler, and it is tested on the host against NPUC.
 4. **Test before every commit.** `tests/run.sh` (no vendor file; must PASS) for any change. For a change to a part
    (`stream.py`, `frame.py`, `weights.py`, `grelu.py`, `npunet.py`): also `tests/regress.sh`, which checks every compiled
    set in `work/sweep` (only the known misses allowed: graph 93/98, graph-random2 64/66, NPUC's own uninitialised bytes).
-   Say the numbers in the commit message.
+   A change meant to change no output (a refactor, a speed-up): `tests/snapshot.py compare` against a snapshot the code
+   before it recorded must say IDENTICAL. Say the numbers in the commit message.
 5. **New networks become regression data.** A new sweep goes to `work/sweep/<name>/` (one folder per variant, as
    npuc-local.sh writes them) with its spec list committed next to the part (`ncpgen/stream_variants_*.txt`,
    `frame_sweep.py` families); networks NPUC compiled may extend `tests/golden.txt` (`tests/make-golden.sh`).
@@ -33,7 +34,8 @@ the compiler, and it is tested on the host against NPUC.
 | Regression against NPUC | `tests/regress.sh [set...]` |
 | Compile with NPUC | `oracle/npuc-local.sh net.json out/ [--quant 1\|3] [--allow-none]` (1.3 s; `out/log.txt`, `out/run/ir_graph_*`) |
 | A variant | `oracle/npuc-variant.py out.json --in H,W,C --conv COUT,K[,S[,same\|valid[,relu\|none]]] --pool max\|avg,K[,S] --seed N` |
-| Generate | `ncpgen/ncpgen.py gen model out.ncp [--grelu npuc\|fixed]`; check a part: `ncpgen/<part>.py check <dirs>` |
+| Generate | `python3 -m ncpgen gen model out.ncp [--grelu npuc\|fixed]` (= `ncpgen/ncpgen.py gen ...`); check a part: `ncpgen/<part>.py check <dirs>` (`python3 -m ncpgen -h` lists every command) |
+| Snapshot (refactors) | `tests/snapshot.py record $NCPGEN_WORK/<name>.json.gz [--code <checkout>]`, then `compare` after the change (`--sample K` for a quick look) |
 | Dump / diff an NCP | `oracle/ncp-dump.py net.ncp --log log.txt [--section isa\|io\|...]` |
 | Ghidra | `oracle/ghidra/run-ghidra.sh decompile <targets.txt>` (one process at a time; JAVA_HOME unset) |
 | Rebuild the harness | `docker run --rm --platform linux/amd64 -v "$PWD":"$PWD" -w "$PWD" python:3.12-slim-bookworm oracle/harness/build.sh` → root-fd659af2 (with `dwconv`; `work/n3/root-current`) |
