@@ -2,7 +2,8 @@
 """npunet: models in, and the host half of running them on the Exynos 990 NPU (the porting kit's npu/README.md). Pure
 Python 3: no numpy, no flatbuffers package (a minimal FlatBuffer reader and writer are below).
 
-  npunet.py lower <model.tflite|net.json> <dir> [--quant 1|3] [--allow-none] [--fold-per-channel]
+  npunet.py lower <model.tflite|net.json> <dir> [--quant 1|3] [--allow-none] [--fold-per-channel | --per-channel-shifts]
+                  [--output TENSOR] [--relu6-range]
         the model as the NPU will compute it: <dir>/lowered.json (every parameter explicit) and <dir>/net.npuc (the
         phone's compiler harness input, oracle/harness/npuc-net.cpp)
   npunet.py ref <lowered.json> <input.bin> <output.bin>        the CPU reference: the model's output bytes
@@ -55,7 +56,10 @@ NPUC's arithmetic, as far as it is known (dossier/npu-compiler.md section 9.12):
     out_scale in float32; doubled up to 7 times while < 0.5; slope = round half away (m * 256) (fcvtas @0x9dd40;
     <= 65535), shift = doublings + 8;
     ONE multiplier per layer (wScale[0]): per-channel weight scales are not supported (--fold-per-channel rescales the
-    weights to one scale, a lossy change of the model, reported);
+    weights to one scale, a lossy change of the model, reported). NPUC's backend keeps a slope and a shift per output
+    channel; the NPU reads the slopes as one piece table per pass, but each DRU has its own shift word, so
+    --per-channel-shifts keeps one slope, puts each channel's power of two in its shift and folds only the rest (less
+    than a bit; the harness's setScale hook compiles it; unproven on the NPU: docs/format/perchannel.md);
   - out = zp_out + R(acc * slope / 2^shift), R a half rounding (V for slope 16, shift 15: section 9.11), clamped to
     0..255; acc = bias + sum (x - zp_in) * (w - zp_w), the border = the zero point;
   - RELU: max(out, zp_out) (G: under test). "No activation" compiles to GRELU_BYPASS_ONDEVICE, which writes the byte 0
@@ -395,13 +399,37 @@ def _ints(data, dtype):
     return list(struct.unpack("<%d%s" % (n, fmt), data[:n * struct.calcsize(fmt)]))
 
 
+def tflite_cut(tf, output):
+    """the model cut at one tensor (its index, or its exact name): that tensor its only output, only the ops it needs
+    kept (the NPU part of a model whose tail runs on the CPU, e.g. one head of a detector before its post-process)"""
+    T = tf["tensors"]
+    if isinstance(output, str) and not output.isdigit():
+        idx = [i for i, t in enumerate(T) if t["name"] == output]
+        if len(idx) != 1:
+            raise Refused("--output %r: %d tensors of that name" % (output, len(idx)))
+        output = idx[0]
+    output = int(output)
+    prod = {o["outputs"][0]: k for k, o in enumerate(tf["ops"]) if o["outputs"]}
+    if output not in prod:
+        raise Refused("--output %d: no op writes tensor %d" % (output, output))
+    need, todo = set(), [output]
+    while todo:
+        t = todo.pop()
+        k = prod.get(t)
+        if k is not None and k not in need:
+            need.add(k)
+            todo += [i for i in tf["ops"][k]["inputs"] if i >= 0]
+    return dict(tf, ops=[o for k, o in enumerate(tf["ops"]) if k in need], outputs=[output])
+
+
 def tflite_to_graph(tf, src):
     """TFLite (subgraph 0) -> our graph JSON ("npu-net/1"), unchanged values. Every layer gets "id" = "t<index>" of
     its output tensor and "inputs" = the ids it reads (TFLite's own tensor names may be empty or repeat); its "name"
     stays the tensor's name (the lowered layer's name comes from it)."""
     T = tf["tensors"]
     if len(tf["inputs"]) != 1 or len(tf["outputs"]) != 1:
-        raise Refused("%d inputs, %d outputs (one each is supported)" % (len(tf["inputs"]), len(tf["outputs"])))
+        raise Refused("%d inputs, %d outputs (one each is supported; --output TENSOR cuts the model at one)"
+                      % (len(tf["inputs"]), len(tf["outputs"])))
     tin = T[tf["inputs"][0]]
     if tin["dtype"] not in ("int8", "uint8"):
         raise Refused("input %r is %s (a quantized int8 or uint8 input is needed; float models are not supported)" % (tin["name"], tin["dtype"]))
@@ -759,6 +787,7 @@ class _Lowering:
     def __init__(self, low, dtype, quant, fold, allow_none, ents, show, npuc_strides=True):
         self.low, self.dtype, self.quant, self.fold, self.allow_none = low, dtype, quant, fold, allow_none
         self.ents, self.show, self.npuc_strides = ents, show, npuc_strides
+        self.relu6_range = False    # --relu6-range (lower() sets it)
         self.blobs = {}
         self.tail = None        # the key of the last CPU-tail op
         self.readers = {}       # tensor key -> the indices in ents of the ops reading it
@@ -1021,32 +1050,51 @@ def _lower_conv(lw, idx, L, op, name, key, ins, srcs):
         lw.low["unproven"].append("%s: FULLY_CONNECTED lowered to a %dx%d VALID conv (not yet run on the NPU)" % (name, kh, kw))
     if len(bias) != cout:
         raise Refused("%s: %d biases for %d outputs" % (name, len(bias), cout))
-    # weights to uint8 with one zero point 128 and one scale
+    # weights to uint8 with one zero point (128 for int8 weights) and one scale
+    wz = 128
     if wd == "int8":
         if any(z != 0 for z in wzp):
             raise Refused("%s: int8 weights with zero point %s (symmetric 0 wanted)" % (name, wzp))
         wu8 = [v + 128 for v in oihw]
     elif wd == "uint8":
-        if any(z != 128 for z in wzp):
-            raise Refused("%s: uint8 weights with zero point %s: NPUC's on-device path is validated with 128 only" % (name, wzp))
+        if len(set(wzp)) != 1:
+            raise Refused("%s: uint8 weights with %d zero points (one per tensor wanted)" % (name, len(set(wzp))))
+        wz = wzp[0]
+        if wz != 128 and lw.quant == 3:
+            raise Refused("%s: uint8 weights with zero point %d: quant mode 3 takes symmetric weights only (NPUC "
+                          "subtracts 128 from every weight byte)" % (name, wz))
         wu8 = list(oihw)
     else:
         raise Refused("%s: weights dtype %s" % (name, wd))
+    pc_shift = None             # --per-channel-shifts: each output channel's extra shift
     if len(set(wsc)) > 1:
         if not lw.fold:
             raise Refused("%s: %d per-channel weight scales: NPUC's on-device filler uses one scale per layer "
-                          "(wScale[0]); --fold-per-channel rescales the weights to the largest (lossy)" % (name, len(wsc)))
+                          "(wScale[0]); --fold-per-channel rescales the weights to the largest (lossy), "
+                          "--per-channel-shifts keeps each channel's power of two (docs/format/perchannel.md)" % (name, len(wsc)))
         smax = max(wsc)
         kper = len(wu8) // cout
         worst = 0
+        pc_shift = [0] * cout
         for o in range(cout):
             r = Fraction(wsc[o]) / Fraction(smax)
+            if lw.fold == "shifts":
+                # channel o's multiplier is slope / 2^(shift + k): the power of two goes to its DRU's shift word, the
+                # rest r in (1/2, 1] into its weights and bias
+                while 2 * r <= 1:
+                    r *= 2
+                    pc_shift[o] += 1
             for t in range(o * kper, (o + 1) * kper):
-                nv = rnd((wu8[t] - 128) * r, "half_away")
-                worst = max(worst, abs(Fraction(wu8[t] - 128) * r - nv))
-                wu8[t] = nv + 128
+                nv = rnd((wu8[t] - wz) * r, "half_away")
+                worst = max(worst, abs(Fraction(wu8[t] - wz) * r - nv))
+                wu8[t] = nv + wz
             bias[o] = rnd(bias[o] * r, "half_away")
-        lw.low["warnings"].append("%s: per-channel weight scales folded into %g (rounding error up to %.2f LSB of the new scale)" % (name, smax, float(worst)))
+        if lw.fold == "shifts":
+            lw.low["warnings"].append("%s: per-channel weight scales: one slope of scale %g, per-channel shifts +0..+%d, "
+                                      "the rest folded (rounding error up to %.2f LSB)" % (name, smax, max(pc_shift), float(worst)))
+        else:
+            pc_shift = None
+            lw.low["warnings"].append("%s: per-channel weight scales folded into %g (rounding error up to %.2f LSB of the new scale)" % (name, smax, float(worst)))
         wsc = [smax]
     elif len(wsc) != 1 and len(wsc) != cout:
         raise Refused("%s: %d weight scales" % (name, len(wsc)))
@@ -1058,8 +1106,19 @@ def _lower_conv(lw, idx, L, op, name, key, ins, srcs):
     if act == "relu6":
         if _relu6_as_relu(name, oz, os_, lw.low):
             act = "relu"
+        elif not lw.relu6_range:
+            raise Refused("%s: RELU6 clamps inside the output range (NPUC: 'Unsupported FusedActivation type' 3); "
+                          "--relu6-range requantises such outputs to [0, 6]" % name)
+        elif lw.quant == 3 or not lw.readers.get(key):
+            raise Refused("%s: RELU6 clamps inside the output range, and --relu6-range cannot requantise %s" % (
+                name, "in quant mode 3 (zero point 128 only)" if lw.quant == 3 else "the model's output"))
         else:
-            raise Refused("%s: RELU6 clamps inside the output range (NPUC: 'Unsupported FusedActivation type' 3)" % name)
+            # TFLite clamps at zp + round(6 / s) inside the range: the output requantised to [0, 6] (scale 6/255, u8
+            # zero point 0) makes that clamp the saturation, and every reader takes this blob's new quantisation
+            lw.low["warnings"].append("%s: RELU6 clamping at %d inside the range (scale %g, zero point %d): output "
+                                      "requantised to [0, 6] (scale 6/255, zero point 0) for its readers: a change of "
+                                      "the model (--relu6-range)" % (name, relu6_top(oz, os_), os_, oz))
+            os_, oz, act = f32(6.0 / 255), 0, "relu"
     if act == "none" and not lw.allow_none:
         raise Refused("%s: no fused activation: NPUC compiles it to GRELU_BYPASS_ONDEVICE, which writes the byte 0 "
                       "wherever the accumulator is >= 0 (dossier/npu-compiler.md section 9.11); use RELU, or "
@@ -1077,9 +1136,20 @@ def _lower_conv(lw, idx, L, op, name, key, ins, srcs):
     lay = {"kind": "conv", "name": name, "from": op, "src_name": L.get("name", ""), "input": cur["name"],
            "in_chw": [Cc, Hc, Wc], "cout": cout, "k": [kh, kw], "stride": [sh, sw], "padding": pad.upper(),
            "pads": [pt, pb, pl, pr], "act": 1 if act == "relu" else 0,
-           "in_scale": f32_hex(cur["scale"]), "in_zp": cur["zp"], "w_scale": f32_hex(ws), "w_zp": 128,
+           "in_scale": f32_hex(cur["scale"]), "in_zp": cur["zp"], "w_scale": f32_hex(ws), "w_zp": wz,
            "out_scale": f32_hex(os_), "out_zp": oz, "slope": slope, "shift": shift,
            "weights_oihw_u8": wu8, "bias": bias, "out_chw": [cout, ho, wo]}
+    if pc_shift is not None:
+        if shift + max(pc_shift) > 31:
+            raise Refused("%s: per-channel shift %d > 31 (the MTC shift word's 5-bit fields)" % (name, shift + max(pc_shift)))
+        lay["slopes"] = [slope] * cout
+        lay["shifts"] = [shift + k for k in pc_shift]
+        lw.low["unproven"].append("%s: per-channel shifts %d..%d in the DRUs' shift words: NPUC's backend writes them so "
+                                  "(the harness's setScale hook), Samsung's own NCPs vary those words per DRU, but no NPU "
+                                  "run has used them (docs/format/perchannel.md)" % (name, min(lay["shifts"]), max(lay["shifts"])))
+    if wz != 128:
+        lw.low["unproven"].append("%s: weight zero point %d (MTC 0x1b0's low half; NPUC compiles any, ncpgen exact on "
+                                  "$NCPGEN_WORK/sweep/wzp-probe; every NPU run so far had 128)" % (name, wz))
     if act == "none":
         lw.low["warnings"].append("%s: no activation (GRELU_BYPASS_ONDEVICE: the byte 0 wherever acc >= 0, V)" % name)
     if slope & (slope - 1):
@@ -1096,8 +1166,10 @@ def depthwise_dense(L, C, name):
     """An npu-net/1 depthwise_conv2d (filter 1HWO, TFLite's layout) on C input channels -> the conv2d NPUC compiles in
     its place on the device path: C outputs, the dense OHWI kernel holding channel o's taps at input o and the weight
     zero point elsewhere, the same scales (per channel: output o's), bias, strides, padding and activation (V: the
-    stock path's NCP is byte for byte this conv's on 118 networks, docs/format/depthwise.md section 4). Depth
-    multiplier 1 only (a filter of C channels); no dilation."""
+    stock path's NCP is byte for byte this conv's on 118 networks, docs/format/depthwise.md section 4). A depth
+    multiplier M (a filter of C x M channels; TFLite writes a 1-input-channel CONV_2D so, e.g. person_detect's first
+    layer) is the same conv with C x M outputs, output o reading input o // M only (TFLite's depthwise semantics: output
+    c M + m = input c with filter column c M + m); M = 1 is the block diagonal. No dilation."""
     kh, kw = L["kernel"]
     wt = L["weights"]
     if wt.get("layout", "1HWO") != "1HWO":
@@ -1109,20 +1181,20 @@ def depthwise_dense(L, C, name):
         raise Refused("depthwise %s: %d weights for a %dx%d kernel" % (name, len(data), kh, kw))
     co = len(data) // (kh * kw)
     dm = int(L.get("depth_multiplier", 1))     # TFLite's option; 0 (unset) leaves it to the filter
-    if co != C or dm not in (0, 1):
-        raise Refused("depthwise %s: a %d-channel filter on %d input channels (depth_multiplier %d): only multiplier 1 is "
-                      "lowered, to the dense block-diagonal conv NPUC compiles on the device path (its ConvAttr takes "
-                      "group = C, one output per input channel; docs/format/depthwise.md)" % (name, co, C, dm))
+    M = co // C if C and co % C == 0 else 0
+    if not M or dm not in (0, M):
+        raise Refused("depthwise %s: a %d-channel filter on %d input channels (depth_multiplier %d): the filter must have "
+                      "depth_multiplier x C channels" % (name, co, C, dm))
     zps = wt.get("zero_point", 0)
     zps = [int(v) for v in zps] if isinstance(zps, list) else [int(zps)]
     if len(set(zps)) != 1:
         raise Refused("depthwise %s: per-channel weight zero points %s (one wanted)" % (name, sorted(set(zps))))
     K = kh * kw
-    dense = [zps[0]] * (C * K * C)
-    for o in range(C):
+    dense = [zps[0]] * (co * K * C)
+    for o in range(co):
         for t in range(K):
-            dense[(o * K + t) * C + o] = data[t * C + o]
-    return {"op": "conv2d", "name": L.get("name", name), "filters": C, "kernel": [kh, kw],
+            dense[(o * K + t) * C + o // M] = data[t * co + o]
+    return {"op": "conv2d", "name": L.get("name", name), "filters": co, "kernel": [kh, kw],
             "strides": L.get("strides", [1, 1]), "padding": L.get("padding", "same"),
             "activation": L.get("activation", "none"),
             "weights": {"dtype": wt["dtype"], "layout": "OHWI", "scale": wt["scale"], "zero_point": wt.get("zero_point", 0),
@@ -1131,13 +1203,15 @@ def depthwise_dense(L, C, name):
 
 
 def _lower_depthwise(lw, idx, L, op, name, key, ins, srcs):
-    """DEPTHWISE_CONV_2D (multiplier 1) as the regular conv with the dense block-diagonal kernel (depthwise_dense):
+    """DEPTHWISE_CONV_2D as the regular conv with the dense block-diagonal kernel (depthwise_dense):
     then CONV_2D's rules (per-channel scales: --fold-per-channel), its lowered layer and its CPU reference"""
     C, kh, kw = srcs[0]["chw"][0], L["kernel"][0], L["kernel"][1]
     blob = _lower_conv(lw, idx, depthwise_dense(L, C, name), "conv2d", name, key, ins, srcs)
     lw.low["layers"][-1]["from"] = "depthwise_conv2d"
-    lw.low["warnings"].append("%s: DEPTHWISE_CONV_2D %dx%d on %d channels lowered to the dense %dx%d conv with "
-                              "block-diagonal weights (NPUC's own form on the device path)" % (name, kh, kw, C, kh, kw))
+    M = lw.low["layers"][-1]["cout"] // C
+    lw.low["warnings"].append("%s: DEPTHWISE_CONV_2D %dx%d on %d channels%s lowered to the dense %dx%d conv with "
+                              "block-diagonal weights (NPUC's own form on the device path)"
+                              % (name, kh, kw, C, " (depth multiplier %d)" % M if M > 1 else "", kh, kw))
     lw.low["unproven"].append("%s: depthwise as the dense block-diagonal conv NPUC compiles (not run on the NPU)" % name)
     return blob
 
@@ -1335,7 +1409,7 @@ LOWER_OPS = {"conv2d": _lower_conv, "fully_connected": _lower_conv, "depthwise_c
              "relu6": _lower_relu, "reshape": _lower_reshape, "softmax": _lower_softmax, "cpu_mean": _lower_cpu_mean}
 
 
-def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True):
+def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, relu6_range=False):
     """an npu-net/1 graph -> lowered.json's dict: every layer as NPUC computes it (uint8 asymmetric, OIHW weights,
     NPUC's multipliers and pads), the CPU tail, the warnings and what is not proven on the NPU; Refused for what NPUC
     or this path cannot take (the module docstring). Strides NPUC refuses are rewritten exactly (_lower_restrided);
@@ -1362,6 +1436,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True):
     if list(io["shape"]) != shp:
         low["input"]["shape"] = list(io["shape"])
     lw = _Lowering(low, dtype, quant, fold, allow_none, ents, show, npuc_strides)
+    lw.relu6_range = relu6_range
     lw.blobs[inkey] = {"name": "data0", "chw": [C, H, W], "scale": sc, "zp": zp_in}
     for idx, (L, key, ins) in enumerate(ents):
         op = L["op"]
@@ -1473,6 +1548,9 @@ def npuc_text(low):
                 l["name"], l["input"], l["cout"], l["k"][0], l["k"][1], l["stride"][0], l["stride"][1], l["padding"],
                 l["act"], l["in_scale"], l["in_zp"], l["w_scale"], l["w_zp"], l["out_scale"], l["out_zp"],
                 bytes(l["weights_oihw_u8"]).hex(), len(l["bias"]), " ".join(str(b) for b in l["bias"])))
+            if "slopes" in l:   # the harness's setScale hook: NPUC's per-channel vectors (docs/format/perchannel.md)
+                out.append("slopes %s %d %s %s" % (l["name"], l["cout"], " ".join(map(str, l["slopes"])),
+                                                   " ".join(map(str, l["shifts"]))))
         elif l["kind"] == "pool":
             out.append("pool %s %s %s %d %d %d %d %s %d %s %d %s %d" % (
                 l["name"], l["input"], l["type"], l["k"][0], l["k"][1], l["stride"][0], l["stride"][1], l["padding"],
@@ -1492,18 +1570,20 @@ def npuc_text(low):
     return "\n".join(out) + "\n"
 
 
-def load_model(path, quant=1, fold=False, allow_none=False):
-    """a TFLite file or an npu-net/1 JSON -> lowered.json's dict (lower())"""
+def load_model(path, quant=1, fold=False, allow_none=False, output=None, relu6_range=False):
+    """a TFLite file or an npu-net/1 JSON -> lowered.json's dict (lower()); output: cut a TFLite model at that tensor
+    (tflite_cut)"""
     data = open(path, "rb").read()
     tfl = is_tflite(data) and not data.lstrip()[:1] == b"{"
     if tfl:
-        g = tflite_to_graph(read_tflite(data), path)
+        tf = read_tflite(data)
+        g = tflite_to_graph(tflite_cut(tf, output) if output is not None else tf, path)
     else:
         try:
             g = json.loads(data)
         except ValueError:
             raise Refused("%s is neither a TFLite file nor JSON" % path)
-    low = lower(g, quant=quant, fold=fold, allow_none=allow_none)
+    low = lower(g, quant=quant, fold=fold, allow_none=allow_none, relu6_range=relu6_range)
     low["source"] = {"path": os.path.basename(path), "sha256": hashlib.sha256(data).hexdigest(),
                      "kind": "tflite" if tfl else "npu-net/1 json"}
     return low
@@ -1526,9 +1606,11 @@ def ref_conv(l, x, rounding, none_defect, quant):
             for xx in range(W):
                 dst[xx + pl] = row[xx] - zi
     wb = l["weights_oihw_u8"]
-    den = 1 << l["shift"]
+    sls = l.get("slopes", [l["slope"]] * cout)    # per-channel multipliers (--per-channel-shifts), else the layer's
+    shs = l.get("shifts", [l["shift"]] * cout)
     out = bytearray(cout * ho * wo)
     for o in range(cout):
+        slope, den = sls[o], 1 << shs[o]
         wk = [[[wb[((o * C + c) * kh + i) * kw + j] - zw for j in range(kw)] for i in range(kh)] for c in range(C)]
         for y in range(ho):
             for xx in range(wo):
@@ -1540,7 +1622,7 @@ def ref_conv(l, x, rounding, none_defect, quant):
                         base = xx * sw
                         for j in range(kw):
                             s += row[base + j] * wr[j]
-                q = zo + rnd(Fraction(s * l["slope"], den), rounding)
+                q = zo + rnd(Fraction(s * slope, den), rounding)
                 q = min(255, max(0, q))
                 if l["act"] == 1:
                     q = max(q, zo)
@@ -2627,11 +2709,81 @@ def selftest_models():
     a, b = lower(pc, fold=True), lower(tflite_to_graph(tf, "dw.tflite"), fold=True)
     ok.append(("depthwise TFLite round trip (per-channel scales folded): the same lowered layers", strip(a) == strip(b)))
     ok.append(("depthwise per-channel scales refused without --fold-per-channel", "per-channel" in _refusal(lambda: lower(pc))))
-    # refusals: multiplier 2, dilation (JSON and TFLite)
+    # a depth multiplier M: output c M + m reads input c with filter column c M + m (TFLite's semantics), checked
+    # against a direct NHWC computation with NPUC's multiplier (M = 8 on one channel: person_detect's first layer)
+    for C, M in ((4, 2), (1, 8)):
+        r = random.Random(11 + M)
+        co = C * M
+        dwm = {"op": "depthwise_conv2d", "name": "dw", "kernel": [3, 3], "strides": [1, 1], "padding": "same",
+               "depth_multiplier": M, "activation": "relu",
+               "weights": {"dtype": "int8", "layout": "1HWO", "scale": 1 / 256, "zero_point": 0,
+                           "data": [r.randint(-40, 40) for _ in range(9 * co)]},
+               "bias": [r.randint(-300, 300) for _ in range(co)], "output": {"scale": 1 / 128, "zero_point": 0}}
+        lm = lower(_sgraph([dwm], shape=(1, 8, 8, C)))
+        x = bytes(r.randrange(256) for _ in range(64 * C))
+        got = ref_npu(lm, model_in_to_chw(lm, x))
+        sl, sh = npuc_multiplier(f32(1 / 128), f32(1 / 256), f32(1 / 128))
+        want = bytearray(co * 64)
+        xs = [v - 256 if v > 127 else v for v in x]     # int8 NHWC, zero point 0
+        for o in range(co):
+            for y in range(8):
+                for xx in range(8):
+                    acc = dwm["bias"][o]
+                    for i in range(3):
+                        for j in range(3):
+                            yy, xj = y + i - 1, xx + j - 1
+                            if 0 <= yy < 8 and 0 <= xj < 8:
+                                acc += xs[(yy * 8 + xj) * C + o // M] * dwm["weights"]["data"][(i * 3 + j) * co + o]
+                    q = 128 + rnd(Fraction(acc * sl, 1 << sh), "half_away")
+                    want[(o * 8 + y) * 8 + xx] = max(128, min(255, q))
+        ok.append(("depthwise multiplier %d on %d channels: the dense conv's reference = TFLite's semantics" % (M, C),
+                   lm["layers"][0]["cout"] == co and got == bytes(want)))
+    # --per-channel-shifts: scales 2^-k apart need no folding at all (each channel's power of two in its shift); others
+    # keep a remainder in (1/2, 1]; the reference uses each channel's slope / 2^shift; net.npuc gets the "slopes" line
+    r = random.Random(23)
+    pcs = _sconv("pc", 8, 8, r, wspan=100)
+    pcs["weights"]["scale"] = [1 / 256 / 2 ** (c % 4) for c in range(8)]
+    lp = lower(_sgraph([pcs]), fold="shifts")
+    L0 = lp["layers"][0]
+    x = bytes(r.randrange(256) for _ in range(512))
+    got = ref_npu(lp, model_in_to_chw(lp, x))
+    xs = [v - 256 if v > 127 else v for v in x]
+    want = bytearray(512)
+    w = pcs["weights"]["data"]
+    for o in range(8):
+        for y in range(8):
+            for xx in range(8):
+                acc = pcs["bias"][o]
+                for i in range(3):
+                    for j in range(3):
+                        yy, xj = y + i - 1, xx + j - 1
+                        if 0 <= yy < 8 and 0 <= xj < 8:
+                            acc += sum(xs[(yy * 8 + xj) * 8 + c] * w[((o * 3 + i) * 3 + j) * 8 + c] for c in range(8))
+                q = 128 + rnd(Fraction(acc * 128, 1 << (15 + o % 4)), "half_away")
+                want[(o * 8 + y) * 8 + xx] = max(128, min(255, q))
+    ok.append(("--per-channel-shifts, scales 2^-k apart: weights unchanged, shifts 15 + k, the exact per-channel reference",
+               L0["shifts"] == [15 + c % 4 for c in range(8)] and L0["slopes"] == [128] * 8 and got == bytes(want)
+               and "slopes %s 8 " % L0["name"] in npuc_text(lp)))
+    pcs["weights"]["scale"] = [1 / 256 * (1 - c / 12) for c in range(8)]
+    lq = lower(_sgraph([pcs]), fold="shifts")
+    ok.append(("--per-channel-shifts, other scales: shifts 15/16, the rest folded", lq["layers"][0]["shifts"] ==
+               [15 if 1 - c / 12 > 0.5 else 16 for c in range(8)]))
+    # uint8 weights with a zero point other than 128: quant 1 (MTC 0x1b0), refused in quant 3
+    i8 = _sconv("u", 8, 8, r)
+    u8 = json.loads(json.dumps(i8))
+    u8["weights"].update({"dtype": "uint8", "zero_point": 163, "data": [v + 163 for v in i8["weights"]["data"]]})
+    u8["output"]["zero_point"] = 128
+    gu = _sgraph([u8])
+    gu["input"].update({"dtype": "uint8", "zero_point": 128})
+    lu, li = lower(gu), lower(_sgraph([i8]))
+    ok.append(("uint8 weights, zero point 163: w_zp 163, the reference of the same real weights in int8",
+               lu["layers"][0]["w_zp"] == 163 and ref_npu(lu, model_in_to_chw(lu, bytes(b ^ 0x80 for b in x)))
+               == ref_npu(li, model_in_to_chw(li, x))))
+    ok.append(("uint8 weights, zero point 163, quant 3 refused", "quant mode 3" in _refusal(lambda: lower(gu, quant=3))))
+    # refusals: a filter that is not M x C channels, dilation (JSON and TFLite)
     m2 = _dwgraph(extra={"depth_multiplier": 2})
-    m2["layers"][0]["weights"]["data"] *= 2
-    m2["layers"][0]["bias"] *= 2
-    ok.append(("depthwise multiplier 2 refused (only 1)", "only multiplier 1" in _refusal(lambda: lower(m2))))
+    ok.append(("depthwise multiplier 2 with an 8-channel filter on 8 channels refused",
+               "depth_multiplier x C" in _refusal(lambda: lower(m2))))
     ok.append(("depthwise dilation refused (npu-net/1)", "dilation" in _refusal(lambda: lower(_dwgraph(extra={"dilation": [2, 2]})))))
     td = read_tflite(graph_to_tflite(dg))
     [o_ for o_ in td["ops"] if o_["op"] == "DEPTHWISE_CONV_2D"][0]["opt"]["dil_h"] = 2
@@ -2688,6 +2840,23 @@ def _selftest_tflite():
     ok.append(("TFLite round trip with per-channel scales (conv axis 0, depthwise axis 3), folded", _tflite_same(pc, fold=True)))
     ok.append(("TFLite round trip of the residual block (ADD with fused RELU, quant 3)",
                _tflite_same(residual_graph(), quant=3, allow_none=True)))
+    # --output: the model cut at one tensor (one branch of ga: c3, read by the concat), only the ops it needs
+    ta = read_tflite(graph_to_tflite(ga))
+    t3 = next(o["outputs"][0] for o in ta["ops"] if ta["tensors"][o["outputs"][0]]["name"] == "c3")
+    cut = tflite_cut(ta, t3)
+    lc = lower(tflite_to_graph(cut, "cut.tflite"))
+    ok.append(("--output c3: conv, depthwise, pool, c3 (c2, the concat and the tail dropped)",
+               [o["op"] for o in cut["ops"]] == ["CONV_2D", "DEPTHWISE_CONV_2D", "MAX_POOL_2D", "CONV_2D"]
+               and cut["outputs"] == [t3] and len(lc["layers"]) == 4 and lc["layers"][-1]["src_name"] == "c3"
+               and tflite_cut(ta, "c3")["outputs"] == [t3]))
+    # --relu6-range: a RELU6 clamping inside its range -> that output requantised to scale 6/255, zero point 0
+    g6 = _sgraph([_sconv("a", 8, 8, r, act="relu6", out_scale=0.25), _sconv("b", 8, 8, r)])
+    g6["layers"][0]["output"]["zero_point"] = -100
+    l6 = lower(g6, relu6_range=True)
+    a6, b6 = l6["layers"]
+    ok.append(("--relu6-range: clamp at 24 inside the range -> scale 6/255 zero point 0, read so by the next conv",
+               "RELU6" in _refusal(lambda: lower(g6)) and a6["out_scale"] == f32_hex(f32(6 / 255)) and
+               a6["out_zp"] == 0 and a6["act"] == 1 and (b6["in_scale"], b6["in_zp"]) == (a6["out_scale"], 0)))
     return ok
 
 
@@ -2939,7 +3108,8 @@ def _selftest_strides():
 # ---- commands -------------------------------------------------------------------------------------------------------
 def cmd_lower(a):
     """lowered.json and net.npuc for a model, and a line per layer"""
-    low = load_model(a.model, a.quant, a.fold_per_channel, a.allow_none)
+    low = load_model(a.model, a.quant, "shifts" if a.per_channel_shifts else a.fold_per_channel, a.allow_none, a.output,
+                     a.relu6_range)
     os.makedirs(a.dir, exist_ok=True)
     json.dump(low, open(os.path.join(a.dir, "lowered.json"), "w"), indent=1)
     open(os.path.join(a.dir, "net.npuc"), "w").write(npuc_text(low))
@@ -2947,7 +3117,8 @@ def cmd_lower(a):
         if l["kind"] == "conv":
             print("lower: %-22s conv %dx%d s%d %s %d->%d act %s, multiplier %d/2^%d, out %s" % (
                 l["name"], l["k"][0], l["k"][1], l["stride"][0], l["padding"], l["in_chw"][0], l["cout"],
-                "relu" if l["act"] else "none", l["slope"], l["shift"], "x".join(map(str, l["out_chw"]))))
+                "relu" if l["act"] else "none", l["slope"], l["shift"], "x".join(map(str, l["out_chw"])))
+                + (" (per-channel shifts %d..%d)" % (min(l["shifts"]), max(l["shifts"])) if "shifts" in l else ""))
         elif l["kind"] == "pool":
             print("lower: %-22s %s %dx%d s%d %s, out %s" % (l["name"], l["type"], l["k"][0], l["k"][1],
                                                              l["stride"][0], l["padding"], "x".join(map(str, l["out_chw"]))))
@@ -3029,6 +3200,13 @@ def main(argv=None):
     p.add_argument("dir")
     p.add_argument("--quant", type=int, default=1)
     p.add_argument("--fold-per-channel", action="store_true")
+    p.add_argument("--relu6-range", action="store_true", help="a fused RELU6 clamping inside its output range: the output "
+                   "requantised to [0, 6] so the clamp is the saturation (a change of the model)")
+    p.add_argument("--output", metavar="TENSOR", help="a TFLite model cut at this tensor (index or name): its NPU part "
+                   "up to there, the rest left to the CPU")
+    p.add_argument("--per-channel-shifts", action="store_true",
+                   help="per-channel weight scales as one slope, each channel's power of two in its DRU's shift word "
+                        "and the rest folded (docs/format/perchannel.md; the harness's setScale hook compiles it)")
     p.add_argument("--allow-none", action="store_true")
     p.set_defaults(fn=cmd_lower)
     for name, fn, args in (("ref", cmd_ref, ("lowered", "input", "output")),

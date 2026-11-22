@@ -14,15 +14,17 @@ gets wrong (its activation table, below).
 |---|---|
 | Byte-exact with NPUC | every compiled network of every developed set (about 3500 networks, `tests/regress.sh`) except 7 whose NCPs NPUC fills with uninitialised bytes (it differs from itself); layers NPUC tiles inside a graph and NPUC's trim and spill included (graph-split 18/18, large random graphs 40/40; a fresh unseen set 35/39 at first sight, 37/39 now) |
 | Common models | `models/`: 31 of 32 zoo entries generated exactly (the 32nd fails in NPUC itself). Of 25 published models, 24 as published: LeNet-5, MNIST and CIFAR CNNs, VGG-11, ResNet-8, ResNet-18 (96 and 224 px), SqueezeNet 1.1 (96 and 224 px; at 224 its final global pool runs on the CPU, NPUC having no form of it), AlexNet, a YOLOv2-tiny, MobileNet v1 0.25 (96 px), 0.5 and 1.0 (224 px), MobileNet v2 0.35 (96 and 224 px) and 1.0 (224 px), DS-CNN and the keyword-spotting CNN, magic wand, the MLPerf Tiny autoencoder (strides NPUC refuses are rewritten into the same function). micro-speech fails in NPUC itself (`models/README.md`) |
+| Camera models | `models/camera.md`: 12 published camera models fetched and ranked by what they need. TFLM's person_detect **exact as published** (per-channel scales as per-channel shifts, or folded); SSD MobileNet v1's heads lower and compile one at a time, ncpgen not yet exact at 300 px (NPUC's tiling there). The rest need several outputs, a CPU tail, ADD with any scales, upsampling, PAD |
 | Without any vendor file | `tests/run.sh`: our own networks (the corpus, a final unseen set, the zoo) regenerated, each NCP equal by sha256 to NPUC's, and the zoo's TFLite forms checked |
 | On the NPU | the example network (`ncpgen gen` of npunet's example writes the exact NCP of a bit-exact NPU run); the rest is predicted, with a run plan in the porting kit |
 
 Operations: CONV_2D (kernels 1..13, VALID up to 14, stride 1/2, SAME/VALID, ReLU, ReLU6 where TFLite's clamp is a no-op,
-or none), DEPTHWISE_CONV_2D (multiplier 1; compiled, as NPUC does on this path, as a dense block-diagonal conv),
+or none), DEPTHWISE_CONV_2D (any multiplier; compiled, as NPUC does on this path, as a dense block-diagonal conv),
 MAX/AVERAGE_POOL_2D (strides up to 2-3, as NPUC allows), global average pooling and MEAN (as a conv within NPUC's
 packing limits, else at stride 1 up to 8x8, else on the CPU when it ends the network), FULLY_CONNECTED (as a conv), ADD (quant mode 3, power-of-two scales), CONCATENATION (channels),
-standalone RELU; RESHAPE and SOFTMAX after the NPU part run on the CPU. Quant modes 1 (uint8) and 3 (int8), one weight
-scale per layer (per-channel scales folded with `--fold-per-channel`, lossy). Large layers: NPUC's tiling policy (read
+standalone RELU; RESHAPE and SOFTMAX after the NPU part run on the CPU. Quant modes 1 (uint8, any weight zero point) and 3
+(int8), one multiplier per layer: per-channel weight scales as one slope and per-channel shifts (`--per-channel-shifts`,
+less than a bit folded; docs/format/perchannel.md) or folded (`--fold-per-channel`). Large layers: NPUC's tiling policy (read
 from its code), inside graphs too, weight rings, its command-queue split, its trim and spill, its batch scheduling.
 Not yet: other activations (leaky ReLU, SiLU), upsampling, channel split, several outputs.
 

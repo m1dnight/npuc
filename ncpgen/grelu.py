@@ -69,8 +69,40 @@ def npuc_slope(in_s, w_s, out_s):
 
 
 def layer_slope(layer):
-    """(slope, shift) of a lowered conv layer"""
+    """(slope, shift) of a lowered conv layer: its one multiplier (NPUC's ScaleONFiller, from wScale[0]). A layer with
+    per-channel values (channel_requant) has one only when they are all equal"""
+    if "slopes" in layer:
+        cr = set(channel_requant(layer))
+        if len(cr) != 1:
+            raise ValueError("per-channel slopes and shifts: no single multiplier for this layer")
+        return cr.pop()
     return npuc_slope(scale_value(layer["in_scale"]), scale_value(layer["w_scale"]), scale_value(layer["out_scale"]))
+
+
+def channel_requant(layer):
+    """[(slope, shift)] per output channel. NPUC keeps them per channel (the node's NPUSlopeMemoryData and shift
+    vectors, C out entries each) and its backend puts channel c's slope in its DRU's GReLU slot (B[d]) and its shift in
+    its DRU's MTC shift word; its frontend fills every entry with the one (slope, shift) of wScale[0] (V: setScale,
+    and the per-channel probes of docs/format/perchannel.md). A lowered layer may carry its own per-channel "slopes"
+    and "shifts" (what the harness's setScale hook gives NPUC)"""
+    n = int(layer["cout"])
+    if "slopes" not in layer:
+        return [layer_slope(layer)] * n
+    sl, sh = layer["slopes"], layer["shifts"]
+    if len(sl) != n or len(sh) != n:
+        raise ValueError("%d slopes / %d shifts for %d output channels" % (len(sl), len(sh), n))
+    return [(int(a), int(b)) for a, b in zip(sl, sh)]
+
+
+def table_slope(layer):
+    """the one slope a corrected table holds (fixed, robust): the NPU reads the 16 slots as ONE piece table for every
+    channel of a pass (grelu.md section 6, V on the NPU), so channels of different slopes cannot share a pass; the
+    shifts may differ per channel (each DRU has its own shift word)"""
+    sl = {s for s, _ in channel_requant(layer)}
+    if len(sl) != 1:
+        raise ValueError("per-channel slopes (%d different): the NPU's GReLU table is one piece table per pass, so no "
+                         "table serves them (only --grelu npuc writes NPUC's per-DRU bytes)" % len(sl))
+    return sl.pop()
 
 
 def zp_byte(layer, quant_mode):
@@ -102,14 +134,14 @@ def act_code(layer):
 
 def npuc_blocks(layer, quant_mode):
     """NPUC's tables for a lowered conv layer: [(A[16], B[16], t1, t2, mode)] per pass"""
-    slope, _ = layer_slope(layer)
+    cr = channel_requant(layer)
     zp = zp_byte(layer, quant_mode)
     code = act_code(layer)
     blocks = []
     for drus in channel_passes(int(layer["cout"])):
         a, b = [0] * 16, [0] * 16
-        for d in drus:  # the per-DRU lambda (CompileOptions +0x138 == 1)
-            b[d], a[d] = slope, zp
+        for d, c in drus.items():  # the per-DRU lambda (CompileOptions +0x138 == 1): the channel's slope
+            b[d], a[d] = cr[c][0], zp
         if code == MODE_RELU:  # convCreateOperation, case 10: *(u32 *)(conv + 0x1a6) = 0
             b[0] = b[1] = 0
         blocks.append((a, b, 0, 0, 3))  # cases 10 and 11: T1 = T2 = 0, mode 3
@@ -180,7 +212,7 @@ def fixed_vals(vals, layer, quant_mode):
     v, k = auto_fix(vals)
     extra = None
     if act_code(layer) == MODE_RELU and v[2] == 0:
-        s, _ = layer_slope(layer)
+        s = table_slope(layer)
         zp = zp_byte(layer, quant_mode)
         g0 = [entry(zp, 0), entry(zp, s), entry(zp, s), v[3]]
         v = g0 * 4
@@ -193,7 +225,7 @@ def robust_vals(layer, quant_mode):
     (0, 0) with ReLU; groups 1-3 = group 0. It is byte for byte every table that ran bit-exact on the NPU (N3d piece2,
     npu-run v2/v4/v5 and net-current, all Cout = 8), and it does not depend on which group lanes 2-3 read (never run:
     Cout >= 9), where auto keeps NPUC's groups 1-3 = other DRUs' (zp, s), not ReLU pieces."""
-    s, _ = layer_slope(layer)
+    s = table_slope(layer)
     zp = zp_byte(layer, quant_mode)
     lo = 0 if act_code(layer) == MODE_RELU else s
     return [entry(zp, lo), entry(zp, s), entry(zp, s), 0] * 4
@@ -211,6 +243,8 @@ def grelu_blocks(layer, quant_mode, fixed=False):
     for a, b, t1, t2, mode in npuc_blocks(layer, quant_mode):
         vals = [entry(a[k], b[k]) for k in range(16)]
         info = {"kind": auto_kind(vals), "extra": None}
+        if fixed:
+            table_slope(layer)  # per-channel slopes: refused, not corrected (auto would pick one of them)
         if fixed == "robust":
             vals = robust_vals(layer, quant_mode)
         elif fixed:
@@ -393,6 +427,14 @@ def show_table(path):
             " | ".join(groups)))
 
 
+def _ok(f):
+    try:
+        f()
+        return True
+    except ValueError:
+        return False
+
+
 def selftest():
     """facts read in the oracle sweep (docs/format/grelu.md), re-derived by the model; no compile"""
     used = lambda c: [sorted(m) for m in channel_passes(c)]
@@ -422,6 +464,15 @@ def selftest():
     s, sh = npuc_slope(1 / 128, 1 / 256, 1 / 32)
     rha = lambda acc: int(acc * s / 2 ** sh + 0.5)
     ok.append(("relu6 T2 is the first acc reaching the top", 0x80 + rha(t2) >= 255 > 0x80 + rha(t2 - 1)))
+    # per-channel values (docs/format/perchannel.md, probe c16-sl): B[d] = the DRU's channel's slope; the corrected
+    # tables take one slope with any shifts, and refuse several slopes
+    pc = dict(lay, cout=16, slopes=[128 + c for c in range(16)], shifts=[15] * 16)
+    ok.append(("per-channel slopes: NPUC's B[d] = channel d's slope (C out 16)",
+               [v >> 16 for r, v in grelu_regs(pc, 1) if r in TABLE] == [0, 0] + [128 + c for c in range(2, 16)]))
+    ok.append(("per-channel slopes: no corrected table", not _ok(lambda: grelu_regs(pc, 1, "robust"))))
+    sh = dict(pc, slopes=[128] * 16, shifts=[12 + c % 4 for c in range(16)])
+    ok.append(("one slope, per-channel shifts: the robust table of that slope",
+               [v for r, v in grelu_regs(sh, 1, "robust") if r in TABLE][:3] == [0x80, 0x00800080, 0x00800080]))
     bad = [n for n, v in ok if not v]
     for n, v in ok:
         print("%s %s" % ("ok  " if v else "FAIL", n))

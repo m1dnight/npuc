@@ -266,8 +266,9 @@ What unblocks the most models for the least work comes first. Items marked done 
    the effort (**a day**); refusing it cleanly comes with 5.
 9. **Beyond the zoo**: leaky ReLU (Tiny YOLOv2's activation; the GReLU table could hold the slope, docs/format/grelu.md
    section 6, needs NPU experiments: days), per-channel weight scales (TFLite's default for every conv: NPUC's
-   on-device filler takes one scale per layer, so this needs the per-DRU slopes NPUC fills anyway, studied on the
-   NPU: days; what folding them costs meanwhile: the section "Per-channel weight scales" below). Done (2026-11-22): `graph_to_tflite` for every op npunet lowers, so the zoo writes TFLite and the
+   on-device filler takes one scale per layer; done (2026-11-22) as far as the NPU allows: `--per-channel-shifts`,
+   docs/format/perchannel.md; what folding costs: the section "Per-channel weight scales" below). The camera models
+   (person detection, detectors, face, pose) and what they need: models/camera.md. Done (2026-11-22): `graph_to_tflite` for every op npunet lowers, so the zoo writes TFLite and the
    TFLite path is tested on real topologies (all 24 lower as their JSON; `tests/run.sh`).
 
 10. **Done (2026-11-22): tiling inside a graph, what remained** (frame.md 6.9, 6.11, 6.12): NPUC's trim and spill, in
@@ -361,8 +362,10 @@ top-1 class stayed A's on every input of 10 of the 14 classifiers at every R; it
 (lenet5 at R = 4, 16 and 64; magic-wand at 16), on 1 for kws-cnn (R = 16) and micro-speech (R = 64). These models
 have our noise weights and the gains spread evenly in log scale; a real model's R and spread are its own (read them
 from its weight scales: npunet's warning gives each folded layer's rounding), and a channel at s_max / 128 or below
-keeps at most one level of its weights. The per-DRU slopes NPUC fills anyway (item 9)
-would make per-channel scales exact.
+keeps at most one level of its weights. They cannot be exact on this NPU: NPUC has no per-channel multiplier and the
+NPU reads the slopes as one piece table per pass, but each DRU has its own shift word, so `--per-channel-shifts` keeps
+each channel's power of two there and folds less than a bit (docs/format/perchannel.md; on person_detect, against
+TFLite's arithmetic: logits 8.5 LSB off on average instead of 87 folded, models/camera.md).
 
 ## The models
 

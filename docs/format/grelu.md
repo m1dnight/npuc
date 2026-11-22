@@ -148,7 +148,7 @@ pass's MTC writes).
 - `pwl_regs(pieces, t1, t2)`, `relu6_pieces(layer, q)`: an arbitrary 3-piece table (G).
 - `python3 -I grelu.py check <variant dir>...`: per variant, NPUC writes vs the oracle NCP (exact/DIFFERS), fixed vs
   auto (run in memory with ncp-grelu-patch.py's own functions), robust vs auto; `table <ncp>`, `regs <lowered.json>`,
-  `selftest` (15 checks, no compile).
+  `selftest` (18 checks, no compile).
 
 Result (2026-11-21): `check $NCPGEN_WORK/sweep/grelu/v/*/ $NCPGEN_WORK/sweep/c3 $NCPGEN_WORK/sweep/grelu/ref/net-current-oracle`
 -> 92 variants, NPUC writes exact 92/92; fixed = auto 90, intended deviation 2 (c1, c2), differs 0; robust = auto 47.
@@ -175,5 +175,9 @@ Nets from `npuc-variant.py` (16x16x8 int8 input, the measured IFM layout). `reg=
   mode (3) in 0x40120940 bits 8..15.
 - Weights/requant: the slope rounds half away (section 5); npunet.py's lowered `slope` is not NPUC's in about half of
   non-power-of-two multipliers.
+- Per-channel requantisation (docs/format/perchannel.md, V on the oracle): NPUC keeps B[d] and the shift word per DRU
+  from per-channel vectors its frontend fills with one value; given per-channel slopes (the harness's setScale hook)
+  it writes each DRU its channel's slope here, which the per-pass piece table above cannot honour; per-channel shifts
+  (one slope) keep the table consistent.
 - Harness: npuc-net.cpp accepts act 0/1 only; allowing the TFLite enum 0..5 (ConvAttr.fusedActivation) would let the
   oracle show the mode-2 block of ReLU6/tanh.
