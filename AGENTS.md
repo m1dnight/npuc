@@ -18,7 +18,7 @@ the compiler, and it is tested on the host against NPUC.
 4. **Test before every commit.** `tests/run.sh` (no vendor file; must PASS) for any change. For a change to a part
    (`stream.py`, `frame.py`, `weights.py`, `grelu.py`, `npunet.py`): also `tests/regress.sh`, which checks every compiled
    set in `work/sweep` (only the known misses allowed: graph 93/98, graph-random2 64/66, NPUC's own uninitialised
-   bytes; zoo 4 and graph-large 9: trim and spill inside a graph and the rest of frame.md 6.11's list).
+   bytes; graph-large2 2 of the fresh large random set: frame.md 6.11's list).
    A change meant to change no output (a refactor, a speed-up): `tests/snapshot.py compare` against a snapshot the code
    before it recorded must say IDENTICAL. Say the numbers in the commit message.
 5. **New networks become regression data.** A new sweep goes to `work/sweep/<name>/` (one folder per variant, as
@@ -45,14 +45,16 @@ Python: `python3 -I`, standard library only. The host has docker (arm64 containe
 
 ## Where things stand (2026-11-22)
 
-Byte-exact with NPUC on every compiled network (`tests/regress.sh`) except NPUC's 7 uninitialised-byte eltwises and the
-listed misses of the zoo's standard-resolution models and of graph-large (NPUC's trim and spill inside a graph, not
-modelled: docs/format/frame.md 6.11). Tiling inside a graph follows NPUC's policy (frame.graph_policy). Common models:
-`models/` (26 of 32 zoo entries exact; models/README.md lists what the rest need). Depthwise is lowered
-to the dense block-diagonal conv NPUC itself compiles (docs/format/depthwise.md; NPUC's own depthwise-optimised path is
-off on the device and unproven on the NPU). Not supported yet: trim and spill and weight rings inside a graph, a CMDQ cut in a tiled
-plan's single blocks, channel split/slice, other
-activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling (NPUC's deconvolution crashed in the
-harness). Several outputs (detection heads) are supported (docs/format/frame.md 12; the harness's `output` line needs
-root-f7b580ef or later). Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the
-nervesinator porting kit).
+Byte-exact with NPUC on every compiled network (`tests/regress.sh`) except NPUC's 7 uninitialised-byte eltwises and two
+of the fresh large random graphs (graph-large2 t2006, t2022: frame.md 6.11). Tiling inside a graph follows NPUC's
+policy (frame.graph_policy), NPUC's trim and spill is modelled from its GlobalMemoryAllocator in graphs and chains
+(frame.md 6.12), its layer-block forwarding from its calculators (frame.forwarding), the CMDQ cut in a tiled plan's
+single blocks too (6.9). Common models: `models/` (31 of 32 zoo entries exact, the 32nd fails in NPUC; every standard-
+resolution model as published). Depthwise is lowered to the dense block-diagonal conv NPUC itself compiles
+(docs/format/depthwise.md; NPUC's own depthwise-optimised path is off on the device and unproven on the NPU). Camera
+models: models/camera.md (person_detect exact as published; per-channel scales as per-channel shifts,
+docs/format/perchannel.md; the harness's setScale hook needs root-40bb3e3f). Not supported yet: channel split/slice, other activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling
+(NPUC's deconvolution crashed in the harness), an output another layer also reads (NPUC crashes on it), a layer-block
+only a weight ring fits, strata joined to each other. Several outputs (detection heads) are supported (docs/format/frame.md
+12; the harness's `output` line needs root-38925a6d or later). Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the nervesinator
+porting kit).

@@ -173,7 +173,8 @@ output a blob a layer also reads (isIntermediateOutput): a probe only; NPUC's po
 npuc-conv-6e2aa54d unchanged), `LINK_CURRENT=0`. The same NCPs as root-fd659af2: the 12 outputs probes recompiled with
 the line (and "npuc-net 2" instead of 1 for the conv-only ones) byte for byte, and 37 of 38 stored NCPs sampled from
 corpus, graph, graph-random, graph-random2, random, graph-split and tiling2 (the other: graph rc4-24x12, NPUC's own
-uninitialised descriptor words, which root-fd659af2 does not reproduce either).
+uninitialised descriptor words, which root-fd659af2 does not reproduce either). Merged with main's per-channel lines
+(`wscales`, `slopes`, the setScale hook): **root-38925a6d** (npuc-net-627f953e), the run directory for both.
 
 ## 5. What ncpgen/npunet.py needs to lower TFLite to it (for the orchestrator)
 

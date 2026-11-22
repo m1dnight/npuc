@@ -799,12 +799,15 @@ def _dscnn_dense(n):
 
 
 # ---- standard resolutions: the common ImageNet models at the input sizes they are published at ----------------------
-def _mnv1_std(n, alpha):
+def _mnv1_std(n, alpha, gap1=False):
     n.conv(int(32 * alpha), 3, s=2, act="relu6")
     for c, s in ((64, 1), (128, 2), (128, 1), (256, 2), (256, 1), (512, 2)) + ((512, 1),) * 5 + ((1024, 2), (1024, 1)):
         n.dw(3, s, act="relu6")
         n.conv(int(c * alpha), 1, act="relu6")
-    n.gap1()
+    if gap1:
+        n.gap1()
+    else:
+        n.gap()
     n.conv(1000, 1, act="none", name="logits")
     n.flatten()
     n.softmax()
@@ -814,20 +817,20 @@ MNV1_STD_SRC = ("MobileNet v1 %s (Howard et al. 2017; keras.applications MobileN
                 "depthwise-separable blocks, %d..%d channels, global average pool, 1x1 conv to 1000 classes)")
 GAP1_AD = ("the 7x7 global average pool as a 7x7 stride-1 VALID average pool (one output: the same function; NPUC's "
            "NFU pools take strides up to 3, and npunet's identity-conv form of a stride-7 pool is %d x %d x 7 x 7 "
-           "weights)")
-MNV1_STD_AD = COMMON + ["ReLU6 at TFLite's 6/255 (zp -128)", GAP1_AD % (1024, 1024), "the logits conv: --allow-none"]
+           "weights, which npunet would lower, but nobody compiled that form)")
+MNV1_STD_AD = COMMON + ["ReLU6 at TFLite's 6/255 (zp -128)", "the logits conv: --allow-none"]
 
 
 @model("mobilenet-v1-100-224", "mobilenet-v1-100-224", MNV1_STD_SRC % ("1.0", "1.0", 32, 1024),
        "ImageNet 224x224x3, 1000 classes", adapt=MNV1_STD_AD)
 def _mnv1_100_224(n):
-    _mnv1_std(n, 1.0)
+    _mnv1_std(n, 1.0)       # its 7x7 global pool over 1024: npunet's stride-1 pool (no conv form)
 
 
 @model("mobilenet-v1-050-224", "mobilenet-v1-050-224", MNV1_STD_SRC % ("0.5", "0.5", 16, 512),
-       "ImageNet 224x224x3, 1000 classes", adapt=MNV1_STD_AD[:3] + [GAP1_AD % (512, 512)] + MNV1_STD_AD[4:])
+       "ImageNet 224x224x3, 1000 classes", adapt=MNV1_STD_AD[:2] + [GAP1_AD % (512, 512)] + MNV1_STD_AD[2:])
 def _mnv1_050_224(n):
-    _mnv1_std(n, 0.5)
+    _mnv1_std(n, 0.5, gap1=True)
 
 
 MNV2_STD_SRC = ("MobileNet v2 %s (Sandler et al. 2018; keras.applications MobileNetV2 alpha %s at 224x224: 17 inverted "
@@ -835,15 +838,15 @@ MNV2_STD_SRC = ("MobileNet v2 %s (Sandler et al. 2018; keras.applications Mobile
 
 
 @model("mobilenet-v2-100-224", "mobilenet-v2-100-224", MNV2_STD_SRC % ("1.0", "1.0", "16..320"),
-       "ImageNet 224x224x3, 1000 classes", adapt=MNV2_AD[:3] + [GAP1_AD % (1280, 1280)] + MNV2_AD[3:])
+       "ImageNet 224x224x3, 1000 classes", adapt=MNV2_AD)
 def _mnv2_100_224(n):
-    _mnv2(n, MNV2_100, gap1=True)
+    _mnv2(n, MNV2_100)      # its MEAN over 7 x 7 x 1280: npunet's stride-1 pool (no conv form)
 
 
 @model("mobilenet-v2-035-224", "mobilenet-v2-035-224", MNV2_STD_SRC % ("0.35", "0.35", "8..112"),
-       "ImageNet 224x224x3, 1000 classes", adapt=MNV2_AD[:3] + [GAP1_AD % (1280, 1280)] + MNV2_AD[3:])
+       "ImageNet 224x224x3, 1000 classes", adapt=MNV2_AD)
 def _mnv2_035_224(n):
-    _mnv2(n, MNV2_035, gap1=True)
+    _mnv2(n, MNV2_035)
 
 
 def _resnet18(n):

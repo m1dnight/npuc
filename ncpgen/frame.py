@@ -305,7 +305,8 @@ def _ring(passes, slot, fm):
     return cdiv(passes, cdiv(passes, rmax))
 
 
-def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_npuc, nsub=None, best=None):
+def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_npuc, nsub=None, best=None,
+                  spill_vec=None):
     """a run of layers NPUC keeps in one tile (one group per layer from g0, feature maps forwarded in SRAM): its SRAM
     chunks and DMAs (the input from DRAM vector v_src, the weights, the last output stored to v_dst). nsub: the
     weight sub-batch count per conv (weights.py), which adds a PARTIAL_SUM chunk; a conv whose weights do not fit
@@ -345,7 +346,7 @@ def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_n
                 # V (NPUC's policy, frame.md 6.10; tiling2 a02: a 6-slot ring with an extended lifetime where all
                 # 12 passes would fit with a short one): its ring and the ring's lifetime
                 r = best[li]["nbuf"] or passes
-                short = r < passes and not best[li]["extended"]
+                short = not best[li]["extended"]
             if r is None:
                 return None, None, ops
             ring[li] = r
@@ -371,16 +372,10 @@ def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_n
     for k, grp in enumerate(chunks):
         res = _first_fit([grp], placed, cap=SRAM_LIMIT)
         if res is None and k >= 2:
-            first = min(c["live"][0] for c in grp)
-            ifm = next(c for c in placed if c.get("layer") == lis[k - 2] and c["kind"] in ("CONV", "POOL"))
-            ifm["live"] = (ifm["live"][0], first - 1)
-            trim = {"kind": "TRIM", "size": ifm["size"], "live": (first, first), "layer": lis[k - 1], "copy": True,
-                    "src": ifm["off"]}
-            if ifm["off"] < ifm["size"]:
-                placed.append(dict(trim, off=IDP_STRIDE - rup(ifm["size"], 64)))
-            else:
-                placed += _place([trim], placed)
-            res = _first_fit([grp], placed, cap=SRAM_LIMIT, ties_created=True)
+            # NPUC's trim and spill (frame.md 6.7, 6.12; the stream part's model of its GlobalMemoryAllocator): a copy
+            # of the input (a TRIM chunk, its own group before the layer's), or a spill (the previous layer stores its
+            # output, this layer loads it into a chunk of its own, placed after its other chunks)
+            res = _chain_trim_spill(grp, placed, lis[k - 1], lis[k - 2])
         if res is None:
             res = _first_fit([grp], placed, cap=SRAM_LIMIT, overflow=True)
         placed += res
@@ -410,20 +405,41 @@ def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_n
     # when a PAD, REFORMAT or POOL op does, except that a PAD or POOL loads plane by plane and NPUC's DMACluster
     # cuts n*pp >= 64 (CODEGEN_MINIMAL_LOADS_NUM_FOR_BATCH_CLUSTERING) such loads into 4 (CODEGEN_CLUSTER_NUM_BATCHES)
     # clusters of ceil(pp/4) planes per IDP, the last one the rest), then every conv's weights in its own group
-    direct = ops[0].get("direct", False)
-    if ops[0]["op"] in ("PAD", "POOL") and inl["n"] > 1 and inl["n"] * inl["pp"] >= 64:
-        per = cdiv(inl["pp"], 4)
-        k0 = 0
-        while k0 < inl["pp"]:
-            k1 = min(inl["pp"], k0 + per)
-            sz = (k1 - k0) * inl["plane"]
-            idps, h, w, cs = _sram_dma(inl["n"], sz // (2 * inl["Wp"]), 2 * inl["Wp"])
-            dmas.append((g0, 0, _blob(v_src, k0 * inl["plane"], 1, idps, h, w, cs=inl["per_idp"] - sz),
-                         _blob(0, in_chunk["off"] + k0 * inl["plane"], 1, idps, h, w, cs=cs)))
-            k0 = k1
-    else:
-        for vec_, idps, h, w, cs, doff in _spread_dmas(inl, direct):
-            dmas.append((g0, 0, _blob(v_src, doff, 1, idps, h, w), _blob(vec_, in_chunk["off"], 1, idps, h, w, cs=cs)))
+    def in_load(g, vsrc, lay, op0, off):
+        direct = op0.get("direct", False)
+        if op0["op"] in ("PAD", "POOL") and lay["n"] > 1 and lay["n"] * lay["pp"] >= 64:
+            per = cdiv(lay["pp"], 4)
+            k0 = 0
+            while k0 < lay["pp"]:
+                k1 = min(lay["pp"], k0 + per)
+                sz = (k1 - k0) * lay["plane"]
+                idps, h, w, cs = _sram_dma(lay["n"], sz // (2 * lay["Wp"]), 2 * lay["Wp"])
+                dmas.append((g, 0, _blob(vsrc, k0 * lay["plane"], 1, idps, h, w, cs=lay["per_idp"] - sz),
+                             _blob(0, off + k0 * lay["plane"], 1, idps, h, w, cs=cs)))
+                k0 = k1
+        else:
+            for vec_, idps, h, w, cs, doff in _spread_dmas(lay, direct):
+                dmas.append((g, 0, _blob(vsrc, doff, 1, idps, h, w), _blob(vec_, off, 1, idps, h, w, cs=cs)))
+
+    def out_store(li, vdst):
+        # V: when the layer is a conv on a wider input (internal_shapes), the DRAM side of its store steps planes by
+        # the true width's plane: DRAM c_stride = pp * (true plane - internal plane) (negative; seen with one plane
+        # per IDP; G: NPUC's planes then overlap in DRAM). A pool that widened its own output stores with c_stride 0.
+        Co_, Ho_, Wo_ = layers[li]["out_chw"]
+        _, Hi_, Wi_ = shapes[li]["out"]
+        ol_ = cell(Co_, Hi_, Wi_)
+        dcs = ol_["pp"] * (cell(Co_, Ho_, Wo_)["plane"] - ol_["plane"]) if Wi_ != Wo_ and layers[li]["kind"] == "conv" \
+            else 0
+        if fix_npuc:
+            dcs = 0
+        for vec_, idps, h, w, cs, doff in _spread_dmas(ol_, True, layers[li]["kind"] == "pool"):
+            dmas.append((grp_of[li], 1, _blob(vec_, out_chunk[li]["off"], 1, idps, h, w, cs=cs),
+                         _blob(vdst, doff, 1, idps, h, w, cs=dcs if idps > 1 else 0)))
+
+    in_load(g0, v_src, inl, ops[0], in_chunk["off"])
+    # a spill (frame.md 6.12): the previous layer stores its output (its own IM vector, spill_vec), the reader loads
+    # it into its chunk, as a block's input (V: mobilenet-v1-100-224, conv3's 56 x 56 x 128 output before dw3)
+    spills = {c["layer"]: c for c in placed if c.get("spill")}
     last = lis[-1]
     oc = out_chunk[last]
     Co, Ho, Wo = layers[last]["out_chw"]
@@ -434,8 +450,13 @@ def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_n
     # after that pass's weight load (16 output channels = 2 planes per IDP)
     Ll = layers[last]
     passwise = Ll["kind"] == "conv" and ring.get(last, 0) < cdiv(Ll["cout"], 16) and Ll["cout"] % 16 and \
-        nsub.get(last) == 1
-    for li in lis:
+        nsub.get(last) == 1 and _cmdq_estimate(Ll, shapes[last]) <= CMDQ_LIMIT    # (cut: chunk by chunk, 6.9)
+    for k, li in enumerate(lis):
+        if li in spills:
+            if spill_vec is not None:
+                out_store(lis[k - 1], spill_vec[li])
+                in_load(grp_of[li], spill_vec[li], cell(*shapes[li]["in"]),
+                        next(o for o in ops if o["layer"] == li), spills[li]["off"])
         if layers[li]["kind"] == "conv" and not (passwise and li == last):
             load_weights(li)
     if passwise:
@@ -447,14 +468,62 @@ def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_n
     # V: when the last layer is a conv on a wider input (internal_shapes), the DRAM side of its store steps planes by
     # the true width's plane: DRAM c_stride = pp * (true plane - internal plane) (negative; seen with one plane per
     # IDP; G: NPUC's planes then overlap in DRAM). A pool that widened its own output stores with c_stride 0.
-    tl = cell(Co, Ho, Wo)
-    dcs = ol["pp"] * (tl["plane"] - ol["plane"]) if Wi != Wo and layers[last]["kind"] == "conv" else 0
-    if fix_npuc:
-        dcs = 0
-    for vec_, idps, h, w, cs, doff in _spread_dmas(ol, True, layers[last]["kind"] == "pool"):
-        dmas.append((grp_of[last], 1, _blob(vec_, oc["off"], 1, idps, h, w, cs=cs),
-                     _blob(v_dst, doff, 1, idps, h, w, cs=dcs if idps > 1 else 0)))
+    out_store(last, v_dst)
     return placed, peak, ops
+
+
+def _spill_vectors(layers, shapes, lis, wsize, nsub, best, fix_npuc, vec):
+    """the IM vectors of a single block's spilled tensors (frame.md 6.12): a dry run of its allocation finds the
+    spills; each spilled producer's output gets a vector by the IM rule, in order. {reader layer: vector}"""
+    placed, _, _ = _single_block(layers, shapes, lis, wsize, 0, 0, {li: 0 for li in lis}, 0, [], fix_npuc, nsub,
+                                 best)
+    out = {}
+    for c in placed:
+        if c.get("spill"):
+            p_ = lis[lis.index(c["layer"]) - 1]
+            c_, h_, w_ = shapes[p_]["out"]
+            Lt = layers[p_]["out_chw"]
+            im = _im_vector(c_, h_, w_, Lt[0] * Lt[1] * Lt[2])
+            out[c["layer"]] = vec(MV_IM, im["av"], (im["w"], im["h"], im["c"]))
+    return out
+
+
+def _chain_trim_spill(grp, placed, li, prev):
+    """stream._trim_spill on one layer's chunks of a chain's single block: placed (dicts, in placement order) as the
+    allocator's state, the previous layer's output read by this layer's first op. Returns the layer's chunks, with
+    a TRIM chunk ("copy") or a spilled reload ("spill": an INPUT chunk this layer loads) appended; the input's live
+    range is cut as NPUC cuts it."""
+    wrap = []
+    for d in placed:
+        c = stream.Chunk(None, d["kind"], d["size"], list(d["live"]), None, d.get("tail", False))
+        c.off, c.layer, c.src = d["off"], d.get("layer"), d
+        if d.get("layer") == prev and d["kind"] in ("CONV", "POOL"):
+            c.tensor, c.readers = prev, [(li, min(x["live"][0] for x in grp))]
+        wrap.append(c)
+    pos = {}
+    stream._register(pos, wrap)
+    mine = []
+    for j, d in enumerate(grp):
+        c = stream.Chunk(j, d["kind"], d["size"], list(d["live"]), (2, li), d.get("tail", False))
+        c.layer, c.src = li, d
+        mine.append(c)
+    ts = {}
+    try:
+        got = stream._trim_spill(mine, wrap, pos, SRAM_LIMIT, ts)
+    except stream.Unsupported as e:
+        raise NotImplementedError(str(e))
+    for c in wrap:                          # the input's live range as NPUC cut it
+        c.src["live"] = tuple(c.live)
+    out = []
+    for c in got:
+        if c.cid is not None and getattr(c, "src", None) is not None and c.src in grp:
+            out.append(dict(c.src, off=c.off))
+    for X, T in ts.get("trims", []):
+        out.append({"kind": "TRIM", "size": T.size, "live": tuple(T.live), "layer": li, "copy": True, "src": X.off,
+                    "off": T.off})
+    for t, r, n in ts.get("spills", []):
+        out.append({"kind": "INPUT", "size": n.size, "live": tuple(n.live), "layer": li, "spill": True, "off": n.off})
+    return out
 
 
 def _weight_load(dmas, g, v_w, per, part, k, nin, nl, sram_off):
@@ -596,12 +665,15 @@ def _plan(low, weight_sizes, strict, fix_npuc):
     inl = cell(C0, H0, W0)
     v_in = vec(MV_IN, inl["size"], (W0, H0, C0))
     v_out = vec(MV_OT, ofm_size(Co, Ho, Wo), (Wo, Ho, Co))
+    lis = list(range(len(layers)))
+    # a spilled tensor (frame.md 6.12) has its own IM vector, before the output's (in the order of the stores)
+    spill_vec = _spill_vectors(layers, shapes, lis, wsize, nsub, policy["best"], fix_npuc, vec)
     v_im = vec(MV_IM, im["av"], (im["w"], im["h"], im["c"]))
     v_w = {li: vec(MV_WT, wsize[li]) for li in convs}
     vec(MV_IM, 138, (8, 8, 2))   # V: always present, 8x8x2 + 10
     dmas = []   # (group, direction 0 load / 1 store, src blob, dst blob)
-    placed, peak, ops = _single_block(layers, shapes, list(range(len(layers))), wsize, v_in, v_im, v_w, 0, dmas,
-                                      fix_npuc, nsub, policy["best"])
+    placed, peak, ops = _single_block(layers, shapes, lis, wsize, v_in, v_im, v_w, 0, dmas,
+                                      fix_npuc, nsub, policy["best"], spill_vec)
     if peak is None or peak > SRAM_LIMIT:
         raise NotImplementedError("NPUC keeps every layer whole but our allocation needs %s B" % peak)
     if peak > SRAM_SAFE and strict and any(nsub[li] is None for li in convs):
@@ -815,11 +887,14 @@ def plan_graph(low, weight_sizes=None):
     outs = net_outputs(low)                     # several outputs: in NPUC's order (frame.md 12)
     order = exec_order(outs, ins, cons, src)
     gl = P.group_layers                         # the layer of each group, None for an output group (frame.md 6.8,
-    #                                             6.9, 12: several outputs' groups each end their policy group)
+    #                                             6.9; one output: its read-back's row tiles last, 6.5; several: one
+    #                                             group each, each ending its policy group, 12)
+    nu = gl.count(None)                         # the output groups
+    out = outs[0]
     inner = getattr(P, "graph_inner", set())    # a tiled stratum's layers after its head (6.11)
     if list(dict.fromkeys(x for x in gl if x is not None)) != \
             [n for n in getattr(P, "emit_order", order) if by[n]["kind"] != "concat" and n not in inner] or \
-            gl.count(None) != len(outs):
+            (len(outs) > 1 and nu != len(outs)) or nu < 1:
         raise ValueError("the stream's groups do not follow the layer order")
     # the WEIGHT vectors, in the NCP's group order (NPUC's layer order for one output; frame.md 12)
     wl = [n for n in getattr(P, "emit_order", order) if by[n]["kind"] in ("conv", "relu", "eltwise")]
@@ -924,10 +999,29 @@ def plan_graph(low, weight_sizes=None):
             k += 1
             continue
         if what == "dram":
-            o = op.tensor if len(outs) > 1 else outs[0]
-            c_, h_, w_ = oint.get(o, chw[o])
-            un[o] = _read_back(rows, g, cell(chw[o][0], h_, w_), chw[o][0], tvec(o), False)
-            k += 1
+            if len(outs) > 1:
+                o = op.tensor
+                c_, h_, w_ = oint.get(o, chw[o])
+                un[o] = _read_back(rows, g, cell(chw[o][0], h_, w_), chw[o][0], tvec(o), False)
+                k += 1
+                continue
+            c_, h_, w_ = oint.get(out, chw[out])
+            if nu == 1:
+                un[out] = _read_back(rows, g, cell(chw[out][0], h_, w_), chw[out][0], tvec(out), False)
+                k += 1
+                continue
+            # a row tile of a tiled read-back (6.5, plan_tiled's): its rows per IDP from the output's IM
+            uc, uh, uw = P.out_chw
+            u0, u1 = _tile_ranges(uh, nu, 4)[g - (len(P.groups) - nu)]
+            got = []
+            _tile_dma(got, cell(uc, uh, uw), (u0, u1, 0, uw - 1), tvec(out), 0, True, g, ns0=True)
+            j = k + 1
+            while j < len(dmas) and dmas[j][2] == g and getattr(dmas[j][0], "what", None) == "dram":
+                j += 1
+            if len(got) != j - k:
+                raise NotImplementedError("a read-back tile's %d DMAs, %d in the stream" % (len(got), j - k))
+            rows += got
+            k = j
             continue
         if getattr(op, "tile", None) is not None:
             # a tile of a stratum NPUC tiles inside the graph (frame.md 6.11): its input region loaded from the DRAM
@@ -1030,24 +1124,37 @@ def plan_graph(low, weight_sizes=None):
         flag = op.flags[i] if op.kind == "store" else op.flag
         io.append([n_ + 1, getattr(op, "bid", 0) or 0, g, 0, flag, 2, 0, 1, 0] + sb + db)
     G = len(P.groups)
-    ogs = [g for g in range(G) if gl[g] is None]    # the output groups: one per output, in NPUC's order
     groups = [{"index": g, "kind": "output" if gl[g] is None else ("dma" if any(x[2] == g for x in io) else "plain")}
               for g in range(G)]
-    ufs = []
-    for j, o in enumerate(outs):
-        Co, Ho, Wo = chw[o]
-        _, Hi, Wi = oint.get(o, chw[o])
-        ol = cell(Co, Hi, Wi)
-        ufs.append({"n": un[o][0], "c": un[o][1], "C": Co, "H": Ho, "W": Wo, "Hi": Hi, "Wi": Wi, "Hp": ol["Hp"],
-                    "Wp": ol["Wp"], "sram_off": 0, "group": ogs[j]})
-        if len(outs) > 1:
-            ufs[-1].update({"v_out": v_outs[o], "layer": o})
-    p = {"graph": True, "av": av, "mv": mv, "io": io, "groups": groups, "v_out": v_outs[outs[0]],
-         "v_w": [wvec[n] for n in wl], "wlayers": wl,
-         "chunks": [], "layers": [L["kind"] for L in layers], "unflatten": ufs[0]}
     if len(outs) > 1:
-        p["outputs"] = ufs
-    return p
+        # one output group per output, in NPUC's order, each its own OT_FMAP (frame.md 12)
+        ogs = [g for g in range(G) if gl[g] is None]
+        ufs = []
+        for j, o in enumerate(outs):
+            Co, Ho, Wo = chw[o]
+            _, Hi, Wi = oint.get(o, chw[o])
+            ol = cell(Co, Hi, Wi)
+            ufs.append({"n": un[o][0], "c": un[o][1], "C": Co, "H": Ho, "W": Wo, "Hi": Hi, "Wi": Wi, "Hp": ol["Hp"],
+                        "Wp": ol["Wp"], "sram_off": 0, "group": ogs[j], "v_out": v_outs[o], "layer": o})
+        return {"graph": True, "keep_bids": True, "av": av, "mv": mv, "io": io, "groups": groups,
+                "v_out": v_outs[out], "v_w": [wvec[n] for n in wl], "wlayers": wl,
+                "chunks": [], "layers": [L["kind"] for L in layers], "unflatten": ufs[0], "outputs": ufs}
+    Co, Ho, Wo = chw[out]
+    _, Hi, Wi = oint.get(out, chw[out])         # a widened pool's one more column (as a chain's)
+    ol = cell(Co, Hi, Wi)
+    outs = [{"n": un[out][0], "c": un[out][1], "C": Co, "H": Ho, "W": Wo, "Hi": Hi, "Wi": Wi, "Hp": ol["Hp"],
+             "Wp": ol["Wp"], "sram_off": 0, "group": G - 1}] if nu == 1 else []
+    if nu > 1:
+        uc, uh, uw = P.out_chw
+        lu = cell(uc, uh, uw)
+        for u, (u0, u1) in enumerate(_tile_ranges(uh, nu, 4)):
+            r_ = u1 - u0 + 1
+            outs.append({"n": lu["n"], "c": lu["cpi"], "C": Co, "H": r_, "W": Wo, "Hi": r_, "Wi": uw, "Hp": rup(r_, 4),
+                         "Wp": lu["Wp"], "sram_off": 0, "group": G - nu + u, "dst_off": u0 * Wo,
+                         "dst_cs": (Ho - r_) * Wo})
+    return {"graph": True, "keep_bids": True, "av": av, "mv": mv, "io": io, "groups": groups, "v_out": v_outs[out],
+            "v_w": [wvec[n] for n in wl], "wlayers": wl,
+            "chunks": [], "layers": [L["kind"] for L in layers], "unflatten": outs[0], "outputs": outs}
 
 
 # ---- tiled plans (NPUC's stratum tiling) ------------------------------------------------------------------------------
@@ -1336,9 +1443,14 @@ def _pol_blocks(nd, ins, outs, nbuf=0):
     return b
 
 
-def _pol_full(nd, nbuf=0, extended=True):
-    """estimateFullMemoryRequirements (0x34481c): the whole node; extended = its weights live from its first op"""
+def _pol_full(nd, nbuf=0, extended=True, ifm_pre=False, ofm_pre=False):
+    """estimateFullMemoryRequirements (0x34481c): the whole node; extended = its weights live from its first op;
+    ifm_pre, ofm_pre: its input (output) is held elsewhere and not counted (the layer-block forwarding's test)"""
     b = _pol_blocks(nd, nd["in"], nd["out"], nbuf)
+    if ifm_pre:
+        b["ifm"] = 0
+    if ofm_pre:
+        b["ofm"] = 0
     wk, x = b["wk"], b["ps"]
     if not wk:
         return b["ifm"] + b["ofm"] + b["w"] + x
@@ -1436,6 +1548,41 @@ def _pol_fit_h(nd, nw, nbuf):
     return None
 
 
+def _pol_whole(nd, limit, ifm_pre=False, ofm_pre=False):
+    """getBestProcessingParams' whole-node part (0x3adc8c) within limit: {"whole", "nbuf", "extended"}. All weights
+    with an extended lifetime when they fit; else tryAllocateWeightsPartially's ring (FUN_003b0e2c: the largest
+    ceil(P / k), k = 2.., that fits), kept with 5 or more buffers when extended, else retried with a short lifetime;
+    all weights with a short lifetime when they fit and no ring of more than 4 buffers does. The weights' lifetime is
+    a tag the call sets on the node ("weights_have_extended_lifetime"): cleared whenever the extended forms fail,
+    also when the node is not kept whole (V: decompiled; the layer-block forwarding's side effect, forwarding())"""
+    L = nd["L"]
+    conv = L["kind"] == "conv"
+    P = nd.get("P", 0)
+
+    def ring(extended):
+        prev = 0
+        for k in range(2, P + 1):
+            nb = cdiv(P, k)
+            if nb != prev:
+                if _pol_full(nd, nb, extended, ifm_pre, ofm_pre) <= limit:
+                    return nb
+                prev = nb
+        return 0
+
+    if _pol_full(nd, 0, True, ifm_pre, ofm_pre) <= limit:
+        return {"whole": True, "nbuf": 0, "extended": True}
+    all_short = _pol_full(nd, 0, False, ifm_pre, ofm_pre) <= limit
+    nb1 = ring(True) if conv else 0
+    if not all_short:
+        if nb1 >= 5:
+            return {"whole": True, "nbuf": nb1, "extended": True}
+        nb2 = ring(False) if conv else 0
+        return {"whole": bool(nb2), "nbuf": nb2, "extended": False}
+    if nb1 > 4:
+        return {"whole": True, "nbuf": nb1, "extended": True}
+    return {"whole": True, "nbuf": 0, "extended": False}
+
+
 def _pol_best(nd):
     """getBestProcessingParams (0x3adc8c) for one node: {"tiles": (nh, nw), "nbuf": weight buffers (0 = all),
     "extended": the weights' lifetime}. Whole when it fits (all weights with an extended lifetime; else a ring of
@@ -1448,31 +1595,10 @@ def _pol_best(nd):
     conv = L["kind"] == "conv"
     P = nd.get("P", 0)
 
-    def ring(extended):         # tryAllocateWeightsPartially (FUN_003b0e2c): the largest ceil(P / k), k = 2.., that fits
-        prev = 0
-        for k in range(2, P + 1):
-            nb = cdiv(P, k)
-            if nb != prev:
-                if _pol_full(nd, nb, extended) <= SRAM_LIMIT:
-                    return nb
-                prev = nb
-        return 0
-
     if H < mh and W < mw:
-        if _pol_full(nd, 0, True) <= SRAM_LIMIT:
-            return {"tiles": (1, 1), "nbuf": 0, "extended": True}
-        all_short = _pol_full(nd, 0, False) <= SRAM_LIMIT
-        nb1 = ring(True) if conv else 0
-        if not all_short:
-            if nb1 >= 5:
-                return {"tiles": (1, 1), "nbuf": nb1, "extended": True}
-            nb2 = ring(False) if conv else 0
-            if nb2:
-                return {"tiles": (1, 1), "nbuf": nb2, "extended": False}
-        else:
-            if nb1 > 4:
-                return {"tiles": (1, 1), "nbuf": nb1, "extended": True}
-            return {"tiles": (1, 1), "nbuf": 0, "extended": False}
+        r = _pol_whole(nd, SRAM_LIMIT)
+        if r["whole"]:
+            return {"tiles": (1, 1), "nbuf": r["nbuf"], "extended": r["extended"]}
     Ho, Wo = nd["out"][1], nd["out"][2]
     for nw in range(1, cdiv(Wo, 8) + 1):
         if _pol_lengths(Wo, nw, 8) is None:
@@ -1714,6 +1840,90 @@ def _graph_policy(low, wsize=None):
     return {"order": order, "shapes": shp, "nodes": nds, "best": best, "strata": strata, "wsize": wsize}
 
 
+def forwarding(low, pol=None):
+    """NPUC's layer-block forwarding tests (LayerBlockFMSharingCalculator::calculateOptimizationParameters, one pass
+    per mode: input sharing, concat in SRAM, full forwarding; V: decompiled, oracle/ghidra/targets-graphtile2.txt):
+    a block is a fork whose readers all lead, through layers of one input and one reader, to one concat that reads
+    nothing else. Over the nodes in order, each mode holds its block's initial memory (input sharing: the head's
+    output; concat in SRAM: the concat's ("ahead_concat_size"); full forwarding: both) and tests every untiled node
+    of the block whose predecessor passed (or is the head) with getBestProcessingParams(node, 256 KiB - that - its
+    predecessor's output when the predecessor is not the head and has several readers), the input not counted when
+    the predecessor is the head (input sharing, full forwarding), the output not counted when a concat reads it
+    (concat in SRAM, full forwarding); less than one byte left: "is too fat", no test. A node passes when it stays
+    whole. Each test sets the node's weight lifetime (_pol_whole), so the last test wins (V: large random t1004,
+    t1013: the branch convs' weights live on their conv only). A block succeeds in a mode when every input of its
+    concat passed (or is the head: tryProcessLayerBlockEnd). Returns {"life": {node: extended} for the nodes tested,
+    "ok": {mode: {head: succeeded}}, "nbuf": {mode: {node: weight buffers it passed with}}, "heads": {head: concat}}."""
+    ins, cons, by, src = topology(low)
+    pol = pol or graph_policy(low)
+    nds, shp = pol["nodes"], pol["shapes"]
+    tiled = {x for st in pol["strata"] for x in st["layers"]}
+    order = pol["order"]
+
+    def out_mem(n):
+        if n == src:
+            return _pol_blk(*low["input"]["chw"])
+        C, H, W = shp[n]["out"]
+        return _pol_blk(rup(C, 16) if by[n]["kind"] == "conv" else C, H, W)
+
+    def root(t):
+        while t != src and by[t]["kind"] in ("conv", "pool", "relu") and len(cons[t]) == 1 and len(ins[t]) == 1:
+            t = ins[t][0]
+        return t
+    heads = {}                              # block head -> its concat
+    for kn in order:
+        if by[kn]["kind"] != "concat":
+            continue
+        rs = {root(i) for i in ins[kn]}
+        if len(rs) != 1:
+            continue
+        r = rs.pop()
+        if r != src and by[r]["kind"] == "concat" and r in ins[kn]:
+            continue
+        # every reader of the head on a branch to this concat
+        branch = set()
+        for i in ins[kn]:
+            t = i
+            while t != r:
+                branch.add(t)
+                t = ins[t][0]
+        if all(x in branch or x == kn for x in cons.get(r, [])):
+            heads[r] = kn
+    life, res, nbuf = {}, {}, {}
+    for mode in ("is", "cs", "ff"):
+        cur, mem0, ok = None, 0, set()
+        res[mode], nbuf[mode] = {}, {}
+        for n in [src] + order:
+            if n != src and by[n]["kind"] == "concat" and cur is not None:
+                if heads.get(cur) == n:
+                    res[mode][cur] = all(i in ok for i in ins[n])
+                cur = None
+            if n in heads:
+                kn = heads[n]
+                C, H, W = shp[kn]["out"]
+                cat = _pol_blk(C, H, W)
+                mem0 = {"is": out_mem(n), "cs": cat, "ff": out_mem(n) + cat}[mode]
+                cur, ok = n, {n}
+                continue
+            if cur is None or n == src or by[n]["kind"] == "concat" or n not in nds or n in tiled:
+                continue
+            if len(ins[n]) != 1 or ins[n][0] not in ok:
+                continue
+            p = ins[n][0]
+            more = out_mem(p) if p != cur and len(cons.get(p, [])) >= 2 else 0
+            mem = SRAM_LIMIT - mem0 - more
+            if mem < 1:
+                continue
+            rd = cons.get(n, [])
+            r = _pol_whole(nds[n], mem, ifm_pre=mode != "cs" and p == cur,
+                           ofm_pre=mode != "is" and bool(rd) and by[rd[0]]["kind"] == "concat")
+            life[n] = r["extended"]
+            if r["whole"]:
+                ok.add(n)
+                nbuf[mode][n] = r["nbuf"]
+    return {"life": life, "ok": res, "nbuf": nbuf, "heads": heads}
+
+
 def node_whole(nd, limit):
     """getBestProcessingParams(node, limit) keeps the node whole with all its weights (the test NPUC's layer-block
     forwarding makes of a block's nodes with the SRAM the block leaves, LayerBlockFMSharingCalculator::
@@ -1774,7 +1984,7 @@ def _tile_dma(dmas, lay, rng, dram_vec, sram_off, load, g, ns0=False, pool=False
                 if pool and pl_ < pp:
                     pl_ = pp - pp % 2
             sdram = _blob(dram_vec, i * lay["per_idp"] + doff, 1, pl_, h, w, ws=ws, cs=lay["plane"] - dspan)
-            ssram = _blob(i, sram_off, 1, pl_, h, w, ns=0 if ns0 or pl_ == 1 else IDP_STRIDE - pl_ * h * w)
+            ssram = _blob(i, sram_off, 1, pl_, h, w, ns=0 if pl_ == 1 or sram_off == 0 else IDP_STRIDE - pl_ * h * w)
             dmas.append((g, 0, sdram, ssram) if load else (g, 1, ssram, sdram))
 
 
@@ -1868,6 +2078,8 @@ def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
     v_out = vec(MV_OT, ofm_size(Co, Ho, Wo), (Wo, Ho, Co))
     v_ims = []
     for st in plan_strata:
+        if st["kind"] == "single":      # its spilled tensors first (frame.md 6.12)
+            st["spill_vec"] = _spill_vectors(layers, shapes, st["layers"], wsize, nsub, policy["best"], fix_npuc, vec)
         c_, h_, w_ = shapes[st["layers"][-1]]["out"]
         Lt = layers[st["layers"][-1]]["out_chw"]
         im = _im_vector(c_, h_, w_, Lt[0] * Lt[1] * Lt[2])
@@ -1886,7 +2098,7 @@ def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
         lis = st["layers"]
         if st["kind"] == "single":
             st["chunks"], st["peak"], _ = _single_block(layers, shapes, lis, wsize, src_vec, v_ims[si], v_w, group,
-                                                        dmas, fix_npuc, nsub, policy["best"])
+                                                        dmas, fix_npuc, nsub, policy["best"], st["spill_vec"])
             ng = len(lis) + sum(1 for c in st["chunks"] if c.get("copy"))
             st["groups"] = list(range(group, group + ng))
             group += ng
@@ -1945,10 +2157,94 @@ def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
         if st["kind"] == "single":
             _mark_copies(groups, [c for c in st["chunks"] if c.get("copy")], st["groups"][0], st["layers"])
     allch = [c for st in plan_strata for c in st["chunks"]]
-    return {"layers": [L["kind"] for L in layers], "chunks": allch,
-            "peak": max(c["off"] + c["size"] for c in allch),
-            "av": av, "mv": mv, "io": io, "groups": groups, "v_out": v_out, "v_w": [v_w[li] for li in convs],
-            "shapes": shapes, "strata": plan_strata, "unflatten": outs[0], "outputs": outs, "tiled": True}
+    out = {"layers": [L["kind"] for L in layers], "chunks": allch,
+           "peak": max(c["off"] + c["size"] for c in allch),
+           "av": av, "mv": mv, "io": io, "groups": groups, "v_out": v_out, "v_w": [v_w[li] for li in convs],
+           "shapes": shapes, "strata": plan_strata, "unflatten": outs[0], "outputs": outs, "tiled": True}
+    cut = [li for st in plan_strata if st["kind"] == "single" for li in st["layers"]
+           if _cmdq_estimate(layers[li], shapes[li]) > CMDQ_LIMIT]
+    if cut and not _IN_STREAM:
+        _tiled_cut(low, out, dmas, cut, v_ims, nu)
+    return out
+
+
+def _tiled_cut(low, p, dmas, cut, v_ims, nu):
+    """a tiled plan whose single blocks hold layers NPUC cuts for their CMDQ size (6.9; V: mobilenet-v1-100-224, its
+    1024-channel layers and classifier in 3 groups each): the groups, the DMA order, events and batches are the
+    stream part's (its plan of the same network, frame's chunks); our descriptors follow its DMAs one for one, but
+    for the stores of a cut layer, one per chunk of its passes' planes (_range_store, as in an untiled plan's cut)"""
+    global _IN_STREAM
+    layers = low["layers"]
+    shapes = p["shapes"]
+    _IN_STREAM = True
+    try:
+        dl = stream.plan_dmas(low)
+        P = stream.Plan(low)
+    finally:
+        _IN_STREAM = False
+    # each stream group's layer, and our group's
+    starts = sorted((g, li) for li, g in P.chain_groups.items())
+    sgl = {}
+    for (g, li), nxt in zip(starts, starts[1:] + [(len(P.groups), None)]):
+        for x in range(g, nxt[0]):
+            sgl[x] = li
+    fgl = {}
+    for st in p["strata"]:
+        g = st["groups"][0]
+        if st["kind"] == "tiled":
+            for x in st["groups"]:
+                fgl[x] = st["layers"][0]
+            continue
+        cps = {c["layer"] for c in st["chunks"] if c.get("copy")}
+        for li in st["layers"]:
+            g += li in cps
+            fgl[g] = li
+            g += 1
+    rows, k, j = [], 0, 0
+    stores = [x for x in dl if x["kind"] == "store"]
+    while j < len(dl):
+        x = dl[j]
+        li = sgl.get(x["sgid"])
+        if x["kind"] == "store" and li in cut:
+            # the cut layer's stores: our DMAs of its whole output skipped, one store per chunk of its passes
+            while k < len(dmas) and dmas[k][1] == 1 and fgl.get(dmas[k][0]) == li:
+                k += 1
+            g = x["sgid"]
+            run = [y for y in dl[j:] if y["kind"] == "store" and y["sgid"] == g]
+            Co, _, _ = layers[li]["out_chw"]
+            _, Hi, Wi = shapes[li]["out"]
+            ol = cell(Co, Hi, Wi)
+            oc = next(c for c in p["chunks"] if c.get("layer") == li and c["kind"] in ("CONV", "POOL"))
+            st = next(st for st in p["strata"] if li in st["layers"])
+            if st["layers"][-1] != li:
+                raise NotImplementedError("a cut layer storing its output inside a single block")
+            i = stores.index(x)
+            nxt = next((y for y in stores[i + 1:] if y["sgid"] != g), None)
+            step = 2 * ol["plane"]
+            p0 = (x["sram"] - oc["off"]) // step
+            p1 = (nxt["sram"] - oc["off"]) // step if nxt and sgl.get(nxt["sgid"]) == li else cdiv(layers[li]["cout"], 16)
+            got = _range_store([], g, ol, oc["off"], v_ims[p["strata"].index(st)], p0, p1)
+            if len(got) < len(run):
+                raise NotImplementedError("a cut layer's store in %d DMAs, %d in the stream" % (len(got), len(run)))
+            rows += got[:len(run)]
+            j += len(run)
+            continue
+        if k >= len(dmas) or (dmas[k][1] == 1) != (x["kind"] == "store"):
+            raise NotImplementedError("the stream's DMAs do not follow ours (a cut in a tiled plan)")
+        rows.append((x["sgid"],) + tuple(dmas[k][1:]))
+        k += 1
+        j += 1
+    if k != len(dmas):
+        raise NotImplementedError("the stream's DMAs do not follow ours (a cut in a tiled plan): %d of %d" % (k, len(dmas)))
+    G = len(P.groups)
+    p["io"] = [[n_ + 1, x["bid"] or 0, g, 0, x["flag"], 2, 0, 1, 0] + sb + db
+               for n_, (x, (g, d_, sb, db)) in enumerate(zip(dl, rows))]
+    for u, o in zip(range(G - nu, G), p["outputs"]):
+        o["group"] = u
+    p["groups"] = [{"index": g, "kind": "output" if g >= G - nu else ("dma" if any(r[2] == g for r in p["io"])
+                                                                       else "plain")} for g in range(G)]
+    p["keep_bids"] = True
+    p["cut"] = True
 
 
 def _sub_batches(low):

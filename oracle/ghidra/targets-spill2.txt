@@ -1,0 +1,9 @@
+# Trim and spill, second pass: the low-level allocator under GlobalMemoryAllocator (first fit on a bitmap, the
+# available address range a TRIM chunk may use), the chunk kinds, the backend's view of a spilled edge
+sym:BitmapAllocator
+sym:LowLevelAllocator
+sym:MemoryChunk8kind2str
+sym:MemoryChunkC1
+sym:MemoryRegions
+str:FMAP_SPILL_DRAM
+str:Change FMAP_SPILL_DRAM

@@ -243,8 +243,8 @@ When 'bigger first', 'backward' and every permutation fail for a layer of a sing
 strategies, rely on trim and spill!"), NPUC "reloads the IFM into the start of the available address space": the
 layer's input (the previous layer's output chunk, "active IFM") is copied by a **TRIM** node into a new chunk of the
 same size at the start of the SRAM (0: 18 compiles), or at its end (0x40000 - size) when a copy at 0 would overlap the
-input itself (final-chains f014: input at 23040, 27648 B, copy at 234496, "Demanded address"; G for the exact
-test), live at the layer's first atom only (its order: the TRIM
+input itself (final-chains f014: input at 23040, 27648 B, copy at 234496, "Demanded address"; the exact test, read
+from NPUC's code, is 6.12's tryTrimIFMChunk), live at the layer's first atom only (its order: the TRIM
 takes no order of its own); the input's live range is cut to end before it; then the layer's chunks are placed again
 bigger first, equal sizes in creation order (PAD before CONV: ws-191-256x2, r3-096). If even that fails NPUC aborts
 (r3-103: GlobalMemoryAllocator.cpp:839). The copy is its own NCP group, right before the layer's group: no DMA, no
@@ -337,7 +337,12 @@ with 64 loads or more has them in one batch while its triggers come in sub-batch
 `frame.plan` calls the stream part, which calls `frame.plan` back for tiled plans: a module flag stops the recursion.
 A plan may hold a trim-and-spill copy (6.7) too: its group, with no DMA, keeps its place before its layer (V:
 mobilenet-v1-050-224, a copy before its 13th depthwise layer and the 512 -> 1000 classifier cut in three; a copy after
-a cut layer is refused).
+a cut layer is refused). **In a tiled plan's single blocks** (`_tiled_cut`; V: mobilenet-v1-100-224, conv13, dw13,
+conv14 and the 1024 -> 1000 classifier in 3 groups each after its conv2 + dw2 stratum, with 2 copies and a spill in the
+same block): the stream part's plan gives the groups (a chunk of pads only is a group without DMA), the DMA order,
+events and batch ids; frame's descriptors follow its DMAs one for one, but a cut layer that ends its block stores per
+chunk (`_range_store`), never pass by pass (its ring of 32 of 63 passes and Cout 1000 would otherwise store pass by
+pass).
 
 ### 6.10 NPUC's tiling policy, read from its code (`npuc_policy`; V: decompiled, `oracle/ghidra/targets-tiling.txt`)
 
@@ -455,7 +460,10 @@ stratum ("WCONCAT", the vConcat node's chunk; V: squeezenet11-224-npu, t1031); w
 more and a PAD or POOL first (not a TRIM: t1000, t1008) comes in 4 parts of ceil(pp / 4) planes, part by part over the
 IDPs, each part right before the NFU ops of its slots (section 5's DMACluster, as an untiled input's chunked load); a
 part's descriptor: DRAM offset + s0 x plane, c = its planes, SRAM offset + s0 x h x w, n_stride 0x40000 - planes x h x w,
-0 for the part landing at SRAM offset 0 (t1016; G: the rule behind the "direct" loads of 6.5).
+0 for the part landing at SRAM offset 0 (t1016). **The SRAM n_stride rule** (V: every tiled set, regress unchanged;
+t1036, whose spill moves a one-layer stratum's SPLIT chunk off 0 and its CONV output onto it): a per-IDP tile DMA of
+several planes has SRAM n_stride 0 exactly when its SRAM offset is 0, else 0x40000 - planes x h x w; this is the rule
+behind the "direct" loads of 6.5 (a one-layer k1 stratum's SPLIT chunk sits at 0) and the read-back's (`_tile_dma`).
 
 **Layer-block forwarding** (LayerBlockFMSharingCalculator, after the policy; read from the decompile): input sharing,
 concat in SRAM and full forwarding each hold memory for a whole fork-join block (the head's output, or the concat's
@@ -464,13 +472,101 @@ left with less than one byte "is too fat" (V: cat96-64, its 128-channel concat a
 `common.concat_in_sram`), a tiled node skips the test and the block fails (V: cat128-128, cat160-64: neither input
 sharing nor concat in SRAM). So a concat with a tiled producer or reader is in DRAM (stream, `weights._concat_tiled`).
 A node that would only fit with a weight ring under the reduced bound is refused (not modelled).
+**Their side effect on weight lifetimes** (`frame.forwarding`; V: decompiled tryProcessInternalNode,
+getBestProcessingParams, estimateFullMemoryRequirements; large random t1004, t1013): getBestProcessingParams sets or
+clears the node's "weights_have_extended_lifetime" tag on every call, so the forwarding tests change the lifetime the
+policy chose. Per mode (input sharing, then concat in SRAM, then full forwarding), over the nodes in order: a block is
+a fork whose readers all lead through one-input one-reader layers to one concat (the "ahead_block_start" bulbs);
+its head sets the mode's initial memory (the head's output; the concat's; both); an untiled node whose predecessor
+passed (or is the head) is tested with 256 KiB - that - its predecessor's output when the predecessor is not the head
+and has several readers (moreMemoryRequired), its IFM not counted when the predecessor is the head (input sharing,
+full forwarding: checkPredAndSuccPreallocation), its OFM not counted when a concat reads it (concat in SRAM, full
+forwarding); under one byte: "too fat", no call. The last call's lifetime stands (_pol_whole: extended only when all
+weights fit so, or a ring of 5+ buffers does): t1004's three branch convs of 112 x 112 keep their weights on their
+conv only (WEIGHT live [conv, conv]), which the trim and spill of 6.12 then depends on.
 
-**Not yet**: NPUC's trim and spill inside a graph ("Allocating splitted chunk": a long-lived tensor, a residual, split
-around a layer that cannot be allocated; resnet18-96, resnet18-224, mobilenet-v2-100-224), the policy's weight rings
-in graph layers (resnet18's 512-channel convs), a CMDQ cut in a tiled plan's single block (mobilenet-v1-100-224), a
-tiled read-back in a graph, strata joined to each other, a tiled layer whose input heads a concat's branches; the io
-batch id of a clustered load's last part (t1016: NPUC keeps all 16 loads in one batch). Rate on the unseen large random
-graphs: 31 of 40 (22 before the clustered loads, the shared WCONCAT and the chain rule).
+**Also modelled** (V: large random t1016, t1018, t1038, t1039):
+- a layer-block's forwarding decided by `frame.forwarding` (the tests above with their prealloc flags; t1038's
+  96-channel branch conv fits once the shared input or the concat is not counted: concat in SRAM), so the old refusal
+  "may refuse on memory" is gone; a block whose node would pass only with a weight ring is still refused;
+- a concat whose branches start at a single-node layer but one of whose branch layers is tiled: no input sharing (the
+  tiled node is not tested, the block fails), the root an ordinary tensor kept in SRAM for its untiled readers and
+  stored for the tiled ones (t1018);
+- a tiled read-back in a graph: the chain's row tiles of 6.5, one output group each (t1039: 160 x 160);
+- the io batch ids of a graph: the stream part's (NPUC's SetBatchTransferInGroup, cmdq.md 7b), not re-derived from the
+  ev2set masks (t1016: a clustered load's 16 parts in one batch, which the masks cannot tell).
+
+**Not yet**: strata joined to each other, a tiled stratum's output heading a concat's branches, a concat the forwarding
+keeps out of SRAM (fresh t2022: its reader's chunk a second citizen, the next block's pool output a first citizen),
+fresh t2006 (a spill our model aborts on, NPUC not; its weight blocks differ too). Rate on the first large random set:
+40 of 40 (31 before the trim and spill of 6.12, the forwarding model and the items above; 22 before the clustered
+loads, the shared WCONCAT and the chain rule). **A fresh unseen set** (`stream_graphs.py random
+$NCPGEN_WORK/sweep/graph-large2 2000 40 --set large`, compiled after the work above): 35 of 39 at first sight (NPUC
+crashes on t2031, GlobalMemoryAllocator.cpp:860); t2016 and t2029 then fixed by NPUC's backward order in the stream
+allocator (the start of the live range, latest first, as frame._first_fit has it, not the plain reverse of bigger
+first): 37 of 39.
+
+### 6.12 Trim and spill (`stream.allocate(ts=...)`, `_trim_spill`; V: decompiled GlobalMemoryAllocator, `oracle/ghidra/targets-spill*.txt`; mobilenet-v2-100-224, resnet18-96, resnet18-224, large random t1004, t1013, t1021, t1033, t1036)
+
+NPUC's fallback when no order fits a node's chunks ("Failed all allocation strategies, rely on trim and spill!",
+allocateOriginalNodeImpl with its trim-and-spill flag). Its allocator (LowLevelAllocator's BitmapAllocator) keeps one
+bitmap of 64-byte granules per node position: `alloc` is first fit from 0, `allocAt(a)` first fit from a,
+`getMinAvailableAddress(s, e)` the first granule free over positions s..e, `getMaxAvailableAddress` the end of the
+last free one. The allocator also keeps, per position, the chunks registered there (in allocation order).
+
+1. **The order.** NPUC sorts the node's chunk vector in place: bigger first is an insertion sort that puts equal sizes in
+   the reverse of their order in the vector (a fresh node: the chunk created last first, the known tie rule), then
+   backward (start of the live range, latest first), then for trim and spill bigger first again on that: equal sizes
+   by the start of their live range (V: resnet18-96, PAD before CONV after the trim). The chunks go in that order up
+   to the first that does not fit, F.
+2. **Active IFMs** (populateActiveIFMs): the chunks registered at the positions the placed chunks and F span (min start
+   .. max end) that belong to another node and overlap [min available, max available) over F's live range, or that
+   a spill made. resnet18-96: the residual at 0..0x1000 lies below the free range 0x1000..0x40000 and is not active.
+3. **One active IFM: trim** (tryTrimIFMChunk). Only when the IFM lives over fewer than 4 positions and no concat reads
+   it. A TRIM chunk of its size, live from its start + 1 to its end, at the min available address (16-aligned) when
+   a copy there would not overlap the IFM, else at max available - size (16-aligned down); when that overlaps too:
+   "Cannot trim IFM chunk, try different allocation strategy!", one more pass of the node's chunks without trim and
+   spill, whose result NPUC keeps (t1021: it fails, NPUC spills). The IFM then ends at its start, the copy is placed
+   with allocAt; if it does not land at its address ("Cannot trim!") or the node's chunks fail in one pass (in the
+   order of 1), all is undone ("Unable to trim, rely on spill!", mobilenet-v1-100-224). Success: the copy group of 6.7
+   (in a graph too: resnet18-96, a copy at 0x1000 before a 512-channel conv).
+4. **Else: spill** (spillAt) at the first position the placed chunks span: every chunk registered there and live there
+   that is not a first citizen ends at its start ("Shortening chunk live range"; its offset kept), and each reader of
+   its tensor (not a concat; in the def node's successor order = the layer list's) at a position other than that
+   start gets a new chunk of the same size live at the reader's first node only. A stratum's SPLIT chunk live there
+   only is freed and joins the node's chunks (t1036). Then the node's chunks with every order again, bigger first
+   being the sort of 1 applied once more (equal sizes reversed again: resnet18-224, REFORMAT before PAD); none fits:
+   NPUC aborts ("Defragmentation and spilling failed"). Then the readers' chunks, each first fit, in the spill's order
+   ("Allocating splitted chunk at p ~ p"). The position lists keep the old chunk where no reader replaced it.
+5. **What a spill means for the network.** The PGraph gets a Spill node on each such edge: the producer stores the
+   tensor to DRAM ("create output DRAM", its own IM vector in the order of first stores), each reader past the spill
+   loads it into its new chunk ("input DRAM is output of node"), as any intermediate loaded from DRAM (cmdq.md 7c),
+   its slots all written (`full`); an eltwise reading a spilled tensor loads its other operand back from DRAM too, the
+   spilled one first (mobilenet-v2-100-224: the residual of the 56 x 56 x 24 block and its 144-channel expansion are
+   spilled around the depthwise layer; NPUC also reloads the residual for the expansion conv run right after its
+   producer). A tiled stratum reading a spilled tensor reads it from DRAM anyway; its SPLIT node still gets a chunk
+   (t1036).
+
+Seen: mobilenet-v2-100-224 (one spill of 2 chunks, 3 reloads), resnet18-96 (a trim, then a spill), resnet18-224
+(spill of 2 chunks), t1004/t1013 (a branch root read by three branch convs, after the forwarding lifetimes of 6.11),
+t1021 (a trim with no room, then a spill), t1033, t1036 (an eltwise output and a SPLIT), t1038 (a trim whose copy every
+reader reads: its group right after the producer's). Not modelled (refused): a spill of a chunk with no tensor (a
+per-reader chunk alone), a trim whose IFM feeds the node's input in another way.
+
+**In a chain's single blocks** (`frame._chain_trim_spill`, the same code; V: mobilenet-v1-100-224 and every copy of
+6.7 unchanged: ws-191-256x2, r3-076/077/096/111, the spill sweep, tiling2 b03/b05, final-chains f014,
+mobilenet-v1-050-224): the copy of 6.7 is NPUC's trim (its placement and tie rules are the exact ones above, which
+the 6.7 rules approximated: "0 or the top" is the min / max available address, "ties in creation order" the
+re-sort); a spill splits the block's DMAs: the producer's group stores its output to an IM vector of its own (in the
+order of the stores: before the block's output IM), the reader's group loads it into its spilled chunk as a block
+loads its input (the clustered loads of 6.5 with n x pp >= 64 and a PAD or POOL first: mobilenet-v1-100-224's dw3,
+56 x 56 x 128, in 4 parts of 4 planes at 0x1e000). The stream part takes frame's single-block plans (chunks, rings,
+copies, spills) for tiled plans too (`Plan.take_frame_chunks`), not only for an untiled network.
+
+**A conv's weight lifetime in a chain** (V: mobilenet-v1-100-224's dw4, all its weights live on its conv only, which
+its allocation needs): the policy's lifetime (6.10, `_pol_whole`) stands for all weights too, not only for a ring:
+WEIGHT from the layer's first op when extended, on its CONV only when not (regress unchanged: no other compile has a
+short lifetime with all weights).
 
 ## 7. The intrinsics (V: disassembled from every variant; our own A32 encoder writes them)
 

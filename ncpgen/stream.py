@@ -35,8 +35,8 @@ if not __package__:     # run as a script: the package is this file's directory
 
 from ncpgen import frame, grelu, weights  # noqa: E402
 from ncpgen.common import (CMDQ, INTC, MTC, NFU, Memo, cdiv, concat_in_sram, decode_isa, encode_isa,  # noqa: E402
-                           exec_order, is_graph, multiplier, ncp_parts, net_outputs, network_key, requant, scale_value,
-                           set_reg_addr, set_reg_op, GRAPH_KINDS)
+                           exec_order, is_graph, ncp_parts, net_outputs, network_key, set_reg_addr,
+                           set_reg_op, GRAPH_KINDS)
 
 
 class Unsupported(Exception):
@@ -105,11 +105,6 @@ def cells(h, w):
 
 
 # ---- the GReLU hook ----------------------------------------------------------------------------------------------
-def layer_shift(layer):
-    """the requantisation shift of a conv (NPUC's ScaleONFiller::setScale, common.requant)"""
-    return requant(multiplier(*(scale_value(layer[k]) for k in ("in_scale", "w_scale", "out_scale"))))[2]
-
-
 def grelu_writes(layer, quant_mode, p, fixed=False, cache=None):
     """the activation table's writes for pass p of a conv, CMDQ 0x401e0050 = 1 ... = 0 included: grelu.grelu_regs
     (every pass's block), split here at the 0x401e0050 brackets. cache: a dict kept while one plan is emitted (the
@@ -291,52 +286,258 @@ def _next_permutation(a):
     return True
 
 
-def allocate(chunks, limit=None):
+def _fit_batch(batch, placed, limit, first=None):
+    """one allocation group: "bigger first" (size descending, equal sizes the later chunk first; partial sums last;
+    or the given first order), then "backward" (its reverse, partial sums still last), then every next permutation of
+    the backward order; the first order in which no chunk ends past the limit, placed (None when none fits)"""
+    if first is None:
+        main = sorted((c for c in batch if not c.tail), key=lambda c: (-c.size, -c.cid))
+        first = main + [c for c in batch if c.tail]
+    main = [c for c in first if not c.tail]
+    tail = [c for c in first if c.tail]
+    # backward: the start of the live range, latest first, equal starts smaller first (frame._first_fit's; V: large
+    # random t2016, t2029: a stratum's CONV, PAD, TRIM stay in that order, the plain reverse fitted another way)
+    back = sorted(reversed(main), key=lambda c: -c.live[0]) + tail
+    idx = list(range(len(back)))
+    tries = [first, back]
+    n = 0
+    while True:
+        order = tries.pop(0) if tries else None
+        if order is None:
+            if not _next_permutation(idx):
+                return None
+            order = [back[i] for i in idx]
+        mine = []
+        for c in order:
+            if getattr(c, "fixed", False):  # placed by the caller (the graph's first citizens)
+                pass
+            elif getattr(c, "top", False):  # a concat in SRAM: at the top (V: cat16, cat-32-16)
+                c.off = (limit - c.size) // 64 * 64
+            else:
+                _place(c, placed + mine)
+            mine.append(c)
+        if all(c.off + c.size <= limit for c in mine):
+            return mine
+        n += 1
+        if n > 5040:
+            return None
+
+
+def allocate(chunks, limit=None, ts=None):
     """NPUC's PolicyMaker allocation (V: its "Request ... Allocated" log lines over the sweeps): batch by batch (the
     first citizens, the input, then each layer's chunks), each chunk at the lowest 64-aligned offset clear of every
     placed chunk whose live range (inclusive, in node order) overlaps. Within a batch it tries "bigger first" (size
     descending, equal sizes the later chunk first; partial sums last), then "backward" (the reverse, partial sums
     still last), then every next permutation of the backward order, and keeps the first order in which no chunk
-    ends past the limit (V: r_c256co128, six orders tried)"""
+    ends past the limit (V: r_c256co128, six orders tried). ts (a graph's): when no order fits a layer's chunks,
+    NPUC's trim and spill (_trim_spill; ts collects what it did: "trims", "spills")"""
     limit = SRAM_LIMIT if limit is None else limit
     placed = []
-    for bt in sorted(set(c.batch for c in chunks)):
+    pos = {}                                    # NPUC's chunks per node position, in registration order
+    for bt in sorted(set(c.batch for c in chunks if c.batch is not None)):
         batch = [c for c in chunks if c.batch == bt]
-        main = sorted((c for c in batch if not c.tail), key=lambda c: (-c.size, -c.cid))
-        tail = [c for c in batch if c.tail]
-        first = main + tail
-        back = list(reversed(main)) + tail
-        idx = list(range(len(back)))
-        tries = [first, back]
-        ok = False
-        n = 0
-        while True:
-            order = tries.pop(0) if tries else None
-            if order is None:
-                if not _next_permutation(idx):
-                    break
-                order = [back[i] for i in idx]
+        mine = _fit_batch(batch, placed, limit)
+        if mine is None and ts is not None and bt[0] == 2:
+            mine = _trim_spill(batch, placed, pos, limit, ts)
+        elif mine is not None and ts is not None:
+            _register(pos, mine)
+        if mine is None:                        # nothing fits: bigger first, the caller sees the overflow
+            main = sorted((c for c in batch if not c.tail), key=lambda c: (-c.size, -c.cid))
             mine = []
-            for c in order:
-                if getattr(c, "fixed", False):  # placed by the caller (the graph's first citizens)
-                    pass
-                elif getattr(c, "top", False):  # a concat in SRAM: at the top (V: cat16, cat-32-16)
-                    c.off = (limit - c.size) // 64 * 64
-                else:
-                    _place(c, placed + mine)
-                mine.append(c)
-            if all(c.off + c.size <= limit for c in mine):
-                ok = True
-                break
-            n += 1
-            if n > 5040:
-                break
-        if not ok:                              # nothing fits: bigger first, the caller sees the overflow
-            mine = []
-            for c in first:
+            for c in main + [c for c in batch if c.tail]:
                 _place(c, placed + mine)
                 mine.append(c)
         placed += mine
+
+
+# ---- NPUC's trim and spill (GlobalMemoryAllocator::allocateOriginalNodeImpl, tryTrimIFMChunk, spillAt; its
+# BitmapAllocator: one bitmap of 64-byte granules per node position; V: decompiled, oracle/ghidra/targets-spill*.txt,
+# and the logs of mobilenet-v2-100-224, resnet18-96/224, mobilenet-v1-100-224, graph-large t1004..t1036) ------------
+GRANULE = 64
+
+
+def _busy_bits(placed, s, e):
+    bits = bytearray(SRAM_LIMIT // GRANULE)
+    for m in placed:
+        if m.size and m.off is not None and m.live[0] <= e and s <= m.live[1]:
+            a, b = m.off // GRANULE, min(len(bits), cdiv(m.off + m.size, GRANULE))
+            if b > a:
+                bits[a:b] = b"\x01" * (b - a)
+    return bits
+
+
+def _min_free(placed, live):
+    """getMinAvailableAddress: the first granule no chunk live over the range holds (-1: none)"""
+    i = _busy_bits(placed, *live).find(0)
+    return -1 if i < 0 else i * GRANULE
+
+
+def _max_free(placed, live):
+    """getMaxAvailableAddress: the end of the last free granule (0: none)"""
+    i = _busy_bits(placed, *live).rfind(0)
+    return 0 if i < 0 else (i + 1) * GRANULE
+
+
+def _alloc_at(placed, addr, size, live):
+    """allocAt: the first granule from addr up where size bytes are free over the live range (-1: none)"""
+    bits = _busy_bits(placed, *live)
+    n = cdiv(size, GRANULE)
+    a = addr // GRANULE
+    while a + n <= len(bits):
+        j = bits.find(1, a, a + n)
+        if j < 0:
+            return a * GRANULE
+        a = j + 1
+    return -1
+
+
+def _register(pos, mine):
+    for c in mine:
+        for p in range(c.live[0], c.live[1] + 1):
+            pos.setdefault(p, []).append(c)
+
+
+def _bigger_first(vec):
+    """NPUC's bigger-first sort of a chunk vector: size descending, equal sizes in the reverse of their order in vec
+    (the order of a fresh node: the chunk created last first); partial sums last"""
+    main = [c for c in vec if not c.tail]
+    out = []
+    for size in sorted(set(c.size for c in main), reverse=True):
+        out += [c for c in main if c.size == size][::-1]
+    return out + [c for c in vec if c.tail]
+
+
+def _one_pass(order, placed):
+    """allocateOriginalNodeImpl without trim and spill: the chunks in this order, each first fit; None when one does
+    not fit"""
+    mine = []
+    for c in order:
+        o = _alloc_at(placed + mine, 0, c.size, c.live)
+        if o < 0:
+            return None
+        c.off = o
+        mine.append(c)
+    return mine
+
+
+def _trim_spill(batch, placed, pos, limit, ts):
+    """NPUC's fallback when no order fits a node's chunks ("Failed all allocation strategies, rely on trim and
+    spill!"; V: decompiled allocateOriginalNodeImpl, its log in every case listed above). The chunks bigger first
+    once more, equal sizes now by the start of their live range (the sort runs on the backward order) up to the first
+    that does not fit (F); the "active IFMs": the chunks of other nodes registered at the positions those chunks
+    span that lie in the free address range around F's live range (min .. max available address), or that a spill
+    made. One active IFM: tryTrimIFMChunk (_trim, the chain's copy, frame.md 6.7). Else, or when the trim fails:
+    spillAt the first position (_spill): every chunk live there that is not a first citizen ends at its start, and
+    each of its readers past it gets a chunk of its own, live at it only, loaded from DRAM (the producer stores the
+    tensor); then the node's chunks with every order again (NPUC aborts when none fits), then the readers' chunks,
+    each first fit, in the order the spill made them."""
+    if any(getattr(c, "fixed", False) or getattr(c, "top", False) for c in batch):
+        raise Unsupported("trim and spill of a batch with placed chunks (not modelled)")
+    # NPUC sorts the node's chunk vector in place: bigger first (an insertion sort that puts equal sizes in the
+    # reverse of their order), then backward (the start of the live range, latest first), and now bigger first again
+    # on that (V: resnet18-96, PAD before CONV after the trim; resnet18-224, REFORMAT before PAD after the spill)
+    back = sorted((c for c in batch if not c.tail), key=lambda c: (-c.live[0], c.size, -c.cid))
+    order = _bigger_first(back + [c for c in batch if c.tail])
+    done, F = [], None
+    for c in order:
+        o = _alloc_at(placed + done, 0, c.size, c.live)
+        if o < 0:
+            F = c
+            break
+        c.off = o
+        done.append(c)
+    if F is None:
+        raise Unsupported("trim and spill: every chunk fits")
+    s0 = min(c.live[0] for c in done + [F])
+    e0 = max(c.live[1] for c in done + [F])
+    lo, hi = _min_free(placed, F.live), _max_free(placed, F.live)
+    layer = getattr(F, "layer", None)
+    act = []
+    for p in range(s0, e0 + 1):
+        for c in pos.get(p, []):
+            if c in act:
+                continue
+            if (getattr(c, "layer", None) != layer and c.off < hi and lo < c.off + c.size) or getattr(c, "spill", False):
+                act.append(c)
+    if len(act) == 1:
+        mine = _trim(act[0], order, placed, pos, ts)
+        if mine is not None:
+            return mine
+    return _spill(s0, batch, order, placed, pos, limit, ts)
+
+
+def _trim(X, order, placed, pos, ts):
+    """tryTrimIFMChunk (V: decompiled; ws-191-256x2, f014, resnet18-96, mobilenet-v1-100-224): an active IFM that
+    lives over fewer than 4 positions and feeds no concat is copied into a new TRIM chunk, live from the position
+    after its start to its end, at the start of the free address range when the copy would not overlap it there,
+    else at the end (16-aligned); the IFM then ends at its start; the node's chunks in one pass. When the copy does
+    not land at its address or the node does not fit, all is undone (None: NPUC spills)."""
+    if X.live[1] - X.live[0] >= 4 or getattr(X, "concat_reader", False) or getattr(X, "tensor", None) is None:
+        return None
+    T = Chunk(None, "TRIM", X.size, [X.live[0] + 1, X.live[1]], None)
+    lo, hi = _min_free(placed, T.live), _max_free(placed, T.live)
+    x0, x1 = X.off, X.off + X.size - 1
+    if not (x0 <= lo <= x1 or lo <= x0 <= lo + X.size - 1):
+        dem = cdiv(lo, 16) * 16
+    else:
+        dem = hi - X.size
+        if dem <= x0 <= hi or x0 <= dem <= x1:
+            # "Cannot trim IFM chunk, try different allocation strategy!": one more pass without trim and spill, its
+            # result NPUC's (V: t1021, which then spills)
+            mine = _one_pass(order, placed)
+            if mine is not None:
+                _register(pos, mine)
+            return mine
+        dem &= ~15
+    live0 = list(X.live)
+    X.live = [X.live[0], X.live[0]]
+    if _alloc_at(placed, dem, T.size, T.live) == dem:
+        T.off = dem
+        mine = _one_pass(order, placed + [T])
+        if mine is not None:
+            for p in range(T.live[0], T.live[1] + 1):
+                pos[p] = [T if c is X else c for c in pos.get(p, [])]
+            _register(pos, mine)
+            T.layer = getattr(order[0], "layer", None)
+            ts.setdefault("trims", []).append((X, T))
+            return mine + [T]
+    X.live = live0                          # "Unable to trim, rely on spill!"
+    return None
+
+
+def _spill(at, batch, order, placed, pos, limit, ts):
+    """spillAt (V: decompiled; mobilenet-v2-100-224's residual and expanded input, resnet18-*, t1004..t1036)"""
+    out = []
+    for c in list(pos.get(at, [])):
+        if getattr(c, "fixed", False) or not c.live[0] <= at <= c.live[1]:
+            continue
+        if c.live[0] == c.live[1] and c.name == "SPLIT":
+            placed.remove(c)                # a stratum's SPLIT chunk joins the node's chunks (V: t1036)
+            order = order + [c]
+            continue
+        if c.live[0] == c.live[1]:
+            continue
+        if getattr(c, "readers", None) is None:
+            raise Unsupported("a spill of %s (not modelled)" % c.name)
+        c.live = [c.live[0], c.live[0]]
+        for r, p in c.readers:
+            if p == c.live[0]:
+                continue
+            n = Chunk(None, c.name, c.size, [p, p], None)
+            n.spill, n.tensor, n.layer, n.reader = True, c.tensor, c.layer, r
+            pos[p] = [n if x is c else x for x in pos.get(p, [])]
+            out.append(n)
+            ts.setdefault("spills", []).append((c.tensor, r, n))
+    mine = _fit_batch(order, placed, limit, first=_bigger_first(order))
+    if mine is None:
+        raise Unsupported("NPUC aborts: \"Defragmentation and spilling failed, nothing to do!\"")
+    _register(pos, mine)
+    for n in out:
+        n.off = _alloc_at(placed + mine, 0, n.size, n.live)
+        if n.off < 0:
+            raise Unsupported("NPUC aborts: \"Cannot reallocate spilled chunks, bailing out!\"")
+        mine.append(n)
+    return mine
 
 
 def graph_stratum(layers, shapes, st):
@@ -413,11 +614,15 @@ class Plan:
         # untiled: one SRAM-forwarded run of every layer, loading from and storing to DRAM (a layer NPUC tiles raises
         # NeedsTiling: frame.plan tiles every network NPUC tiles)
         self.layout(layers, final=True, inp=tuple(low["input"]["chw"]))
+        self.chain_groups = {}
         for li, L in enumerate(layers):
             if "copy" in self.info[li]:
                 self.groups.append(self.copy_group(self.info[li]))
             ev0 = self.ev
-            self.groups += self.cut(self.layer_group(li, L, first=li == 0, last=li == len(layers) - 1), ev0)
+            self.chain_groups[li] = len(self.groups)
+            sp = li + 1 < len(layers) and self.info[li + 1].get("spill")    # a spill: store, reload (6.12)
+            self.groups += self.cut(self.layer_group(li, L, first=li == 0 or self.info[li].get("spill", False),
+                                                     last=li == len(layers) - 1 or sp), ev0)
         last = self.info[-1]
         nu = unflatten_tiles(last, last["ho"], last["wo"])
         dout = last["dout"]
@@ -450,18 +655,24 @@ class Plan:
         layers = self.low["layers"]
         shapes = fp["shapes"]
         last = None
+        self.chain_groups = {}
         for st in fp["strata"]:
             lis = st["layers"]
             if st["kind"] == "single":
                 run = [layers[li] for li in lis]
-                self.layout(run, final=False, inp=tuple(shapes[lis[0]]["in"]))
+                # frame's single block (its allocation: trim and spill, the policy's rings; frame.md 6.6-6.12)
+                self.layout(run, final=False, inp=tuple(shapes[lis[0]]["in"]), fst=st)
                 for k, L in enumerate(run):
                     if "copy" in self.info[k]:
                         self.groups.append(self.copy_group(self.info[k]))
                     ev0 = self.ev
-                    self.groups += self.cut(self.layer_group(k, L, first=k == 0, last=k == len(run) - 1), ev0)
+                    self.chain_groups[lis[k]] = len(self.groups)
+                    sp = k + 1 < len(run) and self.info[k + 1].get("spill")
+                    self.groups += self.cut(self.layer_group(k, L, first=k == 0 or self.info[k].get("spill", False),
+                                                             last=k == len(run) - 1 or sp), ev0)
                 last = self.info[-1]
                 continue
+            self.chain_groups[lis[0]] = len(self.groups)
             self.frame_stratum(st, shapes)
             co, ho, wo = shapes[lis[-1]]["out"]
             last = {"dout": Dist(co), "ho": ho, "wo": wo, "conv": layers[lis[-1]]["kind"] == "conv"}
@@ -659,8 +870,9 @@ class Plan:
         self.ev += 1
         return f
 
-    def layout(self, layers, final=True, inp=None):
-        """the node order, the chunks and their offsets of an SRAM-forwarded run of layers (input from DRAM)"""
+    def layout(self, layers, final=True, inp=None, fst=None):
+        """the node order, the chunks and their offsets of an SRAM-forwarded run of layers (input from DRAM); fst: frame
+        plan's single block for them (its chunks, rings, copies and spills stand)"""
         c0, h0, w0 = inp or self.low["input"]["chw"]
         whole = [c0, h0, w0] == list(self.low["input"]["chw"]) and len(layers) == len(self.low["layers"])
         chunks = []
@@ -739,9 +951,12 @@ class Plan:
                 if d["ring"] < d["passes"] and d["ring"] <= 4:
                     # a ring of 4 slots or fewer lives on its conv only (frame.md 6.7; V: f043, wl-512-h21)
                     d["weight"].live = [d["out"].live[0], d["out"].live[0]]
-        allocate(chunks)
+        if fst is not None:
+            self.take_frame_chunks(chunks, fst["chunks"], fst["layers"])
+        else:
+            allocate(chunks)
         self.chunks = chunks
-        if whole:
+        if whole and fst is None:
             self.frame_single(chunks)
         # NPUC tiles a layer (SPLIT/TRIM/CONCAT nodes, several tiles per group: not modelled) when the SRAM a core
         # needs passes 256 KiB or an output dimension passes 255 (V: t200 one tile at 245120 B, t208 tiled at
@@ -767,23 +982,37 @@ class Plan:
             return
         if fp.get("tiled") or "chunks" not in fp:
             return
-        fc = {(c["kind"], c.get("layer", -1)): c for c in fp["chunks"]}
-        for ck in chunks:
-            c = fc.get((ck.name, ck.batch - 1))
-            if c is None:
-                return                      # not the same block: keep ours
-        for ck in chunks:
-            c = fc[(ck.name, ck.batch - 1)]
+        self.take_frame_chunks(chunks, fp["chunks"], list(range(len(self.low["layers"]))), strict=False)
+
+    def take_frame_chunks(self, chunks, fchunks, lis, strict=True):
+        """frame.plan's chunks of a single block of layers lis (global indices; our info and batches are local):
+        offsets, sizes, rings and slot steps, its trim-and-spill copies (6.7) and spilled reloads (6.12: the reader
+        loads its input into its own chunk, the producer stores)"""
+        fc = {(c["kind"], c.get("layer", -1)): c for c in fchunks}
+        loc = {li: k for k, li in enumerate(lis)}
+        key = [(ck.name, lis[ck.batch - 1] if ck.batch else -1) for ck in chunks]
+        if any(k not in fc for k in key):
+            if strict:
+                raise Unsupported("frame's single block has other chunks than ours")
+            return                          # not the same block: keep ours
+        for ck, k in zip(chunks, key):
+            c = fc[k]
             ck.off, ck.size = c["off"], c["size"]
             if ck.name == "WEIGHT":
                 d = self.info[ck.batch - 1]
                 d["ring"] = c.get("ring") or d["ring"]
                 d["wstep"] = c.get("step")
-        for c in fp["chunks"]:
+        for c in fchunks:
+            if c.get("layer") not in loc:
+                continue
+            d = self.info[loc[c["layer"]]]
             if c["kind"] == "TRIM" and c.get("copy"):
-                d = self.info[c["layer"]]
                 d["copy"] = {"src": c["src"], "dst": c["off"], "size": c["size"]}
                 d["in"] = Chunk(None, "TRIM", c["size"], list(c["live"]), d["in"].batch)
+                d["in"].off = c["off"]
+            elif c.get("spill"):
+                d["spill"], d["full"] = True, True
+                d["in"] = Chunk(None, "INPUT", c["size"], list(c["live"]), d["in"].batch)
                 d["in"].off = c["off"]
 
     def copy_group(self, d):
@@ -938,7 +1167,7 @@ class Plan:
                 return []
             if split and slot % chunk == 0:
                 ops.append(Op("load", what="ifm", flag=self.event(), sram=d["in"].off + slot * cells(h, w) * 64,
-                              slots=(slot, slot + chunk)))
+                              slots=(slot, min(din.ppc, slot + chunk))))
                 cur[0] = [len(ops) - 1]
             return list(cur[0])
 
@@ -1158,6 +1387,10 @@ class Plan:
         except ValueError as e:
             raise Unsupported("weights.py: %s" % e)
         cats = [L["name"] for L in order if L["kind"] == "concat"]
+        # a concat in SRAM: NPUC's static conditions (common.concat_in_sram); its layer-block forwarding's test of the
+        # block must pass too (frame.forwarding, mode "cs"): a block that fails it (large random t2022: the concat in
+        # DRAM, its single reader's chunk a second citizen, the next block's pool output a first citizen) is refused
+        fwd = frame.forwarding(low, pol)
         scats = [kn for kn in cats if concat_in_sram(kn, outs, by, ins, cons)
                  and not any(x in tst for x in ins[kn] + cons.get(kn, []))]
         # tensors their readers load from DRAM: the network input, a concat's buffer, a tiled stratum's output read by
@@ -1231,26 +1464,28 @@ class Plan:
                     t = ins[t][0]
             return out_
 
-        def bulb_fits(kn, mem):
-            # NPUC's layer-block forwarding (LayerBlockFMSharingCalculator::tryProcessInternalNode): no node of the
-            # block tiled, and each kept whole with the SRAM the block holds (mem: the head's output for input
-            # sharing, the concat for concat in SRAM) left over (frame.node_whole)
+        def bulb_fits(kn, mode):
+            # NPUC's layer-block forwarding (frame.forwarding: LayerBlockFMSharingCalculator, mode "is" input
+            # sharing, "cs" concat in SRAM): no node of the block tiled, each kept whole with the SRAM the block holds
+            # left over (V: t1038, its 96-channel branch conv counted without the shared input or the concat)
             nodes = bulb_nodes(kn)
             if any(x in tst for x in nodes):
                 return False
-            for x in nodes:
-                if x in pol["nodes"] and not frame.node_whole(pol["nodes"][x], SRAM_LIMIT - mem):
-                    raise Unsupported("a layer-block NPUC's forwarding may refuse on memory (%s): not modelled" % x)
-            return True
+            heads = [h for h, k in fwd["heads"].items() if k == kn]
+            ok = bool(heads) and fwd["ok"][mode].get(heads[0], False)
+            if ok and any(fwd["nbuf"][mode].get(x) for x in nodes):
+                raise Unsupported("a layer-block whose node only fits with a weight ring: not modelled")
+            return ok
         for kn in scats:
-            bulb_fits(kn, frame._pol_blk(*pol["shapes"][kn]["out"]))
+            if not bulb_fits(kn, "cs"):
+                raise Unsupported("a concat in SRAM NPUC's forwarding refuses (%s): not modelled" % kn)
+
         def closed(kn, r):
             # every reader of the root r lies on one of concat kn's branches: NPUC finds the layer-block (a root read
             # elsewhere too, e.g. by a detection head, starts none: V outputs-random m028, no "Input sharing" block)
             on = {x for x in bulb_nodes(kn) if ins[x][0] == r} | ({kn} if r in ins[kn] else set())
             return set(cons.get(r, [])) <= on
-        shared = any(all(bulb_root(i) == src for i in ins[kn]) and closed(kn, src) and
-                     bulb_fits(kn, frame._pol_blk(c0, h0, w0))
+        shared = any(all(bulb_root(i) == src for i in ins[kn]) and closed(kn, src) and bulb_fits(kn, "is")
                      for kn in cats)
         # a concat whose branches all start at one computed tensor ("Input sharing" from a layer): when that layer
         # is a single node (a pool, a ReLU, a conv without pad or stride), NPUC stores it to DRAM, its first reader
@@ -1261,8 +1496,10 @@ class Plan:
             rs = {bulb_root(i) for i in ins[kn]}
             r = min(rs)
             if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r] and closed(kn, r):
-                if r in tst or any(x in tst for x in bulb_nodes(kn)):
-                    raise Unsupported("tiling in a graph: a concat's branches from a computed tensor, tiled")
+                if r in tst:
+                    raise Unsupported("tiling in a graph: a concat's branches from a tiled stratum's output")
+                if any(x in tst for x in bulb_nodes(kn)):
+                    continue                # a tiled branch: no input sharing (6.11), the root an ordinary tensor
                 roots |= rs
         for r in roots:
             stored.setdefault(r, ("im", r))
@@ -1285,7 +1522,7 @@ class Plan:
                 # conv and an eltwise); heading a concat's branches, one first citizen from the vConcat to the last
                 # reader, loaded by the first and shared (input sharing; V: large random t1016)
                 if not any(all(bulb_root(i) == t for i in ins[kn]) and
-                           bulb_fits(kn, frame._pol_blk(*pol["shapes"][t]["out"])) for kn in cats):
+                           bulb_fits(kn, "is") for kn in cats):
                     for j, r in enumerate(rs):
                         rch[t, r] = chunk("WCONCAT", size, [head[r], head[r]], (2, oidx[tst[t]["layers"][0]], 2, j))
                 else:
@@ -1414,6 +1651,7 @@ class Plan:
                 full[n] = True
             tens[n] = d["out"]
             info[n] = d
+        life = fwd["life"]
         for n, d in info.items():
             if "weight" in d:
                 # the WEIGHT chunk as NPUC's planner sizes it: its own pack of the kernel (planning rows; for a conv
@@ -1429,6 +1667,8 @@ class Plan:
                     d["weight"].size, d["wstep"] = d["ring"] * e, cdiv(e, 64) * 64
                 if d["ring"] < d["passes"] and d["ring"] <= 4:      # a short ring lives on its conv only
                     d["weight"].live = [d["out"].live[0], d["out"].live[0]]
+                if life.get(n) is False:    # the lifetime NPUC's layer-block forwarding left (frame.forwarding;
+                    d["weight"].live = [d["out"].live[0], d["out"].live[0]]    # V: t1004, t1013)
                 if by[n]["kind"] == "relu" and not d["whole"]:  # NPUC sizes the per-pass dummy conv's chunk as 4
                     # cores' worth over the cores used (V: relu-c1..c24); a whole-reading one as a conv's (V: g029)
                     d["weight"].size = cdiv(4 * d["weight"].size, d["dout"].cores)
@@ -1443,8 +1683,65 @@ class Plan:
                 ck.off = (min([SRAM_LIMIT] + [o.off for o in ov if o.top]) - ck.size) // 64 * 64
             ck.top = ck.off > 0
             ck.fixed = True
-        allocate(chunks)
+        # what NPUC's trim and spill needs to know of a chunk (allocate's ts; frame.md 6.12): the node it belongs to,
+        # and for a tensor's chunk its readers (not a concat) with the position of their first node
+        for (t, r), ck in rch.items():
+            ck.layer = t
+        for n, tg in tgeo.items():
+            for _, _, ck in tg["req"]:
+                ck.layer = n
+        for n, d in info.items():
+            for ck in [d.get(x) for x in ("pad", "ref", "out", "weight", "ps", "meta")] + d.get("meta_chunks", []):
+                if isinstance(ck, Chunk) and ck.cid is not None and getattr(ck, "layer", None) is None:
+                    ck.layer = n
+            ck = d.get("out")
+            if isinstance(ck, Chunk) and ck.cid is not None and not getattr(ck, "fixed", False):
+                rs = cons.get(n, [])
+                ck.tensor = n
+                # (a tiled stratum reads through DRAM, but NPUC gives its SPLIT node a chunk too: V t1036)
+                ck.readers = [(r, head[r] - (r in tst)) for r in rs if by[r]["kind"] != "concat"]
+                ck.concat_reader = any(by[r]["kind"] == "concat" for r in rs)
+        ts = {}
+        allocate(chunks, ts=ts)
         self.chunks = chunks
+        # a spilled tensor (frame.md 6.12): its producer stores it, each reader past the spill loads it into a chunk
+        # of its own; an eltwise reading it then loads its other operand back from DRAM too (as with any operand in
+        # DRAM: cmdq.md 7c). A trimmed input: the copy group before its reader
+        spilled = {}
+        for t, r, ck in ts.get("spills", []):
+            if r in tst:                    # a tiled stratum loads its tiles from DRAM anyway
+                stored.setdefault(t, ("im", t))
+                continue
+            spilled[t, r] = ck
+            rch[t, r] = ck
+            stored.setdefault(t, ("im", t))
+        for (t, r), ck in spilled.items():
+            d = info[r]
+            if by[r]["kind"] == "eltwise":
+                d["ins"] = [rch[i, r] if (i, r) in rch else tens[i] for i in ins[r]]
+                for i in ins[r]:
+                    if i != t and i not in dsrc:
+                        stored.setdefault(i, ("im", i))
+            elif ins[r][0] == t:
+                d["in"], d["full"] = ck, True
+            else:
+                raise Unsupported("trim and spill: a spilled tensor read as a second input (not modelled)")
+        # a trimmed tensor: every reader reads the copy, made by its own group right after the producer's (V: t1038,
+        # a copy of an eltwise output before its two readers; chains: frame.md 6.7)
+        copies = {}
+        for X, T in ts.get("trims", []):
+            t = X.tensor
+            for r in cons.get(t, []):
+                d = info[r]
+                if by[r]["kind"] == "eltwise":
+                    d["ins"] = [T if i == t else c for i, c in zip(ins[r], d["ins"])]
+                elif d.get("in") is X:
+                    d["in"] = T
+                else:
+                    raise Unsupported("trim and spill: a copy of a chunk its reader does not read (not modelled)")
+            r0 = next(x for x in [L["name"] for L in order] if x in cons[t])
+            copies[t] = dict(info[r0], copy={"src": X.off, "dst": T.off, "size": X.size})
+        self.spilled = spilled
         for tg in tgeo.values():            # the strata's chunk offsets, as frame.plan_tiled lists them
             tg["chunks"] = [{"kind": kind, "layer": li, "off": ck.off, "size": ck.size} for kind, li, ck in tg["req"]]
         tops = [ck for ck in chunks if getattr(ck, "top", False)]
@@ -1479,16 +1776,26 @@ class Plan:
             else:
                 o = info[out]
             nu = unflatten_tiles(o, o["ho"], o["wo"])
-            if nu > 1:
-                raise Unsupported("tiling in a graph (the unflatten of %d x %d)" % (o["ho"], o["wo"]))
+            if nu > 1 and multi:
+                raise Unsupported("tiling in a graph (the unflatten of %d x %d, one of several outputs)"
+                                  % (o["ho"], o["wo"]))
             self.out_chw = (o["dout"].c, o["ho"], o["wo"])
             self.out_chws.append(self.out_chw)
             self.out_internal[out] = self.out_chw   # NPUC's shape of the output (a widened pool: one more column)
-            ld = Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out)
-            if multi:
-                ld.out_chw = self.out_chw           # the read-back's profile: this output's (npuc_profile)
-            self.groups.append([ld, Op("nopop", deps=[0]), Op("unflatten")])
-            self.group_layers.append(None)
+            if nu == 1:
+                ld = Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out)
+                if multi:
+                    ld.out_chw = self.out_chw       # the read-back's profile: this output's (npuc_profile)
+                self.groups.append([ld, Op("nopop", deps=[0]), Op("unflatten")])
+                self.group_layers.append(None)
+            # a tiled read-back, as a chain's (frame.md 6.5: row tiles by NPUC's policy, each its own output group,
+            # loaded per core with several planes per core; V: large random t1039)
+            for u in range(nu if nu > 1 else 0):
+                nl = o["dout"].cores if o["dout"].ppc > 1 else 1
+                ops = [Op("load", what="dram", flag=self.event(), utile=u, core=k if nl > 1 else None, tensor=out)
+                       for k in range(nl)]
+                self.groups.append(ops + [Op("nopop", deps=list(range(nl))), Op("unflatten")])
+                self.group_layers.append(None)
 
         def loads_first(L, prev, seq):
             # a reader of a tensor in DRAM loads it, unless the input is shared by a concat's branches and an earlier
@@ -1501,8 +1808,10 @@ class Plan:
             # (the same tensor, the same way, into the same SRAM chunk, which the layer just before did not overwrite
             # with its output: V outputs-unseen2 m2028 loads again; its partial sums do not count, V: graph-split-random
             # s001 skips the load over them, G for its PAD and REFORMAT chunks, which no case has overlapped)
-            ld = (i0, load_kind(L, d), d["in"].off) if i0 in dsrc and k != "eltwise" else None
-            if (i0 == src and shared) or i0 in wshared:
+            ld = (i0, load_kind(L, d), d["in"].off) if (i0 in dsrc or (i0, n) in spilled) and k != "eltwise" else None
+            if (i0, n) in spilled:
+                first = True                # a spilled tensor's reader past the spill (frame.md 6.12)
+            elif (i0 == src and shared) or i0 in wshared:
                 first = n == firstr
             elif ld is not None:
                 a, b = d["in"].off, d["in"].off + d["in"].size
@@ -1603,13 +1912,15 @@ class Plan:
             elif k == "relu":
                 ops = self.relu_group(L, d, first, last)
             else:
-                ops = self.elt_group(L, d, ins[n], dsrc, last)
+                ops = self.elt_group(L, d, ins[n], dsrc + [i for i in ins[n] if (i, n) in spilled], last)
             for op in ops:
                 if op.kind == "load" and op.what == "ifm":
                     op.tensor = i0
                 elif op.kind == "store":
                     op.tensor = stored[n][1]
             self.groups += self.cut(ops, ev0) if k != "eltwise" else [ops]
+            if n in copies:                 # a trim-and-spill copy of its output (frame.md 6.12)
+                self.groups.append(self.copy_group(copies[n]))
             self.group_layers += [n] * (len(self.groups) - len(self.group_layers))
 
     def relu_group(self, L, d, first, last):
@@ -1887,13 +2198,16 @@ def emit_conv(c, op, q, fixed, tail, cache=None):
     for k in range(4):
         for j in range(2):
             c.w(MTC + 0x700 + 8 * k + 4 * j, op.ofm + (2 * p + j) * oc)
-    sc = 0 if relu else shift_code(layer_shift(L))
+    # the shift word of each populated DRU: its channel's shift (per channel in NPUC's node data, docs/format/
+    # perchannel.md; one value per layer from NPUC's own frontend)
+    shifts = None if relu else [shift_code(sh) for _, sh in grelu.channel_requant(L)]
     for k in range(4):
         for j in range(2):
             v = 0
             for cc in range(2):
-                if out_channel(dout, k, p, j, cc) is not None:
-                    v |= sc << (16 * cc)
+                o = out_channel(dout, k, p, j, cc)
+                if o is not None and shifts is not None:
+                    v |= shifts[o] << (16 * cc)
             c.w(MTC + 0x900 + 8 * k + 4 * j, v)
     for k in range(4):
         for j in range(2):
