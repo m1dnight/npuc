@@ -43,6 +43,17 @@
 // In an "npuc-net 2" file every reader must declare the scale and zero point its input blob already has (NPUC does not
 // rescale between layers on this path); "npuc-net 1" files are read exactly as before (the new lines refused there).
 //
+// Per-channel requantisation (docs/format/perchannel.md), in either version, after the conv/dwconv line they qualify:
+//   wscales <layer> <n> <w scale f32 hex> x n
+//        the conv's weight scale as a per-channel vector of n = C out floats (ConvAttr.wScale, and bScale = in x w per
+//        channel), what the HAL would hand NPUC for a per-channel operand if it read one (it reads Operand.scale only)
+//   slopes <layer> <n> <slope> x n <shift> x n
+//        a per-channel multiplier: after NPUC's own NNGraphNodeScaleONFiller::setScale (which derives one slope and one
+//        shift from wScale[0] and stores them C out times in the node's per-channel vectors), the hook below writes
+//        these n = C out slopes (u16) and shifts (8..15) into those same vectors
+// Neither line exists in NPUC's input model: they are this harness's way of asking what NPUC's backend does with
+// per-channel values its frontend never produces.
+//
 // Output: the NCP written to --out and <out>.json (what NPUC made of each layer: its output shape and pads, read back
 // after computeOutputShape; the NCP's size), both announced as "FILE <name>" for run-n3.sh to fetch; "npuc-net: PASS"
 // or the step that failed. Exit 0 PASS, 1 bad input, 2 compile error, 3 not an NCP.
@@ -180,6 +191,60 @@ bool npuc_hook_DwOptSupported(void *self)
 		printf("dwconv %s: NNGraphAttribute::DwOptSupported with framework \"scaffe\" (was \"%s\") = %d\n",
 		       l->name.c_str(), saved.c_str(), (int)r);
 	return r;
+}
+#endif
+
+// ---- Per-channel multipliers: NNGraphNodeScaleONFiller::setScale (libnpuc_frontend 0x9da64) -------------------------
+// NPUC's on-device scale filler reads ConvAttr inScale.at(0), outScale.at(0) and wScale.at(0) (attr +0x130, +0x160,
+// +0x190), derives one slope (fcvtas(m x 256), m doubled into [0.5, 1)) and one shift (doublings + 8), and pushes them
+// numOutput (attr +0x58) times into a new NPUSlopeMemoryData (node +0x108: object, +0x110: control block; its
+// vector<uint32_t> at object +8) and a shift object (node +0x118 / +0x120; vector<uint8_t> at object +8). Its run()
+// calls setScale through the PLT (@0x9d908: b setScale@plt), so Bionic binds the call to this definition. For a layer
+// with a "slopes" line it runs NPUC's own function, then overwrites the two vectors element by element; every other
+// node is NPUC's function unchanged.
+struct PerChannel {
+	std::vector<uint32_t> slope;
+	std::vector<uint8_t> shift;
+	int calls = 0;
+};
+static std::map<std::string, PerChannel> g_slopes;  // layer name -> per-channel slope and shift
+
+#if defined(__aarch64__)
+constexpr const char *kSymSetScale = "_ZN4NPUC24NNGraphNodeScaleONFiller8setScaleERNS_11NNGraphNodeE";
+extern "C++" __attribute__((visibility("default"))) void npuc_hook_setScale(void *self, void *node)
+	__asm__("_ZN4NPUC24NNGraphNodeScaleONFiller8setScaleERNS_11NNGraphNodeE");
+void npuc_hook_setScale(void *self, void *node)
+{
+	using fn_t = void (*)(void *, void *);
+	static fn_t orig = reinterpret_cast<fn_t>(dlsym(RTLD_NEXT, kSymSetScale));
+	if (!orig) {
+		printf("npuc-net: FAIL (no NPUC setScale behind the hook)\n");
+		_exit(2);
+	}
+	orig(self, node);
+	auto *n = static_cast<char *>(node);
+	NNLayer *l = *reinterpret_cast<NNLayer **>(n + NNGraphNodeOff::layer);
+	auto it = l ? g_slopes.find(l->name) : g_slopes.end();
+	if (it == g_slopes.end())
+		return;
+	char *so = *reinterpret_cast<char **>(n + 0x108), *ho = *reinterpret_cast<char **>(n + 0x118);
+	if (!so || !ho) {
+		printf("npuc-net: FAIL (setScale left no slope/shift data for %s)\n", l->name.c_str());
+		_exit(2);
+	}
+	auto &sv = *reinterpret_cast<std::vector<uint32_t> *>(so + 8);
+	auto &hv = *reinterpret_cast<std::vector<uint8_t> *>(ho + 8);
+	PerChannel &pc = it->second;
+	if (sv.size() != pc.slope.size() || hv.size() != pc.shift.size()) {
+		printf("npuc-net: FAIL (%s: NPUC's per-channel vectors hold %zu slopes / %zu shifts, the file %zu)\n",
+		       l->name.c_str(), sv.size(), hv.size(), pc.slope.size());
+		_exit(2);
+	}
+	printf("slopes %s: NPUC's setScale gave slope %u shift %u x %zu; replaced by the file's per-channel values\n",
+	       l->name.c_str(), sv.empty() ? 0u : sv[0], hv.empty() ? 0u : (unsigned)hv[0], sv.size());
+	for (size_t c = 0; c < sv.size(); c++)
+		sv[c] = pc.slope[c], hv[c] = pc.shift[c];
+	pc.calls++;
 }
 #endif
 
@@ -420,6 +485,7 @@ int main(int argc, char **argv)
 	};
 	std::vector<std::shared_ptr<NNLayer>> layers;
 	std::vector<std::shared_ptr<ConvAttr>> convs;  // kept alive with their data until the compile is over
+	std::map<std::string, std::shared_ptr<ConvAttr>> convByName;  // for the per-channel lines
 	std::vector<std::string> order;
 	std::string last;
 	STEP("CompileOptions::GetInstance");
@@ -563,6 +629,7 @@ int main(int argc, char **argv)
 				ca->bZp = {0};
 				ca->fusedActivation = act;
 				convs.push_back(ca);
+				convByName[name] = ca;
 				auto *cv = static_cast<NNConvLayer *>(::operator new(sizeof(NNConvLayer)));
 				STEP("NNConvLayer C2 (" + name + ")");
 				npuc_NNConvLayer_C2(cv, name, "Convolution", {input}, {name}, ca);
@@ -805,6 +872,41 @@ int main(int argc, char **argv)
 			first = false;
 			layers.push_back(l);
 			last = name;
+		} else if (kw == "wscales" || kw == "slopes") {
+			std::string name = tk.str();
+			auto ci = convByName.find(name);
+			if (ci == convByName.end()) {
+				tk.fail(kw + " " + name + ": no conv or dwconv of that name before it");
+				break;
+			}
+			ConvAttr &ca = *ci->second;
+			long n = tk.num(1, 4096, "n");
+			if (!tk.bad && n != ca.numOutput)
+				tk.fail(kw + " " + name + ": " + std::to_string(n) + " values for " + std::to_string(ca.numOutput) + " outputs");
+			if (kw == "wscales") {
+				std::vector<float> ws;
+				for (long j = 0; j < n && !tk.bad; j++)
+					ws.push_back(tk.f32hex("w scale"));
+				if (tk.bad)
+					break;
+				ca.wScale = ws;
+				ca.bScale.clear();
+				for (float w : ws)
+					ca.bScale.push_back(ca.inScale.at(0) * w);
+				printf("wscales %s: %ld per-channel weight scales, first %.9g, last %.9g\n", name.c_str(), n,
+				       (double)ws.front(), (double)ws.back());
+			} else {
+				PerChannel pc;
+				for (long j = 0; j < n && !tk.bad; j++)
+					pc.slope.push_back((uint32_t)tk.num(1, 65535, "slope"));
+				for (long j = 0; j < n && !tk.bad; j++)
+					pc.shift.push_back((uint8_t)tk.num(0, 31, "shift"));
+				if (tk.bad)
+					break;
+				g_slopes[name] = pc;
+				printf("slopes %s: %ld per-channel slopes and shifts (first %u / %u)\n", name.c_str(), n, pc.slope[0],
+				       (unsigned)pc.shift[0]);
+			}
 		} else {
 			tk.fail("unknown keyword '" + kw + "'");
 		}
@@ -850,6 +952,11 @@ int main(int argc, char **argv)
 	STEP("NPUCompiler::compile (NPUC runs: frontend fillers, GraphIR/LIR, backend NCP)");
 	int rc = npuc_compile(&comp, &net, &buf);
 	STEP("after compile");
+	for (auto &e : g_slopes)
+		if (e.second.calls == 0) {
+			printf("npuc-net: FAIL (slopes %s: NPUC's setScale never ran for that layer)\n", e.first.c_str());
+			return 2;
+		}
 	printf("NPUCompiler::compile = %d, addr %p, size %d\n", rc, buf.addr, buf.size);
 	if (rc != 0 || !buf.addr || buf.size < 0x80) {
 		printf("npuc-net: FAIL (compile)\n");
