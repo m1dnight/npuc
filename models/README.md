@@ -39,11 +39,11 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
 
 ## Status (2026-11-22, NPUC root-314e61a6)
 
-**24 models: 19 exact, 1 fails in NPUC, 4 refused by npunet** (3 of them up front, where NPUC would assert, naming
-the exact rewrite). Every model npunet lowers has its CPU reference (`npunet.py ref`, 0.1 to 18 s). The three `-npu`
+**24 models: 20 exact, 1 fails in NPUC, 3 refused by npunet** (up front, where NPUC would assert, naming the exact
+rewrite). Every model npunet lowers has its CPU reference (`npunet.py ref`, 0.1 to 18 s). The three `-npu`
 rewrites give byte for byte the reference of the published model, and the depthwise models the reference of their
 `-dense` form. Every NCP NPUC compiled is regression data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: every
-one exact), and the 19 exact ones are rows of `tests/golden.txt`, so `tests/run.sh` regenerates them with no vendor
+one exact), and the 20 exact ones are rows of `tests/golden.txt`, so `tests/run.sh` regenerates them with no vendor
 file. The NPUC column's time includes
 npunet's lowering and was measured under a parallel load.
 
@@ -71,7 +71,7 @@ npunet's lowering and was measured under a parallel load.
 | mobilenet-v1-025-dense | 96x96x1 | --allow-none | ok, 29 NPU layers | PASS, 797 KB, 6.3 s | **EXACT** (1 s) | 5af11588254e, 2 B, 4.9 s |
 | mobilenet-v2-035 | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 23.5 s | **EXACT** (9 s) | 0cc597e5b755, 1000 B, 11.9 s |
 | mobilenet-v2-035-dense | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 24.4 s | **EXACT** (8 s) | 0cc597e5b755, 1000 B, 11.9 s |
-| ds-cnn | 49x10x1 | --allow-none | refused: pool1: a global average pool over 25x5: NPUC's pooling takes strides up to 3, and as a conv its kernel may be up to 14x14 (V); pool in steps first | - | - | - |
+| ds-cnn | 49x10x1 | --allow-none | ok, 11 NPU layers | PASS, 209 KB, 2.7 s | **EXACT** (0 s) | ad2c9fdec999, 12 B, 1.7 s |
 | ds-cnn-dense | 49x10x1 | --allow-none | ok, 11 NPU layers | PASS, 209 KB, 22.2 s | **EXACT** (3 s) | ad2c9fdec999, 12 B, 2.0 s |
 
 Per published model: LeNet-5, the Keras MNIST convnet and MLP, the TensorFlow CIFAR CNN, a VGG-style CIFAR CNN, the
@@ -81,9 +81,8 @@ inputs and SqueezeNet's MEAN as Keras writes them). The Hello Edge KWS CNN, magi
 exact rewrite** (`-npu`; npunet refuses the published forms up front, where NPUC would assert, and names the rewrite). MobileNet v1 is **exact as published**
 (DEPTHWISE_CONV_2D and TFLite's ReLU6 quantisation: npunet lowers each depthwise layer to the dense block-diagonal
 conv, and NPUC's NCP for the depthwise form is the `-dense` form's byte for byte); MobileNet v2 lowers and compiles the
-same way and is exact too (with its adaptations; its MEAN as Keras writes it); DS-CNN is **exact with depthwise
-written as dense** (`-dense`; the published form waits for a global average pool over 25x5). micro_speech **fails in
-NPUC**.
+same way and is exact too (with its adaptations; its MEAN as Keras writes it); DS-CNN is **exact as published** too
+(its 25x5 global average pool as the identity conv, item 5). micro_speech **fails in NPUC**.
 
 ## What ncpgen and npunet need, ranked
 
@@ -144,14 +143,28 @@ What unblocks the most models for the least work comes first. Items marked done 
    and ncpgen refuses, and residual blocks there, which NPUC cannot compile: 15 of 18 compiled, the 3 tiled refused)
    and on unseen random wide graphs (`stream_graphs.py random <dir> 1 30 --set split`: 25 of 25 compiled exact; 5 more
    stop at npunet's limit on a wide global pool).
-5. **npunet: a global average pool larger than 14** (ds-cnn). `_global_avg_as_conv` refuses kernels over 14, but NPUC
-   compiles the 25x5 identity conv over 64 channels and ncpgen is exact on it (ds-cnn-dense writes that conv itself;
-   probes: 25x5, 25x8, 25x10, 8x25, 10x25, 12x20, 14x18, 18x14, 15x15 over 8 channels, 25x20 over 1 are exact too).
-   Two limits stand past it: NPUC's weight bitmask (it asserts `(nzvSize & 0xFE00) == 0` in
-   `NPULIRKernelPack::GenBitmasks2020` on 13x20 and 25x20 over 8 channels, 25x20 over 4: kernel area, channels and
-   non-zero weights together), and ncpgen's own refusal of 16x16 and 20x13 over 8 channels, which NPUC compiles
-   ("weights.py: a sub-batch would hold no channel pair"). Map both, then lower up to them. **Effort: half a day** (a
-   sweep plus reading GenBitmasks2020); it also gives micro-speech (8) its honest refusal.
+5. **Done (2026-11-22): npunet: a global average pool larger than 14** (ds-cnn: exact as published). The 14x14 limit
+   is replaced by the measured one, `npunet.gap_conv_fits` (`models/gap_sweep.py`: 42 identity convs through NPUC, 26
+   in `$NCPGEN_WORK/sweep/gaplim/`; the selftest holds every outcome). NPUC's packer cuts each core's cpc = 2 ceil(C/8)
+   channels into sub-batches before 1017 positions or 512 values its counter calls non-zero (stored byte != 0: in
+   quant 1 the zero point 128 counts, so every byte; in quant 3 only the diagonal's 1), each of an even number of
+   channels, floor(cut / K / 2) * 2 for a kernel area K:
+   - **quant 3**: areas up to 508 (V: 504 over 1, 8 and 64 channels, 500 over 96, 289 over 120 compile and are exact;
+     510 and 512 assert `(bmSize & 0x80) == 0`);
+   - **quant 1**: areas up to 255 (one channel pair per 511 values), except where the sub-batches exceed tryBuildData's
+     maxPossibleBatches, which NPUC asserts (`_numBatches[file] <= maxPossibleBatches`: 10x10 over 36..40, 80, 120
+     channels, 5x20 over 36; 10x10 over 32 and 9x9 over 40 compile; the old 14x14 rule lowered these). Past 255 the
+     sub-batch would hold no channel pair: NPUC divides by zero, and its 0 sub-batches drop out of its maximum, so it
+     packs one sub-batch per core. That compiles while a chunk's bitmap stays under 128 bytes (cpc x K <= 1016: 8
+     channels or fewer, areas up to 508; V: 16x16, 20x20, 64x4, 63x8 over 8, 20x13 over 2) and asserts
+     `(bmSize & 0x80) == 0` from 128 bytes (16x16 over 16). **NPUC's defect**: the assertion tests one bit, so from
+     256 bitmap bytes (16x16 over 32 or 64 channels) it compiles a broken NCP, the size overflowing the chunk header's
+     7-bit field (`$NCPGEN_WORK/zoo-evidence/gaplim-defect/`). npunet lowers the fallback cases NPUC compiles right;
+     **ncpgen's weights.py refuses them** for now ("a sub-batch would hold no channel pair"): with `_min_batches`
+     returning 0 there instead of raising (NPUC's division by zero), ncpgen is exact on all 5 and on the whole sweep
+     (26 of 26, checked in memory, weights.py unchanged here). `tests/regress.sh` lists them (gaplim 5).
+   - kernel sides up to 64: our harness (`npuc-net`) takes 1..64, so nothing larger is measured.
+   micro-speech's FC (8) is a conv of random weights, not this identity conv: still lowered, still NPUC's assertion.
 6. **Done (2026-11-22): npunet: TFLite patterns real converters write** (MEAN over H, W: `_mean_as_pool`, as the NFU
    pooling or, when that cannot take it (stride > 3, unequal strides, another output scale), as the identity conv
    whose multiplier rescales; `[1, N]` inputs; SAME with a negative pad: VALID, `_padding`, V on the 37 networks of
@@ -199,12 +212,18 @@ What unblocks the most models for the least work comes first. Items marked done 
 | max pool 1x1 stride 2 | "The stride value should be equal or less than the size of kernel" | alexnet-96-npu, first try |
 | conv 25x20 VALID over 8 (or 4) channels, 13x20 over 8 | asserts `(nzvSize & 0xFE00) == 0` | micro-speech, probes |
 | conv 25x5/64, 16x4/30, 15x4/16, 14x14/16, 15x15/8, 25x10/8, 12x20/8, 14x18/8, 25x20/1, 49x1/8, 1x40/8 VALID | compile; ncpgen exact | ds-cnn-dense, kws-cnn-npu, probes |
-| conv 16x16/8, 20x13/8 VALID | compile; ncpgen refuses ("a sub-batch would hold no channel pair") | probes |
+| conv 16x16/8, 20x13/8 VALID (random weights) | compile; ncpgen refuses ("a sub-batch would hold no channel pair") | probes |
+| global average pool as the identity conv: quant 3 area <= 508, quant 1 area <= 255 within maxPossibleBatches, or one sub-batch per core up to cpc x K = 1016 | compile; ncpgen exact but for quant 1's one-sub-batch cases (it refuses them) | gap_sweep (item 5) |
+| identity conv 16x16 over 32 or 64 channels, quant 1 | compiles a **broken** NCP: a 256- or 512-byte bitmap passes `(bmSize & 0x80) == 0` and overflows the chunk header | gap_sweep |
+| max pool 2x2 / 3x3 at strides 2x1, 3x1, 3x2 (16x16) | asserts `absDiff < stride` | probes (`probe-pool/`) |
+| max pool 2x2 / 3x3 at strides 1x2 (16x16) | compiles; ncpgen's streams differ (unequal pool strides not modelled; npunet refuses them) | probes (`probe-pool/`) |
+| max pool 2x2 stride 3 | refuses ("The stride value should be equal or less than the size of kernel") | 28 frame-sweep variants, probe |
+| conv kernel side > 64 | not measured (our harness takes 1..64) | gap_sweep |
 | max pool 2x2 stride 1 SAME, 3x3 stride 3 SAME/VALID on 128x3/129x3, 3x1 stride 1 on 42x1 | compile; ncpgen exact | yolov2-tiny-128, magic-wand-npu, probes |
 
-The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outputs (`probe/`, `probe3/`) are in
-`$NCPGEN_WORK/zoo-evidence/` (outside `sweep/`, so `regress.sh` does not take them), with the resnet8 ordering variants
-(`order/`: add inputs swapped, shortcut first, both).
+The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outputs (`probe/`, `probe3/`,
+`probe-pool/`, `gaplim-defect/`) are in `$NCPGEN_WORK/zoo-evidence/` (outside `sweep/`, so `regress.sh` does not take
+them), with the resnet8 ordering variants (`order/`: add inputs swapped, shortcut first, both).
 
 ## The models
 
@@ -393,14 +412,13 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Source**: DS-CNN (Zhang et al. 2017, Hello Edge), the MLPerf Tiny keyword-spotting model: conv 64 10x4/2, 4 x (depthwise 3x3 + pointwise 64), average pool 25x5, FC 12
 - **Task / input**: keyword spotting, 49x10 MFCC, 12 classes; input 49x10x1 int8 (scale 0.6, zero point 80)
 - **Ops**: conv2d 10x4/2, depthwise 3x3 x4, conv2d 1x1 x4, average_pool2d, reshape, fully_connected, softmax; 0.02 M weights; output 1x1x12; `--allow-none`
-- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); dropout removed (inference)
-- **Missing for the published form**: the 25x5 global average pool: npunet refuses a pool kernel > 14 ('as a conv its kernel may be up to 14x14 (V)'), but NPUC compiles a 25x5 VALID conv over 64 channels, byte-exact in ncpgen (probe 2026-11-22): relax the limit to what NPUC takes
-- **Status**: refused (lowering: refused: pool1: a global average pool over 25x5: NPUC's pooling takes strides up to 3, and as a conv its kernel may be up to 14x14 (V); pool in steps first; NPUC: -; ncpgen check: -)
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); dropout removed (inference); the output FC: --allow-none
+- **Status**: exact (lowering: ok, 11 NPU layers; NPUC: PASS, 209 KB, 2.7 s; ncpgen check: EXACT (0 s))
 
 ### ds-cnn-dense
 
 - **Source**: DS-CNN (Zhang et al. 2017, Hello Edge), the MLPerf Tiny keyword-spotting model: conv 64 10x4/2, 4 x (depthwise 3x3 + pointwise 64), average pool 25x5, FC 12
 - **Task / input**: keyword spotting, 49x10 MFCC, 12 classes; input 49x10x1 int8 (scale 0.6, zero point 80)
 - **Ops**: conv2d 10x4/2, conv2d 3x3 x4, conv2d 1x1 x4, conv2d 25x5, reshape, fully_connected, softmax; 0.68 M weights; output 1x1x12; `--allow-none`
-- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); dropout removed (inference); each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function); the 25x5 global average pool written as the identity conv npunet lowers smaller ones to (npunet refuses a pooling kernel > 14; NPUC compiles this one); the output FC: --allow-none
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); dropout removed (inference); each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function); the 25x5 global average pool written as the identity conv npunet lowers it to; the output FC: --allow-none
 - **Status**: exact (lowering: ok, 11 NPU layers; NPUC: PASS, 209 KB, 22.2 s; ncpgen check: EXACT (3 s))

@@ -133,4 +133,5 @@ zoo-mobilenet-v1-025|zoo:mobilenet-v1-025|--allow-none|3d12f8af72a2c9c270bb897e1
 zoo-mobilenet-v1-025-dense|zoo:mobilenet-v1-025-dense|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0
 zoo-mobilenet-v2-035|zoo:mobilenet-v2-035|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590
 zoo-mobilenet-v2-035-dense|zoo:mobilenet-v2-035-dense|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590
+zoo-ds-cnn|zoo:ds-cnn|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
 zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a

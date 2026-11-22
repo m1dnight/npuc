@@ -647,11 +647,57 @@ def _mean_as_pool(L, cur, name):
             "activation": "none", "output": L.get("output")}
 
 
+def gap_conv_fits(C, kh, kw, quant):
+    """None when NPUC packs the identity conv of a global average pool (C x C x kh x kw, w[o][o] = 1) into a correct
+    NCP, else why not (V: models/gap_sweep.py, 40 networks, docs/format/weights.md layout 6-7). NPUC's counter walks each
+    (core, output channel)'s cpc x kh x kw stored bytes (cpc = 2 ceil(C / 8) channels per core) and cuts a sub-batch
+    before 1017 values or 512 it calls non-zero (stored byte != 0: in quant 1 the zero point 128 counts, so every
+    real channel's byte; in quant 3 only the diagonal's 1), then gives each sub-batch an even number of channels
+    floor(cut / K / 2) * 2 (ncpgen's weights._min_batches). When that is 0, NPUC's division by zero gives 0 sub-batches,
+    which its maximum over the walks ignores: one sub-batch per core (V: quant 1 over 2 and 8 channels, kernel areas
+    256..504, compile; ncpgen's weights.py refuses them for now). A chunk is one output channel over one sub-batch:
+    its bitmap must stay under 128 bytes (1016 positions) and its non-zero values under 512, else NPUC asserts
+    "(bmSize & 0x80) == 0" or "(nzvSize & 0xFE00) == 0" (it tests one bit: 256 bitmap bytes and more pass and give a
+    broken chunk header, V: 16x16 over 32 and 64 channels in quant 1); and the sub-batches may not exceed tryBuildData's
+    maxPossibleBatches (V: "_numBatches[file] <= maxPossibleBatches", quant 1, 10x10 over 36..120 channels). Measured
+    (gap_sweep): quant 3 kernel areas up to 504 compile, 510 and 512 not; quant 1 areas up to 255, except where the
+    sub-batches overflow, and up to 504 over 8 channels or fewer. Kernel sides over 64: our harness (npuc-net) takes
+    1..64, so nothing larger is measured."""
+    from ncpgen import weights as W   # NPUC's packer, as ncpgen models it (here only its counter and bound)
+    if max(kh, kw) > 64:
+        return "a kernel side over 64 (our NPUC harness takes 1..64: nothing larger is measured)"
+    K, cpc = kh * kw, 2 * -(-C // 8)
+    nb = 1
+    for c in range(-(-C // cpc)):
+        rc = min(cpc, C - c * cpc)
+        if quant == 3:     # the walks of an output channel off this core, and on it at each channel slot (which
+            # cut as the first while the diagonal's K values stay under 512)
+            walks = [[0] * (cpc * K)] + ([[0] * (j * K) + [1] * K + [0] * ((cpc - 1 - j) * K) for j in range(rc)]
+                                         if K > W.MAX_NZV else [])
+        else:              # every byte of a real channel counts (128 or 129), the absent channels' are 0
+            walks = [[1] * (rc * K) + [0] * ((cpc - rc) * K)]
+        for vals in walks:
+            try:
+                nb = max(nb, W._min_batches(vals, K, cpc))
+            except ValueError:      # a sub-batch would hold no channel pair: NPUC's 0 sub-batches, ignored
+                pass
+    cpb = -(-(-(-cpc // nb)) // 2) * 2
+    if cpb * K > W.MAX_VALUES:
+        return "a sub-batch of %d channels x %d taps: its bitmap of %d bytes is over 127 (NPUC asserts \"(bmSize & " \
+               "0x80) == 0\", or from 256 bytes writes a broken chunk header)" % (cpb, K, -(-cpb * K // 8))
+    if K > W.MAX_NZV:
+        return "%d non-zero weights in a chunk (over 511: NPUC asserts \"(nzvSize & 0xFE00) == 0\")" % K
+    bound = W._max_batches({"vk": [kh, kw], "vcpc": cpc})
+    if nb > bound:
+        return "%d sub-batches per core, over tryBuildData's maxPossibleBatches %d (NPUC asserts)" % (nb, bound)
+    return None
+
+
 def _global_avg_as_conv(L, cur, dtype, low):
     """A global AVERAGE_POOL_2D (VALID, its kernel the whole map) as a conv NPUC accepts, when the NFU pooling cannot
     take it: a stride over 3 (V: 4 refused, 8 aborts), unequal strides (NPUC asserts on a larger vertical one), or an
-    output quantisation other than the input's (the pooling keeps it). A VALID conv with kernel up to 14x14 compiles
-    (V, the oracle: 5..14 on 16 channels; 16x16 trips "(bmSize & 0x80) == 0"). Identity weights (w[o][o] = 1), bias 0,
+    output quantisation other than the input's (the pooling keeps it), and when NPUC packs the identity conv
+    (gap_conv_fits: the measured limits, e.g. 25x5 over 64 channels). Identity weights (w[o][o] = 1), bias 0,
     weight scale 1/(kh*kw): acc = the sum, NPUC's multiplier in/(out kh kw) (1/(kh*kw), exact when it is a power of
     two, for the same quantisation). ReLU when the input is already >= its zero point (a no-op there: the mean is >= 0,
     and it avoids NPUC's 'no activation' table), else no activation. None when the pool is not of that kind (the caller
@@ -666,13 +712,14 @@ def _global_avg_as_conv(L, cur, dtype, low):
     if not ((kh, kw) == (H, W) and L.get("padding", "valid").lower() == "valid" and
             (max(sh, sw) > 3 or sh != sw or not same_q)):
         return None
-    if max(kh, kw) > 14:
-        raise Refused("%s: a global average pool over %dx%d: NPUC's pooling takes strides up to 3, and as a conv its "
-                      "kernel may be up to 14x14 (V); pool in steps first" % (L.get("name", "pool"), kh, kw))
     if C * C * kh * kw > 1 << 24:
         raise Refused("%s: a global average pool over %d channels as a conv needs %d x %d x %d x %d weights (NPUC "
                       "compiles 512 x 512 x 7 x 7 in seconds; 1024 channels did not finish): reduce the channels first"
                       % (L.get("name", "pool"), C, C, C, kh, kw))
+    why = gap_conv_fits(C, kh, kw, low["quant_mode"])
+    if why:
+        raise Refused("%s: a global average pool %dx%d over %d channels, quant %d: NPUC's pooling takes strides up to 3, "
+                      "and as a conv %s; pool in steps first" % (L.get("name", "pool"), kh, kw, C, low["quant_mode"], why))
     act = "relu" if _nonneg(low, cur["name"]) else "none"
     data = [1 if c == o else 0 for o in range(C) for i in range(kh) for j in range(kw) for c in range(C)]
     low["warnings"].append("%s: global average pool %dx%d lowered to a %dx%d VALID conv with identity weights and "
@@ -2311,6 +2358,46 @@ def selftest_models():
     [o_ for o_ in td["ops"] if o_["op"] == "DEPTHWISE_CONV_2D"][0]["opt"]["dil_h"] = 2
     ok.append(("depthwise dilation refused (TFLite)", "dilation 2x1" in _refusal(lambda: tflite_to_graph(td, "d"))))
     ok += _selftest_patterns(strip)
+    ok += _selftest_gap()
+    return ok
+
+
+# models/gap_sweep.py through NPUC (root-current): (quant, C, kh, kw) -> compiled into a correct NCP (True) or not
+# (an assertion, or 16x16 over 32/64 channels in quant 1: a broken chunk header NPUC lets through)
+GAP_MEASURED = {
+    (1, 1, 64, 7): 1, (1, 128, 15, 17): 1, (1, 16, 15, 17): 1, (1, 2, 20, 13): 1, (1, 24, 14, 18): 1, (1, 32, 10, 10): 1,
+    (1, 40, 9, 9): 1, (1, 64, 15, 17): 1, (1, 64, 25, 5): 1, (1, 8, 15, 17): 1, (1, 8, 16, 16): 1, (1, 8, 1, 64): 1,
+    (1, 8, 20, 20): 1, (1, 8, 63, 8): 1, (1, 8, 64, 1): 1, (1, 8, 64, 4): 1, (3, 1, 63, 8): 1, (3, 120, 17, 17): 1,
+    (3, 16, 16, 16): 1, (3, 40, 10, 10): 1, (3, 64, 16, 16): 1, (3, 64, 63, 8): 1, (3, 8, 25, 20): 1, (3, 8, 63, 8): 1,
+    (3, 8, 8, 63): 1, (3, 96, 25, 20): 1,
+    (1, 1, 30, 17): 0, (1, 1, 64, 8): 0, (1, 120, 10, 10): 0, (1, 16, 16, 16): 0, (1, 36, 5, 20): 0, (1, 40, 10, 10): 0,
+    (1, 8, 30, 17): 0, (1, 8, 64, 8): 0, (1, 80, 10, 10): 0, (3, 1, 64, 8): 0, (3, 64, 30, 17): 0, (3, 8, 30, 17): 0,
+    (3, 8, 32, 16): 0, (3, 8, 64, 8): 0, (1, 32, 16, 16): 0, (1, 64, 16, 16): 0}
+
+
+def _selftest_gap():
+    """the global average pool as a conv: the measured limits (gap_conv_fits) and their use"""
+    ok = []
+    wrong = [k for k, v in GAP_MEASURED.items() if (gap_conv_fits(k[1], k[2], k[3], k[0]) is None) != bool(v)]
+    ok.append(("global average pool as a conv: gap_conv_fits = NPUC on the %d networks of models/gap_sweep.py"
+               % len(GAP_MEASURED), not wrong))
+    r = random.Random(11)
+
+    def gapnet(C, hw, quant):
+        g = _sgraph([_sconv("c", C, C, r, k=1), {"op": "average_pool2d", "name": "g", "pool": list(hw),
+                                                  "strides": list(hw), "padding": "valid"}], shape=(1,) + tuple(hw) + (C,))
+        return lambda: lower(g, quant=quant)
+    l25 = gapnet(64, (25, 5), 1)()["layers"][-1]
+    ok.append(("ds-cnn's global average pool 25x5 over 64 channels (quant 1): a 25x5 VALID identity conv",
+               l25["kind"] == "conv" and l25["k"] == [25, 5] and l25["out_chw"] == [64, 1, 1]))
+    ok.append(("global average pool 16x16 over 8 channels, quant 1: lowered (NPUC's one sub-batch per core)",
+               not _refuses(gapnet(8, (16, 16), 1))))
+    ok.append(("global average pool 16x16 over 16 channels, quant 1: refused (a 128-byte bitmap)",
+               "over 127" in _refusal(gapnet(16, (16, 16), 1))))
+    ok.append(("global average pool 10x10 over 40 channels, quant 1: refused (maxPossibleBatches); quant 3: lowered",
+               "maxPossibleBatches" in _refusal(gapnet(40, (10, 10), 1)) and not _refuses(gapnet(40, (10, 10), 3))))
+    ok.append(("global average pool 30x17 over 8 channels, quant 3: refused", _refuses(gapnet(8, (30, 17), 3))))
+    ok.append(("global average pool 65x1: refused (kernel sides up to 64 measured)", "over 64" in _refusal(gapnet(8, (65, 1), 1))))
     return ok
 
 

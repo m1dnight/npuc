@@ -196,7 +196,18 @@ on **5160 of 5160** conv/ReLU blocks of every compile under output/npu (the rest
 ## What remains
 
 - Not seen and not handled: a batch with no chunk (tryBuildData writes lead 1, size 1 when a load has <= 4 DRUs:
-  0x2c639c; never reached by a conv on this path), depthwise/grouped convs (refused upstream by npunet).
+  0x2c639c; never reached by a conv on this path). Depthwise convs reach this part as npunet's dense block-diagonal
+  convs (docs/format/depthwise.md); grouped convs are refused upstream by npunet.
+- **A sub-batch with no channel pair** (cpb0 = floor(maxrec / K / 2) * 2 = 0, layout section 6), V on npunet's
+  global-pool identity convs (`models/gap_sweep.py`, `$NCPGEN_WORK/sweep/gaplim/`, quant 1, kernel areas 256..504):
+  NPUC divides by zero (ARM udiv: 0), so that walk gives 0 sub-batches, which updateBatchesForFile's maximum ignores;
+  with every walk at 0 the conv keeps one sub-batch of the core's vcpc channels. `_min_batches` raises there ("NPUC
+  divides by zero"); returning 0 instead makes `ncpgen.py check` exact on the 5 compiled cases (16x16, 20x20, 64x4, 63x8
+  over 8 channels, 20x13 over 2) and leaves the rest of the sweep as it is (26 of 26, checked with the function replaced
+  in memory). The chunk then holds cpc x K positions: NPUC's `(bmSize & 0x80) == 0` tests one bit, so 128..255 bitmap
+  bytes assert but 256 and more (16x16 over 32 or 64 channels) compile into a chunk header whose 7-bit field cannot
+  hold the size (`$NCPGEN_WORK/zoo-evidence/gaplim-defect/`): `_chunk`'s refusal of any bitmap of 128 bytes or more is
+  the right rule for ncpgen.
 - On the NPU: sub-batches, nloads > 1, stride 2, graphs and quant 3 multi-layer blocks have never run; the bytes equal
   NPUC's, so they stand or fall with NPUC (proposal: run `fo20` (Cout 20, 2 loads) and `fi256` (2 sub-batches) through
   npu-run with the CPU reference; and a ReLU layer with C = 18 after a pool, to see NPUC's channel drop on the NPU).

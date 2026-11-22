@@ -749,18 +749,16 @@ DSCNN_SRC = ("DS-CNN (Zhang et al. 2017, Hello Edge), the MLPerf Tiny keyword-sp
              "(depthwise 3x3 + pointwise 64), average pool 25x5, FC 12")
 
 
-@model("ds-cnn", "ds-cnn", DSCNN_SRC, "keyword spotting, 49x10 MFCC, 12 classes", adapt=COMMON,
-       gaps=["the 25x5 global average pool: npunet refuses a pool kernel > 14 ('as a conv its kernel may be up to 14x14 "
-             "(V)'), but NPUC compiles a 25x5 VALID conv over 64 channels, byte-exact in ncpgen (probe 2026-11-22): "
-             "relax the limit to what NPUC takes"], expect="refused")
+@model("ds-cnn", "ds-cnn", DSCNN_SRC, "keyword spotting, 49x10 MFCC, 12 classes",
+       adapt=COMMON + ["the output FC: --allow-none"])
 def _dscnn_pub(n):
     _dscnn(n)
 
 
 @model("ds-cnn-dense", "ds-cnn", DSCNN_SRC, "keyword spotting, 49x10 MFCC, 12 classes",
        adapt=COMMON + ["each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function)",
-                       "the 25x5 global average pool written as the identity conv npunet lowers smaller ones to "
-                       "(npunet refuses a pooling kernel > 14; NPUC compiles this one)", "the output FC: --allow-none"])
+                       "the 25x5 global average pool written as the identity conv npunet lowers it to",
+                       "the output FC: --allow-none"])
 def _dscnn_dense(n):
     _dscnn(n)
 
