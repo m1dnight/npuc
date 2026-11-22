@@ -47,6 +47,7 @@ final-f003|--in 64,24,4 --seed 503603 --conv 32,3,1,same,relu --conv 16,3,1,vali
 final-f004|--in 12,13,4 --seed 696113 --conv 64,3,1,same,relu --conv 24,3,2,valid,relu --conv 256,5,1,valid,relu --oscale 0.00773986 --ozp 19||dc90ad589011bfc5c6857deee08fb2a756b17f31b4d915201b91843ece1ef0ee
 final-f005|--in 24,96,16 --seed 543369 --conv 64,5,1,same,relu|--quant 3|e5698bedb078cbaa0b003e5a1f638f4bd2190062dc9ab3f2deb7c7b6896ca932
 final-f006|--in 8,64,32 --seed 272644 --conv 24,3,2,same,none|--quant 3 --allow-none|66563c308c100ba6cb4fe5294927b9854731b270186af83033b59955421c3a62
+final-f007|--in 64,128,4 --seed 322703 --conv 96,5,1,valid,relu --conv 96,1,2,same,relu --conv 48,7,1,same,none|--quant 3 --allow-none|f67237b0e6d112ad178b70bfbc66d87286ed6dd3754182a1d37a5de08881e66f
 final-f008|--in 17,32,16 --seed 804949 --conv 96,7,2,same,relu --pool max,3,2 --conv 24,3,2,same,relu --conv 64,3,1,same,relu|--quant 3|1d170b2b2dbe40a9cfdf4e4c820de4e393d5d78766bea100f49491f8fc7e9aef
 final-f009|--in 128,160,8 --seed 572814 --conv 16,3,2,same,none|--allow-none|7093b7c616351742a932f944ecdd6868f24570da0a8bdb07111ea851ba8959d9
 final-f010|--in 64,32,1 --seed 23590 --conv 64,7,1,same,relu --oscale 0.0282679 --ozp 4 --conv 128,3,2,same,relu --conv 48,3,1,same,none --conv 96,7,1,same,relu --oscale 0.0268721 --ozp 20|--allow-none|605587e16d5b98c699c3417449e07eade60df98af2717c1eabdc0ad4a8120d7e
@@ -72,6 +73,7 @@ final-f031|--in 32,96,16 --seed 166279 --conv 8,3,2,same,none --conv 96,5,2,same
 final-f032|--in 24,13,64 --seed 659416 --conv 96,3,1,valid,relu --conv 48,7,2,same,relu --conv 4,3,2,same,none --conv 32,3,1,same,relu|--allow-none|e2f7ec21492912e836bd8eaa69fb7e057b0fd6eb6eb85cf1e1295e9b2a6ad0ee
 final-f033|--in 96,24,3 --seed 593803 --conv 16,7,1,same,relu --conv 24,1,1,valid,relu --conv 64,1,1,same,relu|--quant 3|4cbfca45492ab9c679ec79c556ce83c4a5d345f8f386f750e6b99fc18b270890
 final-f034|--in 160,64,24 --seed 865497 --conv 48,3,1,same,relu --conv 128,3,1,same,relu|--quant 3|0b932c3d9afa7443886258ed53e7dda355ceb3667ec8b903b0e3b28e701411e4
+final-f035|--in 12,13,4 --seed 351335 --conv 96,3,1,same,relu --conv 8,3,1,same,relu --conv 16,1,2,same,relu|--quant 3|253912dc16fd0fab5b457ac87bf3e5d61c43a8a4f868701e8a2c7f2357f93ae6
 final-f036|--in 17,64,16 --seed 734165 --conv 256,3,1,same,relu --pool avg,3,2 --conv 48,5,1,same,relu --oscale 0.0132816 --ozp -14||c273d1821d29cb1ad956fe4da85ec9de4f47198ea7f5d66e00b78fe1e0c0dda7
 final-f037|--in 112,64,1 --seed 726223 --conv 8,1,2,valid,none --pool max,3,2 --conv 128,3,1,valid,none|--allow-none|0510cbdf4797f94352caffad8fa4f12a6d094bc3c07f1b618e155541b64117b6
 final-f038|--in 48,8,24 --seed 600858 --conv 32,3,2,same,relu --conv 256,3,1,valid,relu||e3762d0311bfe8aba3ba77b2e652dba7ab11d1d5d37ab4666797d8eab134f91f
@@ -81,6 +83,8 @@ final-f041|--in 32,64,1 --seed 470905 --conv 8,3,2,valid,none --conv 64,3,1,same
 final-f042|--in 128,8,24 --seed 388936 --conv 32,3,2,same,relu --oscale 0.0137271 --ozp -4 --conv 24,3,2,valid,none --conv 32,5,1,same,relu|--allow-none|eba7e5117a089783b60afbfa03c4cdd26f3b522ae73d03fb67241dd29e010d02
 final-f043|--in 96,24,24 --seed 99979 --conv 96,1,1,same,none --conv 128,3,1,same,relu --conv 128,5,2,same,none --oscale 0.0136858 --ozp 12|--allow-none|86e1e061bf0e5e71c8d335aeee16d80cddff73d24e78e2748645fb0b008a49e6
 final-f044|--in 64,160,4 --seed 119876 --conv 96,3,2,valid,relu --conv 256,3,1,same,none --conv 32,5,1,same,relu --conv 4,7,2,same,relu|--allow-none|8c30daffde941fbc61be7fe1e37a97a4b7a8af58462c2dd4df6b9be14b10d3f7
+final-f045|--in 8,64,64 --seed 287036 --conv 64,1,2,same,relu|--quant 3|d913ac52cc5ff9c67d26911e498e5bddbdb67a81c4ac5ffc1a8f987a343d5cc1
+final-f046|--in 96,128,64 --seed 877 --conv 96,1,2,same,relu --conv 256,1,2,valid,relu|--quant 3|712f2955da0ed378b0e1f1353793b8c871642ebaff226f125e5d5eb7d71e1090
 final-f047|--in 48,24,4 --seed 176713 --conv 128,3,1,same,relu --conv 128,3,2,valid,relu --conv 16,5,2,valid,relu --conv 16,3,2,valid,relu|--quant 3|e6c02748aa73bc3e967d55df436a66f5996b5cf233eda8722d540e5f512c4df7
 final-f048|--in 17,24,64 --seed 51650 --conv 4,7,2,valid,relu||e8f9ee031f1797e36992985bff628bfd8f14021e8635bdb769f8eea891df50f7
 final-f049|--in 160,64,16 --seed 169313 --conv 32,3,2,valid,relu --conv 128,3,1,same,relu|--quant 3|d5e5cbd78a962202ed1b35a0eae935fa1d28696f3efa78d289fa044f9393669c
@@ -90,6 +94,7 @@ final-f052|--in 160,13,3 --seed 704591 --conv 48,3,2,same,relu --pool max,3,2||a
 final-f053|--in 32,160,16 --seed 382712 --conv 24,3,1,same,relu||fe638754a1cc67fbdac14ce4abb6a81e662442baeb4bf554f39775b5b6636afe
 final-f054|--in 32,96,64 --seed 333278 --conv 128,3,1,same,relu||f952baeffe78cba54d44dc480948987382653cd48dce803089040580b060abf6
 final-f055|--in 12,96,3 --seed 995157 --conv 8,3,2,same,none --conv 48,7,1,same,relu --conv 16,3,1,valid,relu|--quant 3 --allow-none|60db4155c57665ff815b271be482421f61e7977543cfca39a2f97245c69cb98b
+final-f056|--in 112,96,1 --seed 675528 --conv 24,1,2,same,relu||88c732f61930bcea5308cdabc60fef8bce878ff91e753dffce9e330c599ced07
 final-f057|--in 128,64,8 --seed 953266 --conv 32,5,2,valid,relu --pool max,3,2|--quant 3|6c3582dcd9884480fa16697639b66243952aa7f18b5cdee9c37f9a86b0d818c4
 final-f058|--in 8,96,16 --seed 403617 --conv 24,7,1,same,relu||05dc9e415454c30e31231fb19f6d70aab2216b4e0e5fbc0077127b7ab3dab242
 final-f059|--in 128,128,1 --seed 3126 --conv 96,3,1,same,relu --conv 24,5,2,same,relu --pool avg,2 --pool avg,2|--quant 3|3c3b345fc9e620ae4066dd860f1491600dc11c1f45058bd518ed54626b65e037
@@ -108,6 +113,7 @@ final-f073|--in 12,160,8 --seed 961541 --conv 256,5,2,same,relu --oscale 0.02492
 final-f075|--in 48,24,3 --seed 824262 --conv 24,7,1,same,relu --conv 8,5,2,same,relu||e27c9013884d48c7a312d5e473f31cf33156240ed2beeb237923deddb172e96e
 final-f076|--in 112,96,24 --seed 396853 --conv 256,7,2,same,relu --pool max,2 --conv 48,5,2,valid,relu --pool max,3,2||e2297f1f59fc0f927821e7509854f22433f00c35c339f2e52492755d0125a0c1
 final-f077|--in 17,96,64 --seed 76211 --conv 64,3,1,valid,relu --pool max,3,2||f1b331b6b5374ef70c068898dbb8c572a960b538824e9adbd6961f7d588fa45b
+final-f078|--in 17,32,32 --seed 55853 --conv 96,1,2,same,relu --oscale 0.010286 --ozp -14 --pool avg,2 --conv 64,3,1,same,relu||6e3c1bca0513e4f02700bcf6eae160f20aecccb1963a470cc9ecbe6e3469b9f2
 final-f079|--in 24,32,24 --seed 319480 --conv 16,7,1,same,relu --conv 256,1,2,valid,none --oscale 0.0108537 --ozp 14 --conv 16,1,1,same,relu|--allow-none|e9f8681d40219c8ad01a3a0764849a659c358582490ea9a94c89c6b45940126d
 zoo-lenet5|zoo:lenet5|--allow-none|6f559d205543a0c36647d6e83213e40a9ba6a070cb8d2cdcd8e1d9f2a1931939
 zoo-keras-mnist-cnn|zoo:keras-mnist-cnn|--allow-none|04c1fcd4a8696f0bd668e2c6cbf25821555568e7fadc6a4c544433147249a09d
@@ -123,8 +129,8 @@ zoo-squeezenet11-96|zoo:squeezenet11-96||5a9694211af75a9c568de0f9e7a23e3e7130e50
 zoo-alexnet-96-npu|zoo:alexnet-96-npu|--allow-none|dbb85cfb46a51958c5228e4ee1e1f297824cc1aff87bed08a287a9c6ad382f6c
 zoo-vgg11-64|zoo:vgg11-64|--allow-none|c912ada5d9a8ac97bbd724434afdae902a8677c222a3de356f5b4f0be2c2c80b
 zoo-yolov2-tiny-128|zoo:yolov2-tiny-128|--allow-none|43210e9516d32f0c743d14f95ffb34982b1bd07fc44faa3f04f1b38376da1826
+zoo-mobilenet-v1-025|zoo:mobilenet-v1-025|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0
 zoo-mobilenet-v1-025-dense|zoo:mobilenet-v1-025-dense|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0
+zoo-mobilenet-v2-035|zoo:mobilenet-v2-035|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590
 zoo-mobilenet-v2-035-dense|zoo:mobilenet-v2-035-dense|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590
 zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
-zoo-mobilenet-v1-025|zoo:mobilenet-v1-025|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0
-zoo-mobilenet-v2-035|zoo:mobilenet-v2-035|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590

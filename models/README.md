@@ -39,48 +39,51 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
 
 ## Status (2026-11-22, NPUC root-314e61a6)
 
-**24 models: 19 exact, 4 fail in NPUC, 1 refused by npunet.** Every model npunet lowers has its
-CPU reference (`npunet.py ref`, 0.1 to 18 s). The three `-npu` rewrites give byte for byte the reference of the
-published model, and the depthwise models the reference of their `-dense` form. Every NCP NPUC compiled is regression
-data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: 19 of 19), and the 19 exact ones are
-rows of `tests/golden.txt`, so `tests/run.sh` regenerates them with no vendor file. The NPUC column's time includes
+**24 models: 19 exact, 1 fails in NPUC, 4 refused by npunet** (3 of them up front, where NPUC would assert, naming
+the exact rewrite). Every model npunet lowers has its CPU reference (`npunet.py ref`, 0.1 to 18 s). The three `-npu`
+rewrites give byte for byte the reference of the published model, and the depthwise models the reference of their
+`-dense` form. Every NCP NPUC compiled is regression data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: every
+one exact), and the 19 exact ones are rows of `tests/golden.txt`, so `tests/run.sh` regenerates them with no vendor
+file. The NPUC column's time includes
 npunet's lowering and was measured under a parallel load.
 
 | model | input | options | lowering | NPUC | ncpgen check | CPU reference |
 |---|---|---|---|---|---|---|
 | lenet5 | 28x28x1 | --allow-none | ok, 7 NPU layers | PASS, 109 KB, 4.5 s | **EXACT** (0 s) | 895225fe26b4, 10 B, 0.1 s |
 | keras-mnist-cnn | 28x28x1 | --allow-none | ok, 5 NPU layers | PASS, 67 KB, 4.4 s | **EXACT** (0 s) | bee31a89bef9, 10 B, 0.4 s |
-| mnist-mlp | 1x1x784 | --allow-none | ok, 3 NPU layers | PASS, 852 KB, 8.1 s | **EXACT** (2 s) | cbfaca9fb6f4, 10 B, 0.4 s |
+| mnist-mlp | 1x1x784 | --allow-none | ok, 3 NPU layers | PASS, 852 KB, 4.7 s | **EXACT** (0 s) | cbfaca9fb6f4, 10 B, 0.4 s |
 | tf-cifar-cnn | 32x32x3 | --allow-none | ok, 7 NPU layers | PASS, 168 KB, 5.5 s | **EXACT** (0 s) | e78c8338eb6e, 10 B, 0.5 s |
 | vgg-cifar | 32x32x3 | --allow-none | ok, 11 NPU layers | PASS, 685 KB, 24.5 s | **EXACT** (3 s) | c5c997d7131b, 10 B, 3.8 s |
-| resnet8 | 32x32x3 | --quant 3 --allow-none | ok, 17 NPU layers | PASS, 202 KB, 7.3 s | **EXACT** (1 s) | 29f02bf6832a, 10 B, 1.4 s |
-| ad-autoencoder | 1x1x640 | --allow-none | ok, 10 NPU layers | PASS, 463 KB, 8.7 s | **EXACT** (1 s) | 533c72a18436, 640 B, 0.2 s |
-| kws-cnn | 49x10x1 | --allow-none | ok, 5 NPU layers | FAIL: solutionFound && "Couldn't find a correct processing strategy for a single node" | - | 7a44e7c3827a, 12 B, 0.3 s |
+| resnet8 | 32x32x3 | --quant 3 --allow-none | ok, 17 NPU layers | PASS, 202 KB, 2.5 s | **EXACT** (0 s) | 29f02bf6832a, 10 B, 1.1 s |
+| ad-autoencoder | 1x1x640 | --allow-none | ok, 10 NPU layers | PASS, 463 KB, 4.5 s | **EXACT** (0 s) | 533c72a18436, 640 B, 0.2 s |
+| kws-cnn | 49x10x1 | --allow-none | refused: l2_conv2: conv strides 2x1: NPUC wants equal strides (it asserts '_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain, or finds no processing strategy); when only a FULLY_CONNECTED reads it, the same function is the conv at stride 1 with the FC's weights on every 2-th row, zeros elsewhere (models/README.md, kws-cnn-npu) | - | - | - |
 | kws-cnn-npu | 49x10x1 | --allow-none | ok, 5 NPU layers | PASS, 116 KB, 3.2 s | **EXACT** (0 s) | 7a44e7c3827a, 12 B, 0.4 s |
 | micro-speech | 49x40x1 | --allow-none | ok, 2 NPU layers | FAIL: (nzvSize & 0xFE00) == 0 | - | 0336eae2a362, 4 B, 0.1 s |
-| magic-wand | 128x3x1 | --allow-none | ok, 6 NPU layers | FAIL: absDiff < stride && "Something went wrong during shape calculation" | - | ddc82277175a, 4 B, 0.1 s |
+| magic-wand | 128x3x1 | --allow-none | refused: l4_pool2: pooling strides 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) when the vertical stride is the larger; when only a FULLY_CONNECTED reads it, the same function is the pool at vertical stride 1 with the FC's weights on every 3-th row, zeros elsewhere (models/README.md, magic-wand-npu) | - | - | - |
 | magic-wand-npu | 128x3x1 | --allow-none | ok, 6 NPU layers | PASS, 17 KB, 10.0 s | **EXACT** (0 s) | ddc82277175a, 4 B, 0.1 s |
-| hello-world | 1x1x1 | --allow-none | ok, 3 NPU layers | PASS, 9 KB, 2.9 s | **EXACT** (0 s) | 2b4c342f5433, 1 B, 0.0 s |
-| squeezenet11-96 | 96x96x3 | - | ok, 38 NPU layers | PASS, 1162 KB, 76.2 s | **EXACT** (3 s) | 4951801caa0a, 10 B, 6.3 s |
-| alexnet-96 | 96x96x3 | --allow-none | ok, 11 NPU layers | FAIL: "Stride > 2 is not supported here!" && (ifmOrder.getSlotSize() <= 4) | - | 6d9704d8711f, 10 B, 7.5 s |
+| hello-world | 1x1x1 | --allow-none | ok, 3 NPU layers | PASS, 9 KB, 1.6 s | **EXACT** (0 s) | 2b4c342f5433, 1 B, 0.1 s |
+| squeezenet11-96 | 96x96x3 | - | ok, 38 NPU layers | PASS, 1162 KB, 5.9 s | **EXACT** (1 s) | 4951801caa0a, 10 B, 4.5 s |
+| alexnet-96 | 96x96x3 | --allow-none | refused: l1_conv1: conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::IterateOverAllValues); the same output: the conv at stride 2, then a 1x1 stride-2 VALID conv with identity weights and multiplier 1 keeping every other row and column (models/README.md, alexnet-96-npu) | - | - | - |
 | alexnet-96-npu | 96x96x3 | --allow-none | ok, 12 NPU layers | PASS, 4576 KB, 17.9 s | **EXACT** (43 s) | 6d9704d8711f, 10 B, 9.5 s |
 | vgg11-64 | 64x64x3 | --allow-none | ok, 16 NPU layers | PASS, 3838 KB, 122.5 s | **EXACT** (14 s) | 5456870cc263, 200 B, 16.0 s |
 | yolov2-tiny-128 | 128x128x3 | --allow-none | ok, 15 NPU layers | PASS, 4607 KB, 99.8 s | **EXACT** (20 s) | b4805006f2b0, 2000 B, 9.0 s |
 | mobilenet-v1-025 | 96x96x1 | --allow-none | ok, 29 NPU layers | PASS, 797 KB, 45.6 s | **EXACT** (1 s) | 5af11588254e, 2 B, 5.1 s |
 | mobilenet-v1-025-dense | 96x96x1 | --allow-none | ok, 29 NPU layers | PASS, 797 KB, 6.3 s | **EXACT** (1 s) | 5af11588254e, 2 B, 4.9 s |
-| mobilenet-v2-035 | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 67.1 s | **EXACT** (4 s) | 0cc597e5b755, 1000 B, 10.3 s |
-| mobilenet-v2-035-dense | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 211.2 s | **EXACT** (4 s) | 0cc597e5b755, 1000 B, 17.6 s |
+| mobilenet-v2-035 | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 23.5 s | **EXACT** (9 s) | 0cc597e5b755, 1000 B, 11.9 s |
+| mobilenet-v2-035-dense | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 24.4 s | **EXACT** (8 s) | 0cc597e5b755, 1000 B, 11.9 s |
 | ds-cnn | 49x10x1 | --allow-none | refused: pool1: a global average pool over 25x5: NPUC's pooling takes strides up to 3, and as a conv its kernel may be up to 14x14 (V); pool in steps first | - | - | - |
 | ds-cnn-dense | 49x10x1 | --allow-none | ok, 11 NPU layers | PASS, 209 KB, 22.2 s | **EXACT** (3 s) | ad2c9fdec999, 12 B, 2.0 s |
 
 Per published model: LeNet-5, the Keras MNIST convnet and MLP, the TensorFlow CIFAR CNN, a VGG-style CIFAR CNN, the
 DCASE/MLPerf Tiny autoencoder, the TFLM sine model, SqueezeNet 1.1, VGG-11, Tiny YOLOv2 and ResNet-8 are **exact as
-published** (with the generic adaptations above; ResNet-8's shortcuts SAME -> VALID, the same output). The Hello Edge
-KWS CNN, magic wand and AlexNet are **exact after an exact rewrite** (`-npu`). MobileNet v1 is **exact as published**
+published** (with the generic adaptations above; ResNet-8's SAME 1x1 stride-2 shortcuts, the vector models' `[1, N]`
+inputs and SqueezeNet's MEAN as Keras writes them). The Hello Edge KWS CNN, magic wand and AlexNet are **exact after an
+exact rewrite** (`-npu`; npunet refuses the published forms up front, where NPUC would assert, and names the rewrite). MobileNet v1 is **exact as published**
 (DEPTHWISE_CONV_2D and TFLite's ReLU6 quantisation: npunet lowers each depthwise layer to the dense block-diagonal
 conv, and NPUC's NCP for the depthwise form is the `-dense` form's byte for byte); MobileNet v2 lowers and compiles the
-same way and is exact too (with its adaptations); DS-CNN is **exact with depthwise written as dense** (`-dense`; the published form
-waits for a global average pool over 25x5). micro_speech **fails in NPUC**.
+same way and is exact too (with its adaptations; its MEAN as Keras writes it); DS-CNN is **exact with depthwise
+written as dense** (`-dense`; the published form waits for a global average pool over 25x5). micro_speech **fails in
+NPUC**.
 
 ## What ncpgen and npunet need, ranked
 
@@ -149,12 +152,22 @@ What unblocks the most models for the least work comes first. Items marked done 
    non-zero weights together), and ncpgen's own refusal of 16x16 and 20x13 over 8 channels, which NPUC compiles
    ("weights.py: a sub-batch would hold no channel pair"). Map both, then lower up to them. **Effort: half a day** (a
    sweep plus reading GenBitmasks2020); it also gives micro-speech (8) its honest refusal.
-6. **npunet: TFLite patterns real converters write.** None of these is in the zoo's JSON, but a converted model hits each
+6. **Done (2026-11-22): npunet: TFLite patterns real converters write** (MEAN over H, W: `_mean_as_pool`, as the NFU
+   pooling or, when that cannot take it (stride > 3, unequal strides, another output scale), as the identity conv
+   whose multiplier rescales; `[1, N]` inputs; SAME with a negative pad: VALID, `_padding`, V on the 37 networks of
+   the sweeps npunet refused for it before: 36 compile in NPUC and ncpgen is exact on every one, NPUC aborts on the
+   last, frame/s18 r3-110, "numTiles > 0" on a 2-row map; they are regression data now. The zoo now writes
+   mnist-mlp, ad-autoencoder and hello-world with `[1, N]` inputs, resnet8 with its SAME shortcuts, SqueezeNet and
+   MobileNet v2 with MEAN: the same NCPs). None of these was in the zoo's JSON, but a converted model hits each
    one. MEAN over H and W (Keras' GlobalAveragePooling2D) should lower like a global AVERAGE_POOL_2D. A 2-D input
    `[1, N]` (mnist-mlp, ad-autoencoder, hello-world as Keras writes them) is the same tensor as `[1, 1, 1, N]`. SAME
    padding whose pad would be negative (resnet8's 1x1 stride-2 shortcuts: "SAME padding with stride 2 > kernel 1 leaves
    a negative pad") is VALID in TFLite, which clamps the pad at 0. **Effort: an hour or two for the three.**
-7. **npunet: refuse what NPUC asserts on, or rewrite it exactly.** npunet lowers these and NPUC then aborts:
+7. **Done (2026-11-22) for the refusals: npunet: refuse what NPUC asserts on, or rewrite it exactly** (conv strides
+   over 2 or unequal, pooling strides larger than the kernel or with the vertical one larger, each refusal naming the
+   rewrite; pooling strides with the horizontal one larger compile in NPUC but ncpgen's streams do not model them
+   (2 probes, `$NCPGEN_WORK/zoo-evidence/probe-pool/`): refused too; the stride-3 pool on a width-1 map has one data
+   point, not refused; the rewrites are not automatic). npunet lowered these and NPUC then aborted:
    conv stride > 2 (alexnet-96: "Stride > 2 is not supported here!"), unequal conv strides (kws-cnn's 2x1), unequal
    pool strides (magic-wand's 3x1), any stride-3 pool on a width-1 map, a pool stride larger than its kernel. Two exact
    rewrites, applied by hand in the zoo, could be automatic:
@@ -216,8 +229,8 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Source**: Keras example mnist_mlp (Dense 512-512-10)
 - **Task / input**: MNIST digits as a 784 vector, 10 classes; input 1x1x784 int8 (scale 0.00392157, zero point -128)
 - **Ops**: fully_connected x3, softmax; 0.67 M weights; output 1x1x10; `--allow-none`
-- **Adaptations**: dropout removed (inference); input [1, 784] written as [1, 1, 1, 784] (the same bytes): npunet wants a 4-D NHWC input
-- **Status**: exact (lowering: ok, 3 NPU layers; NPUC: PASS, 852 KB, 8.1 s; ncpgen check: EXACT (2 s))
+- **Adaptations**: dropout removed (inference)
+- **Status**: exact (lowering: ok, 3 NPU layers; NPUC: PASS, 852 KB, 4.7 s; ncpgen check: EXACT (0 s))
 
 ### tf-cifar-cnn
 
@@ -239,18 +252,16 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Source**: MLPerf Tiny image classification ResNet-8 (resnet_v1_eembc, mlcommons/tiny)
 - **Task / input**: CIFAR-10 32x32x3, 10 classes; input 32x32x3 int8 (scale 0.0078125, zero point 0)
 - **Ops**: conv2d 3x3 x5, add x3, conv2d 3x3/2 x2, conv2d 1x1/2 x2, average_pool2d, reshape, fully_connected, softmax; 0.08 M weights; output 1x1x10; `--quant 3 --allow-none`
-- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two and every zero point 0 (quant 3): NPUC's Eltwise add aligns by shifts only and has no zero-point term; the 1x1 stride-2 shortcut convs: SAME -> VALID (the same output; npunet refuses SAME when the pad would be negative, where TFLite clamps it to 0); no activation on the second conv of each block and on the shortcuts: --allow-none (ncpgen's corrected GReLU table makes 'none' right on the NPU; NPUC's own table only for ceil(Cout/8) even)
-- **Missing for the published form**: SAME 1x1 stride-2 conv (negative pad): npunet should clamp the pad at 0 like TFLite
-- **Status**: exact (lowering: ok, 17 NPU layers; NPUC: PASS, 202 KB, 7.3 s; ncpgen check: EXACT (1 s))
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two and every zero point 0 (quant 3): NPUC's Eltwise add aligns by shifts only and has no zero-point term; no activation on the second conv of each block and on the shortcuts: --allow-none (ncpgen's corrected GReLU table makes 'none' right on the NPU; NPUC's own table only for ceil(Cout/8) even)
+- **Status**: exact (lowering: ok, 17 NPU layers; NPUC: PASS, 202 KB, 2.5 s; ncpgen check: EXACT (0 s))
 
 ### ad-autoencoder
 
 - **Source**: MLPerf Tiny anomaly detection: the DCASE 2020 task 2 baseline autoencoder (FC 640-128-128-128-128-8-128-128-128-128-640)
 - **Task / input**: 5 frames x 128 log-mel bins (a 640 vector), reconstruction; input 1x1x640 int8 (scale 0.4, zero point 10)
 - **Ops**: fully_connected x10; 0.26 M weights; output 1x1x640; `--allow-none`
-- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); input [1, 640] written as [1, 1, 1, 640] (the same bytes); the linear output layer: --allow-none
-- **Missing for the published form**: a 2-D [1, N] TFLite input: npunet refuses it (4-D NHWC wanted), [1, 1, 1, N] is the same tensor
-- **Status**: exact (lowering: ok, 10 NPU layers; NPUC: PASS, 463 KB, 8.7 s; ncpgen check: EXACT (1 s))
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); the linear output layer: --allow-none
+- **Status**: exact (lowering: ok, 10 NPU layers; NPUC: PASS, 463 KB, 4.5 s; ncpgen check: EXACT (0 s))
 
 ### kws-cnn
 
@@ -258,8 +269,8 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Task / input**: keyword spotting, 49x10 MFCC, 12 classes; input 49x10x1 int8 (scale 0.6, zero point 80)
 - **Ops**: conv2d 10x4, conv2d 10x4/2x1, reshape, fully_connected x3, softmax; 0.07 M weights; output 1x1x12; `--allow-none`
 - **Adaptations**: dropout removed (inference)
-- **Missing for the published form**: conv stride 2x1: NPUC fails ('Couldn't find a correct processing strategy for a single node' here; '_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain on a 40x7x28 probe); npunet lowers it without complaint (should refuse, or rewrite it as kws-cnn-npu when an FC reads the conv)
-- **Status**: npuc-fails (lowering: ok, 5 NPU layers; NPUC: FAIL: solutionFound && "Couldn't find a correct processing strategy for a single node"; ncpgen check: -)
+- **Missing for the published form**: conv stride 2x1: NPUC fails ('Couldn't find a correct processing strategy for a single node' here; '_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain on a 40x7x28 probe); npunet refuses it up front, naming the exact rewrite of kws-cnn-npu (an FC reads the conv); applying it automatically is not done
+- **Status**: refused (lowering: refused: l2_conv2: conv strides 2x1: NPUC wants equal strides (it asserts '_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain, or finds no processing strategy); when only a FULLY_CONNECTED reads it, the same function is the conv at stride 1 with the FC's weights on every 2-th row, zeros elsewhere (models/README.md, kws-cnn-npu); NPUC: -; ncpgen check: -)
 
 ### kws-cnn-npu
 
@@ -284,8 +295,8 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Task / input**: gestures, 128 accelerometer samples x 3 axes, 4 classes; input 128x3x1 int8 (scale 15.748, zero point 0)
 - **Ops**: conv2d 4x3, max_pool2d x2, conv2d 4x1, reshape, fully_connected x2, softmax; 0.00 M weights; output 1x1x4; `--allow-none`
 - **Adaptations**: dropout removed (inference)
-- **Missing for the published form**: max pool 3x1 stride 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) on unequal pool strides; npunet lowers it without complaint (should refuse, or rewrite it as magic-wand-npu when an FC reads the pool)
-- **Status**: npuc-fails (lowering: ok, 6 NPU layers; NPUC: FAIL: absDiff < stride && "Something went wrong during shape calculation"; ncpgen check: -)
+- **Missing for the published form**: max pool 3x1 stride 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) on unequal pool strides (vertical > horizontal); npunet refuses it up front, naming the exact rewrite of magic-wand-npu (an FC reads the pool); applying it automatically is not done
+- **Status**: refused (lowering: refused: l4_pool2: pooling strides 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) when the vertical stride is the larger; when only a FULLY_CONNECTED reads it, the same function is the pool at vertical stride 1 with the FC's weights on every 3-th row, zeros elsewhere (models/README.md, magic-wand-npu); NPUC: -; ncpgen check: -)
 
 ### magic-wand-npu
 
@@ -300,16 +311,16 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Source**: TensorFlow Lite Micro hello_world sine model (FC 16, FC 16, FC 1)
 - **Task / input**: sine regression, 1 input; input 1x1x1 int8 (scale 0.0246399, zero point -128)
 - **Ops**: fully_connected x3; 0.00 M weights; output 1x1x1; `--allow-none`
-- **Adaptations**: input [1, 1] written as [1, 1, 1, 1]; the linear output: --allow-none
-- **Status**: exact (lowering: ok, 3 NPU layers; NPUC: PASS, 9 KB, 2.9 s; ncpgen check: EXACT (0 s))
+- **Adaptations**: the linear output: --allow-none
+- **Status**: exact (lowering: ok, 3 NPU layers; NPUC: PASS, 9 KB, 1.6 s; ncpgen check: EXACT (0 s))
 
 ### squeezenet11-96
 
 - **Source**: SqueezeNet 1.1 (Iandola et al. 2016; the v1.1 reference: conv1 3x3/2 64, fire2-9, conv10, global average pool)
 - **Task / input**: 96x96x3 images, 10 classes; input 96x96x3 int8 (scale 0.00392157, zero point -128)
-- **Ops**: conv2d 3x3/2, max_pool2d x3, conv2d 1x1 x17, conv2d 3x3 x8, concat x8, average_pool2d, reshape, softmax; 0.72 M weights; output 1x1x10; `--quant 1`
-- **Adaptations**: dropout removed (inference); the two expand convs of a fire module share one output quantisation (NPUC's concat copies bytes; TFLite's converter does the same for CONCATENATION); 1000 ImageNet classes -> 10; global average pool as AVERAGE_POOL_2D 5x5 (a Keras GlobalAveragePooling2D converts to MEAN, which npunet does not take)
-- **Status**: exact (lowering: ok, 38 NPU layers; NPUC: PASS, 1162 KB, 76.2 s; ncpgen check: EXACT (3 s))
+- **Ops**: conv2d 3x3/2, max_pool2d x3, conv2d 1x1 x17, conv2d 3x3 x8, concat x8, mean, softmax; 0.72 M weights; output 1x1x10; `--quant 1`
+- **Adaptations**: dropout removed (inference); the two expand convs of a fire module share one output quantisation (NPUC's concat copies bytes; TFLite's converter does the same for CONCATENATION); 1000 ImageNet classes -> 10
+- **Status**: exact (lowering: ok, 38 NPU layers; NPUC: PASS, 1162 KB, 5.9 s; ncpgen check: EXACT (1 s))
 
 ### alexnet-96
 
@@ -317,8 +328,8 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Task / input**: 96x96x3 images (STL-10), 10 classes; input 96x96x3 int8 (scale 0.00392157, zero point -128)
 - **Ops**: conv2d 11x11/4, max_pool2d x3, conv2d 5x5, conv2d 3x3 x3, reshape, fully_connected x3, softmax; 3.79 M weights; output 1x1x10; `--allow-none`
 - **Adaptations**: dropout removed (inference); LRN dropped (torchvision's AlexNet has none); FC 4096-4096 -> 1024-1024 for 10 classes (STL-10); explicit padding -> TFLite VALID/SAME (no PAD op)
-- **Missing for the published form**: conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::IterateOverAllValues); npunet lowers it without complaint (should refuse, or rewrite it as below)
-- **Status**: npuc-fails (lowering: ok, 11 NPU layers; NPUC: FAIL: "Stride > 2 is not supported here!" && (ifmOrder.getSlotSize() <= 4); ncpgen check: -)
+- **Missing for the published form**: conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::IterateOverAllValues); npunet refuses it up front, naming the exact rewrite of alexnet-96-npu; applying it automatically is not done
+- **Status**: refused (lowering: refused: l1_conv1: conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::IterateOverAllValues); the same output: the conv at stride 2, then a 1x1 stride-2 VALID conv with identity weights and multiplier 1 keeping every other row and column (models/README.md, alexnet-96-npu); NPUC: -; ncpgen check: -)
 
 ### alexnet-96-npu
 
@@ -365,18 +376,17 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 
 - **Source**: MobileNet v2 0.35 (Sandler et al. 2018; keras.applications MobileNetV2 alpha 0.35 at 96x96: 17 inverted residual blocks, 8..112 channels, conv 1280, 1000 classes)
 - **Task / input**: 96x96x3 images, 1000 classes; input 96x96x3 int8 (scale 0.0078125, zero point 0)
-- **Ops**: conv2d 3x3/2, depthwise 3x3 x17, conv2d 1x1 x34, add x10, average_pool2d, reshape, fully_connected, softmax; 1.66 M weights; output 1x1x1000; `--quant 3 --allow-none`
-- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); global average pool as AVERAGE_POOL_2D 3x3 (Keras writes MEAN, which npunet does not take); the linear bottlenecks and the classifier: --allow-none
-- **Missing for the published form**: MEAN (Keras' GlobalAveragePooling2D) is not taken by npunet's TFLite reader: lower MEAN over H, W like a global AVERAGE_POOL_2D
-- **Status**: exact (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 67.1 s; ncpgen check: EXACT (4 s))
+- **Ops**: conv2d 3x3/2, depthwise 3x3 x17, conv2d 1x1 x34, add x10, mean, fully_connected, softmax; 1.66 M weights; output 1x1x1000; `--quant 3 --allow-none`
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); the linear bottlenecks and the classifier: --allow-none
+- **Status**: exact (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 23.5 s; ncpgen check: EXACT (9 s))
 
 ### mobilenet-v2-035-dense
 
 - **Source**: MobileNet v2 0.35 (Sandler et al. 2018; keras.applications MobileNetV2 alpha 0.35 at 96x96: 17 inverted residual blocks, 8..112 channels, conv 1280, 1000 classes)
 - **Task / input**: 96x96x3 images, 1000 classes; input 96x96x3 int8 (scale 0.0078125, zero point 0)
-- **Ops**: conv2d 3x3/2 x5, conv2d 3x3 x13, conv2d 1x1 x34, add x10, average_pool2d, reshape, fully_connected, softmax; 6.74 M weights; output 1x1x1000; `--quant 3 --allow-none`
-- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); global average pool as AVERAGE_POOL_2D 3x3 (Keras writes MEAN, which npunet does not take); the linear bottlenecks and the classifier: --allow-none; each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function; 1.66 M -> 6.74 M weights counted dense, but NPUC's weight format skips the zeros with bitmaps)
-- **Status**: exact (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 211.2 s; ncpgen check: EXACT (4 s))
+- **Ops**: conv2d 3x3/2 x5, conv2d 3x3 x13, conv2d 1x1 x34, add x10, mean, fully_connected, softmax; 6.74 M weights; output 1x1x1000; `--quant 3 --allow-none`
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); the linear bottlenecks and the classifier: --allow-none; each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function; 1.66 M -> 6.74 M weights counted dense, but NPUC's weight format skips the zeros with bitmaps)
+- **Status**: exact (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 24.4 s; ncpgen check: EXACT (8 s))
 
 ### ds-cnn
 

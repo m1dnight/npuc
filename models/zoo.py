@@ -108,8 +108,10 @@ class Net:
         self.family, self.quant, self.pow2, self.dense = family, quant, pow2, dense
         self.shapes_only, self.desc = shapes_only, desc
         rms = math.sqrt(sum((v - zp) ** 2 for v in range(-128, 128)) / 256)  # a uniform random input, centred
-        self.T = {"input": {"hwc": list(hwc), "scale": f32(scale), "zp": zp, "rms": rms, "nonneg": False}}
-        self.inp = {"name": "input", "shape": [1] + list(hwc), "dtype": "int8", "scale": f32(scale), "zero_point": zp}
+        shape = [1] + list(hwc)       # (N,): a [1, N] input, as Keras writes a vector model's (= [1, 1, 1, N])
+        hwc = [1, 1] + list(hwc) if len(hwc) == 1 else list(hwc)
+        self.T = {"input": {"hwc": hwc, "scale": f32(scale), "zp": zp, "rms": rms, "nonneg": False}}
+        self.inp = {"name": "input", "shape": shape, "dtype": "int8", "scale": f32(scale), "zero_point": zp}
         self.layers, self.cur, self.cnt = [], "input", {}
         self.none = False  # a conv/FC without activation (npunet: --allow-none)
         self.nweights = 0
@@ -259,6 +261,15 @@ class Net:
         H, W, _ = self.T[inp or self.cur]["hwc"]
         return self.pool("avg", (H, W), (H, W), "valid", inp, name)
 
+    def mean(self, name=None):
+        """a global average pool as Keras' GlobalAveragePooling2D converts: MEAN over H and W, keep_dims false (an
+        [1, C] output), the input's quantisation"""
+        x = self.T[self.cur]
+        name = self._name("pool", name)
+        L = {"op": "mean", "name": name, "axis": [1, 2], "keep_dims": False,
+             "output": {"scale": x["scale"], "zero_point": x["zp"]}}
+        return self._emit(L, dict(x, hwc=[1, 1, x["hwc"][2]], rms=x["rms"] * 0.85), None)
+
     def gap_conv(self, name="gap"):
         """a global average pool written as the conv npunet lowers it to (identity weights, scale 1/(H*W), bias 0,
         the input's quantisation, ReLU when the input is already >= its zero point)"""
@@ -383,7 +394,7 @@ def _keras_mnist(n):
 
 
 @model("mnist-mlp", "mnist-mlp", "Keras example mnist_mlp (Dense 512-512-10)", "MNIST digits as a 784 vector, 10 classes",
-       adapt=COMMON[1:] + ["input [1, 784] written as [1, 1, 1, 784] (the same bytes): npunet wants a 4-D NHWC input"])
+       adapt=COMMON[1:])
 def _mnist_mlp(n):
     n.fc(512)
     n.fc(512)
@@ -422,12 +433,9 @@ def _vgg_cifar(n):
        "CIFAR-10 32x32x3, 10 classes",
        adapt=COMMON[:1] + ["every activation scale a power of two and every zero point 0 (quant 3): NPUC's Eltwise add "
                            "aligns by shifts only and has no zero-point term",
-                           "the 1x1 stride-2 shortcut convs: SAME -> VALID (the same output; npunet refuses SAME when the "
-                           "pad would be negative, where TFLite clamps it to 0)",
                            "no activation on the second conv of each block and on the shortcuts: --allow-none (ncpgen's "
                            "corrected GReLU table makes 'none' right on the NPU; NPUC's own table only for "
-                           "ceil(Cout/8) even)"],
-       gaps=["SAME 1x1 stride-2 conv (negative pad): npunet should clamp the pad at 0 like TFLite"])
+                           "ceil(Cout/8) even)"])
 def _resnet8(n):
     x = n.conv(16, 3)
     y = n.conv(16, 3, inp=x)
@@ -436,7 +444,7 @@ def _resnet8(n):
     for c in (32, 64):
         y = n.conv(c, 3, s=2, inp=x)
         y = n.conv(c, 3, act="none", inp=y)
-        sc = n.conv(c, 1, s=2, pad="valid", act="none", inp=x)
+        sc = n.conv(c, 1, s=2, pad="same", act="none", inp=x)   # TFLite clamps the negative pad: VALID
         x = n.add(sc, y, act="relu")
     n.gap(inp=x)
     n.flatten()
@@ -446,9 +454,7 @@ def _resnet8(n):
 
 @model("ad-autoencoder", "ad-autoencoder", "MLPerf Tiny anomaly detection: the DCASE 2020 task 2 baseline autoencoder "
        "(FC 640-128-128-128-128-8-128-128-128-128-640)", "5 frames x 128 log-mel bins (a 640 vector), reconstruction",
-       adapt=COMMON[:1] + ["input [1, 640] written as [1, 1, 1, 640] (the same bytes)",
-                           "the linear output layer: --allow-none"],
-       gaps=["a 2-D [1, N] TFLite input: npunet refuses it (4-D NHWC wanted), [1, 1, 1, N] is the same tensor"])
+       adapt=COMMON[:1] + ["the linear output layer: --allow-none"])
 def _ad(n):
     for u in (128, 128, 128, 128, 8, 128, 128, 128, 128):
         n.fc(u)
@@ -476,9 +482,10 @@ KWS_SRC = ("Hello Edge CNN (Zhang et al. 2017, 'Hello Edge: Keyword Spotting on 
 
 @model("kws-cnn", "kws-cnn", KWS_SRC, "keyword spotting, 49x10 MFCC, 12 classes", adapt=COMMON[1:],
        gaps=["conv stride 2x1: NPUC fails ('Couldn't find a correct processing strategy for a single node' here; "
-             "'_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain on a 40x7x28 probe); npunet lowers it "
-             "without complaint (should refuse, or rewrite it as kws-cnn-npu when an FC reads the conv)"],
-       expect="npuc-fails")
+             "'_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain on a 40x7x28 probe); npunet refuses it "
+             "up front, naming the exact rewrite of kws-cnn-npu (an FC reads the conv); applying it automatically is "
+             "not done"],
+       expect="refused")
 def _kws(n):
     _kws_cnn(n, False)
 
@@ -524,8 +531,8 @@ WAND_SRC = "TensorFlow Lite Micro magic_wand gesture CNN (conv 8 4x3, max pool 3
 
 @model("magic-wand", "magic-wand", WAND_SRC, "gestures, 128 accelerometer samples x 3 axes, 4 classes", adapt=COMMON[1:],
        gaps=["max pool 3x1 stride 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) on unequal pool "
-             "strides; npunet lowers it without complaint (should refuse, or rewrite it as magic-wand-npu when an FC "
-             "reads the pool)"], expect="npuc-fails")
+             "strides (vertical > horizontal); npunet refuses it up front, naming the exact rewrite of magic-wand-npu "
+             "(an FC reads the pool); applying it automatically is not done"], expect="refused")
 def _wand_pub(n):
     _wand(n, False)
 
@@ -541,7 +548,7 @@ def _wand_npu(n):
 
 
 @model("hello-world", "hello-world", "TensorFlow Lite Micro hello_world sine model (FC 16, FC 16, FC 1)", "sine regression, 1 input",
-       adapt=["input [1, 1] written as [1, 1, 1, 1]", "the linear output: --allow-none"])
+       adapt=["the linear output: --allow-none"])
 def _hello(n):
     n.fc(16)
     n.fc(16)
@@ -560,8 +567,7 @@ def _fire(n, s, e):
        "fire2-9, conv10, global average pool)", "96x96x3 images, 10 classes",
        adapt=COMMON[1:] + ["the two expand convs of a fire module share one output quantisation (NPUC's concat copies "
                            "bytes; TFLite's converter does the same for CONCATENATION)",
-                           "1000 ImageNet classes -> 10", "global average pool as AVERAGE_POOL_2D 5x5 (a Keras "
-                           "GlobalAveragePooling2D converts to MEAN, which npunet does not take)"])
+                           "1000 ImageNet classes -> 10"])
 def _squeeze(n):
     n.conv(64, 3, s=2, pad="valid")
     n.pool("max", 3, 2)
@@ -576,8 +582,7 @@ def _squeeze(n):
     _fire(n, 64, 256)
     _fire(n, 64, 256)
     n.conv(10, 1, name="classifier")
-    n.gap()
-    n.flatten()
+    n.mean()
     n.softmax()
 
 
@@ -609,8 +614,9 @@ ALEX_AD = COMMON[1:] + ["LRN dropped (torchvision's AlexNet has none)", "FC 4096
 
 @model("alexnet-96", "alexnet-96", ALEX_SRC, "96x96x3 images (STL-10), 10 classes", adapt=ALEX_AD,
        gaps=["conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::"
-             "IterateOverAllValues); npunet lowers it without complaint (should refuse, or rewrite it as below)"],
-       expect="npuc-fails")
+             "IterateOverAllValues); npunet refuses it up front, naming the exact rewrite of alexnet-96-npu; applying it "
+             "automatically is not done"],
+       expect="refused")
 def _alex_pub(n):
     _alex(n, False)
 
@@ -701,8 +707,7 @@ def _mnv2(n):
                 n.add(x, y)
             cin = c
     n.conv(1280, 1, act="relu6")
-    n.gap()
-    n.flatten()
+    n.mean()
     n.fc(1000, act="none")
     n.softmax()
 
@@ -711,13 +716,10 @@ MNV2_SRC = ("MobileNet v2 0.35 (Sandler et al. 2018; keras.applications MobileNe
             "residual blocks, 8..112 channels, conv 1280, 1000 classes)")
 MNV2_AD = COMMON[:1] + ["every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 "
                         "residual ADDs", "ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation)",
-                        "global average pool as AVERAGE_POOL_2D 3x3 (Keras writes MEAN, which npunet does not take)",
                         "the linear bottlenecks and the classifier: --allow-none"]
 
 
-@model("mobilenet-v2-035", "mobilenet-v2-035", MNV2_SRC, "96x96x3 images, 1000 classes", adapt=MNV2_AD,
-       gaps=["MEAN (Keras' GlobalAveragePooling2D) is not taken by npunet's TFLite reader: lower MEAN over H, W like a "
-             "global AVERAGE_POOL_2D"])
+@model("mobilenet-v2-035", "mobilenet-v2-035", MNV2_SRC, "96x96x3 images, 1000 classes", adapt=MNV2_AD)
 def _mnv2_pub(n):
     _mnv2(n)
 
@@ -766,11 +768,11 @@ def _dscnn_dense(n):
 # the input of each family: shape, quantisation (scale, zero point), quant mode, power-of-two activations
 INPUTS = {
     "lenet5": ((28, 28, 1), 1 / 255, -128, 1, False), "keras-mnist-cnn": ((28, 28, 1), 1 / 255, -128, 1, False),
-    "mnist-mlp": ((1, 1, 784), 1 / 255, -128, 1, False), "tf-cifar-cnn": ((32, 32, 3), 1 / 255, -128, 1, False),
+    "mnist-mlp": ((784,), 1 / 255, -128, 1, False), "tf-cifar-cnn": ((32, 32, 3), 1 / 255, -128, 1, False),
     "vgg-cifar": ((32, 32, 3), 1 / 255, -128, 1, False), "resnet8": ((32, 32, 3), 1 / 128, 0, 3, True),
-    "ad-autoencoder": ((1, 1, 640), 0.4, 10, 1, False), "kws-cnn": ((49, 10, 1), 0.6, 80, 1, False),
+    "ad-autoencoder": ((640,), 0.4, 10, 1, False), "kws-cnn": ((49, 10, 1), 0.6, 80, 1, False),
     "micro-speech": ((49, 40, 1), 26 / 255, -128, 1, False), "magic-wand": ((128, 3, 1), 2000 / 127, 0, 1, False),
-    "hello-world": ((1, 1, 1), 2 * math.pi / 255, -128, 1, False),
+    "hello-world": ((1,), 2 * math.pi / 255, -128, 1, False),
     "squeezenet11-96": ((96, 96, 3), 1 / 255, -128, 1, False), "alexnet-96": ((96, 96, 3), 1 / 255, -128, 1, False),
     "vgg11-64": ((64, 64, 3), 1 / 255, -128, 1, False), "yolov2-tiny-128": ((128, 128, 3), 1 / 255, -128, 1, False),
     "mobilenet-v1-025": ((96, 96, 1), 1 / 255, -128, 1, False), "mobilenet-v2-035": ((96, 96, 3), 1 / 128, 0, 3, True),

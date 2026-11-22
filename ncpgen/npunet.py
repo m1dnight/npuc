@@ -30,8 +30,12 @@ division rounded half away, at or above the type's maximum, as for TFLite's own 
 MAX_POOL_2D, AVERAGE_POOL_2D,
 FULLY_CONNECTED (lowered here to a CONV_2D whose kernel covers its input), DEPTHWISE_CONV_2D (depth multiplier 1:
 lowered to the CONV_2D whose kernel is the dense C x C block diagonal, the form NPUC itself compiles on the device
-path, docs/format/depthwise.md; the CPU reference is that conv's). RESHAPE before a FULLY_CONNECTED or at the
-end, and SOFTMAX at the end, run on the host's CPU. Graph ops through the harness's "npuc-net 2" layers
+path, docs/format/depthwise.md; the CPU reference is that conv's), MEAN over H and W (a global AVERAGE_POOL_2D: the
+NFU pooling, or as a conv when that cannot take it). RESHAPE before a FULLY_CONNECTED or at the end, and SOFTMAX at
+the end, run on the host's CPU. The input is NHWC [1, H, W, C] or [1, N] (= [1, 1, 1, N]). SAME padding whose pad
+would be negative (a stride larger than the kernel) is VALID, as TFLite clamps it. Refused up front where NPUC asserts
+(V): conv strides over 2 or unequal, pooling strides over 3, larger than the kernel, or with the vertical one larger;
+a pooling with a larger horizontal stride compiles in NPUC but is not modelled by ncpgen's streams (refused too). Graph ops through the harness's "npuc-net 2" layers
 (docs/harness-ops.md; NPUC compiles them, nothing of them has run on the NPU yet):
   ADD -> eltwise Add (--quant 3 only, every scale 2^-n, no broadcasting; a fused RELU -> a relu layer after it);
   CONCATENATION -> concat (channels only, every input already in the output's quantisation, not the network input);
@@ -268,7 +272,8 @@ class FWriter:
 # ---- TFLite: the subset we read ----------------------------------------------------------------------------------
 OPS = {0: "ADD", 1: "AVERAGE_POOL_2D", 2: "CONCATENATION", 3: "CONV_2D", 4: "DEPTHWISE_CONV_2D", 6: "DEQUANTIZE",
        9: "FULLY_CONNECTED", 14: "LOGISTIC", 17: "MAX_POOL_2D", 18: "MUL", 19: "RELU", 21: "RELU6", 22: "RESHAPE",
-       25: "SOFTMAX", 114: "QUANTIZE"}
+       25: "SOFTMAX", 28: "TANH", 34: "PAD", 40: "MEAN", 41: "SUB", 43: "SQUEEZE", 98: "LEAKY_RELU", 114: "QUANTIZE",
+       117: "HARD_SWISH"}
 OPCODE = {v: k for k, v in OPS.items()}
 TTYPES = {0: "float32", 2: "int32", 3: "uint8", 9: "int8", 7: "int16", 4: "int64"}
 TTYPE = {v: k for k, v in TTYPES.items()}
@@ -355,6 +360,8 @@ def _read_tflite(data):
                 d["opt"] = {"act": ACTS.get(opt.scalar(0, "b", 0), "?")}
             elif name == "CONCATENATION" and otype == 10:
                 d["opt"] = {"axis": opt.scalar(0, "i", 0), "act": ACTS.get(opt.scalar(1, "b", 0), "?")}
+            elif name == "MEAN" and otype == 27:
+                d["opt"] = {"keep_dims": bool(opt.scalar(0, "B", 0))}
         ops.append(d)
     return {"tensors": tensors, "inputs": sg.vec_scalars(1, "i"), "outputs": sg.vec_scalars(2, "i"), "ops": ops,
             "description": m.string(3)}
@@ -391,8 +398,8 @@ def tflite_to_graph(tf, src):
     tin = T[tf["inputs"][0]]
     if tin["dtype"] not in ("int8", "uint8"):
         raise Refused("input %r is %s (a quantized int8 or uint8 input is needed; float models are not supported)" % (tin["name"], tin["dtype"]))
-    if len(tin["shape"]) != 4 or tin["shape"][0] != 1:
-        raise Refused("input shape %s (NHWC with batch 1 wanted)" % tin["shape"])
+    if len(tin["shape"]) not in (2, 4) or tin["shape"][0] != 1:
+        raise Refused("input shape %s (NHWC with batch 1, or [1, N], wanted)" % tin["shape"])
     s, z = _q1(tin, "input")
     g = {"format": "npu-net/1", "name": os.path.splitext(os.path.basename(src))[0], "source": os.path.basename(src),
          "input": {"name": tin["name"], "id": "t%d" % tf["inputs"][0], "shape": tin["shape"], "dtype": tin["dtype"],
@@ -463,9 +470,16 @@ def tflite_to_graph(tf, src):
         elif op in ("RELU", "RELU6"):
             s_, z_ = _q1(out, op + " output")
             L = {"op": op.lower(), "name": name, "output": {"scale": s_, "zero_point": z_}}
+        elif op == "MEAN":
+            ax = T[o["inputs"][1]] if len(o["inputs"]) > 1 else None
+            if ax is None or ax["dtype"] != "int32" or not ax["data"]:
+                raise Refused("MEAN %r: its axes are not a constant int32 tensor" % name)
+            s_, z_ = _q1(out, "MEAN output")
+            L = {"op": "mean", "name": name, "axis": _ints(ax["data"], "int32"),
+                 "keep_dims": o["opt"].get("keep_dims", False), "output": {"scale": s_, "zero_point": z_}}
         else:
             raise Refused("op %s (%r) is not supported: the NPU path takes CONV_2D, DEPTHWISE_CONV_2D, "
-                          "MAX/AVERAGE_POOL_2D, FULLY_CONNECTED, ADD, CONCATENATION and RELU; RESHAPE and SOFTMAX run on the CPU at the end" % (op, name))
+                          "MAX/AVERAGE_POOL_2D, MEAN over H and W, FULLY_CONNECTED, ADD, CONCATENATION and RELU; RESHAPE and SOFTMAX run on the CPU at the end" % (op, name))
         L["id"] = "t%d" % o["outputs"][0]
         L["inputs"] = ["t%d" % t for t in data]
         g["layers"].append(L)
@@ -490,15 +504,34 @@ def _u8zp(dtype, zp):
 
 
 def _out_shape(h, k, s, padding):
-    """TFLite's (= NPUC's, V: NNConvLayer::computeOutputShape) output size and pads (top/left, bottom/right)"""
+    """TFLite's (= NPUC's, V: NNConvLayer::computeOutputShape) output size and pads (top/left, bottom/right); SAME's
+    total pad clamped at 0, as TFLite's ComputePaddingWithOffset does (_padding hands NPUC VALID for those)"""
     if padding == "valid":
         o = (h - k) // s + 1
         return o, 0, 0
     o = (h + s - 1) // s
-    tot = (o - 1) * s + k - h
-    if tot < 0:
-        raise Refused("SAME padding with stride %d > kernel %d leaves a negative pad (NPUC would compute %d)" % (s, k, tot))
+    tot = max(0, (o - 1) * s + k - h)
     return o, tot // 2, tot - tot // 2
+
+
+def _padding(name, what, H, W, kh, kw, sh, sw, pad, low):
+    """The padding mode NPUC is given. SAME whose total pad (out - 1) s + k - n would be negative (a stride larger than
+    the kernel) is VALID in TFLite: it clamps the pad at 0 (ComputePaddingWithOffset), and then ceil(n / s) =
+    (n - k) // s + 1 and the taps are VALID's. So: VALID when every dimension's pad is negative or 0 (with a warning),
+    refused when one is negative and the other positive (NPUC takes one mode for both dimensions)."""
+    if pad != "same":
+        return pad
+    th = ((H + sh - 1) // sh - 1) * sh + kh - H
+    tw = ((W + sw - 1) // sw - 1) * sw + kw - W
+    if min(th, tw) >= 0:
+        return pad
+    if max(th, tw) > 0:
+        raise Refused("%s: %s SAME %dx%d stride %dx%d on %dx%d: the pad is negative in one dimension (TFLite clamps it "
+                      "to 0: VALID there) and positive in the other; NPUC takes one padding mode for both dimensions"
+                      % (name, what, kh, kw, sh, sw, H, W))
+    low["warnings"].append("%s: %s SAME %dx%d stride %dx%d on %dx%d: the pad would be negative and TFLite clamps it to 0, "
+                           "the same output as VALID: lowered as VALID" % (name, what, kh, kw, sh, sw, H, W))
+    return "valid"
 
 
 def _clean(s):
@@ -602,13 +635,27 @@ def _nonneg(low, blob):
     return False
 
 
+def _mean_as_pool(L, cur, name):
+    """MEAN over H and W (Keras' GlobalAveragePooling2D as TFLite writes it) -> the global AVERAGE_POOL_2D it computes
+    (kernel = stride = the map, VALID, its own output quantisation), lowered like one; other axes refused"""
+    ax = sorted(set(int(a) % 4 for a in L.get("axis", [])))
+    if ax != [1, 2]:
+        raise Refused("mean %s over axes %s: only the mean over H and W (axes 1 and 2 of NHWC: a global average pool) is "
+                      "lowered" % (name, L.get("axis")))
+    _, H, W = cur["chw"]
+    return {"op": "average_pool2d", "name": L.get("name", name), "pool": [H, W], "strides": [H, W], "padding": "valid",
+            "activation": "none", "output": L.get("output")}
+
+
 def _global_avg_as_conv(L, cur, dtype, low):
-    """A global AVERAGE_POOL_2D (VALID, its kernel the whole map) as a conv NPUC accepts: NPUC's pooling takes strides
-    up to 3 only (V: 4 refused, 8 aborts), but a VALID conv with kernel up to 14x14 compiles (V, the oracle: 5..14 on
-    16 channels; 16x16 trips "(bmSize & 0x80) == 0"). Identity weights (w[o][o] = 1), bias 0, weight scale
-    1/(kh*kw): acc = the sum, NPUC's multiplier 1/(kh*kw) (exact when kh*kw is a power of two). ReLU when the input
-    is already >= its zero point (a no-op there, and it avoids NPUC's 'no activation' table), else no activation.
-    None when the pool is not of that kind (the caller lowers it as a pool, or refuses it)."""
+    """A global AVERAGE_POOL_2D (VALID, its kernel the whole map) as a conv NPUC accepts, when the NFU pooling cannot
+    take it: a stride over 3 (V: 4 refused, 8 aborts), unequal strides (NPUC asserts on a larger vertical one), or an
+    output quantisation other than the input's (the pooling keeps it). A VALID conv with kernel up to 14x14 compiles
+    (V, the oracle: 5..14 on 16 channels; 16x16 trips "(bmSize & 0x80) == 0"). Identity weights (w[o][o] = 1), bias 0,
+    weight scale 1/(kh*kw): acc = the sum, NPUC's multiplier in/(out kh kw) (1/(kh*kw), exact when it is a power of
+    two, for the same quantisation). ReLU when the input is already >= its zero point (a no-op there: the mean is >= 0,
+    and it avoids NPUC's 'no activation' table), else no activation. None when the pool is not of that kind (the caller
+    lowers it as a pool, or refuses it)."""
     kh, kw = L["pool"]
     C, H, W = cur["chw"]
     sh, sw = L.get("strides", [kh, kw])
@@ -616,7 +663,8 @@ def _global_avg_as_conv(L, cur, dtype, low):
     zpm = cur["zp"] - 128 if dtype == "int8" else cur["zp"]
     same_q = (outq.get("scale") in (None, cur["scale"]) or f32(float(outq["scale"])) == cur["scale"]) and \
         outq.get("zero_point") in (None, zpm)
-    if not ((kh, kw) == (H, W) and L.get("padding", "valid").lower() == "valid" and max(sh, sw) > 3 and same_q):
+    if not ((kh, kw) == (H, W) and L.get("padding", "valid").lower() == "valid" and
+            (max(sh, sw) > 3 or sh != sw or not same_q)):
         return None
     if max(kh, kw) > 14:
         raise Refused("%s: a global average pool over %dx%d: NPUC's pooling takes strides up to 3, and as a conv its "
@@ -629,13 +677,17 @@ def _global_avg_as_conv(L, cur, dtype, low):
     data = [1 if c == o else 0 for o in range(C) for i in range(kh) for j in range(kw) for c in range(C)]
     low["warnings"].append("%s: global average pool %dx%d lowered to a %dx%d VALID conv with identity weights and "
                            "multiplier 1/%d (%s; activation %s)" % (L.get("name", "pool"), kh, kw, kh, kw, kh * kw,
-                                                                    "exact" if kh * kw & (kh * kw - 1) == 0 else
-                                                                    "NPUC's slope approximates it", act))
+                                                                    ("exact" if kh * kw & (kh * kw - 1) == 0 else
+                                                                     "NPUC's slope approximates it") if same_q else
+                                                                    "times in/out scale: the output requantised",
+                                                                    act))
     low["unproven"].append("%s: global average pool as a conv (not run on the NPU)" % L.get("name", "pool"))
+    out = {"scale": cur["scale"], "zero_point": zpm} if same_q else \
+        {"scale": float(outq["scale"]), "zero_point": int(outq["zero_point"])}
     return {"op": "conv2d", "name": L.get("name", "gap"), "filters": C, "kernel": [kh, kw], "strides": [1, 1],
             "padding": "valid", "activation": act,
             "weights": {"dtype": "int8", "layout": "OHWI", "scale": 1.0 / (kh * kw), "zero_point": 0, "data": data},
-            "bias": [0] * C, "output": {"scale": cur["scale"], "zero_point": zpm}}
+            "bias": [0] * C, "output": out}
 
 
 class _Lowering:
@@ -664,6 +716,24 @@ class _Lowering:
         return {"name": name, "chw": list(src["chw"]), "scale": src["scale"], "zp": src["zp"]}
 
 
+def _conv_strides(name, kh, kw, sh, sw, pad):
+    """refuse the conv strides NPUC asserts on, with the exact rewrite when there is one (models/README.md)"""
+    if sh != sw:
+        # V: kws-cnn (10x4 at 2x1), the weights sweep's 3x3 at 1x2 and 2x1: NPUC fails on each
+        raise Refused("%s: conv strides %dx%d: NPUC wants equal strides (it asserts '_strideWidth == _strideHeight' in "
+                      "PNodeConvolution::toAtomicChain, or finds no processing strategy); when only a FULLY_CONNECTED "
+                      "reads it, the same function is the conv at stride 1 with the FC's weights on one %s in %d, "
+                      "zeros elsewhere (models/README.md, kws-cnn-npu)" % (name, sh, sw, "row" if sh > sw else "column",
+                                                                         max(sh, sw)))
+    if sh > 2:
+        # V: strides 3 and 4 (the weights sweep, alexnet-96)
+        raise Refused("%s: conv stride %d: NPUC asserts 'Stride > 2 is not supported here!' "
+                      "(NPULIRKernelMemoryData::IterateOverAllValues); %s" % (name, sh,
+                          "the same output: the conv at stride 2, then a 1x1 stride-2 VALID conv with identity weights "
+                          "and multiplier 1 keeping every other row and column (models/README.md, alexnet-96-npu)"
+                          if sh == 4 and pad == "valid" else "no exact rewrite is known for this stride and padding"))
+
+
 # lower()'s steps, one per op: each appends its layer(s) to lw.low and returns the blob of its output
 def _lower_conv(lw, idx, L, op, name, key, ins, srcs):
     """CONV_2D, or FULLY_CONNECTED as a conv whose kernel covers its input: OIHW uint8 weights with one scale and
@@ -683,6 +753,8 @@ def _lower_conv(lw, idx, L, op, name, key, ins, srcs):
         pad = L.get("padding", "same").lower()
         if wt.get("layout", "OHWI") != "OHWI":
             raise Refused("conv %s: weights layout %s (OHWI wanted)" % (name, wt.get("layout")))
+        _conv_strides(name, kh, kw, sh, sw, pad)
+        pad = _padding(name, "conv", Hc, Wc, kh, kw, sh, sw, pad, lw.low)
         if len(data) != cout * kh * kw * Cc:
             raise Refused("conv %s: %d weights for %d x %d x %d x %d" % (name, len(data), cout, kh, kw, Cc))
         # OHWI -> OIHW
@@ -830,7 +902,21 @@ def _lower_pool(lw, idx, L, op, name, key, ins, srcs):
         # -> assertion "IFM.valid()" in PolicyMaker; kernels up to 5 with strides 1..3 compile
         raise Refused("%s: pooling stride %dx%d: NPUC's NFU pooling takes a stride of at most 3 (it refuses 4, "
                       "aborts on 8); a global average pool can be split into pools of stride <= 3" % (name, sh, sw))
-    pad = L.get("padding", "valid").lower()
+    if sh > kh or sw > kw:
+        # V: 28 frame-sweep variants (2x2 stride 3) and a probe, every one refused by NPUC
+        raise Refused("%s: pooling stride %dx%d larger than its kernel %dx%d: NPUC's ncp_nfu_pooling refuses it ('The "
+                      "stride value should be equal or less than the size of kernel')" % (name, sh, sw, kh, kw))
+    if sh > sw:
+        # V: strides 2x1 (VALID, SAME), 3x1, 3x2 on 16x16 (probes, work/zoo-evidence/probe-pool) and magic-wand's 3x1
+        raise Refused("%s: pooling strides %dx%d: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) when the "
+                      "vertical stride is the larger; when only a FULLY_CONNECTED reads it, the same function is the pool "
+                      "at vertical stride 1 with the FC's weights on one row in %d, zeros elsewhere (models/README.md, "
+                      "magic-wand-npu)" % (name, sh, sw, sh))
+    if sh < sw:
+        # V: 2x2 and 3x3 at strides 1x2 compile in NPUC, but ncpgen's streams differ on both (probes pb, pe)
+        raise Refused("%s: pooling strides %dx%d: NPUC compiles it, but ncpgen's stream part does not model unequal "
+                      "pooling strides (its NCPs differ from NPUC's): not lowered" % (name, sh, sw))
+    pad = _padding(name, "pooling", Hc, Wc, kh, kw, sh, sw, L.get("padding", "valid").lower(), lw.low)
     act = L.get("activation", "none")
     outq = L.get("output", {"scale": None, "zero_point": None})
     os_ = f32(float(outq["scale"])) if outq.get("scale") is not None else cur["scale"]
@@ -1004,9 +1090,11 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
         raise Refused("not an npu-net/1 graph (format %r)" % g.get("format"))
     io = g["input"]
     dtype = io["dtype"]
-    shp = io["shape"]
+    shp = list(io["shape"])
+    if len(shp) == 2 and shp[0] == 1:
+        shp = [1, 1, 1, shp[1]]      # a [1, N] input (an FC model's, as Keras writes it): the same bytes as [1, 1, 1, N]
     if len(shp) != 4 or shp[0] != 1:
-        raise Refused("input shape %s: [1, H, W, C] wanted" % shp)
+        raise Refused("input shape %s: [1, H, W, C] or [1, N] wanted" % io["shape"])
     H, W, C = shp[1], shp[2], shp[3]
     zp_in = _u8zp(dtype, int(io["zero_point"]))
     sc = f32(float(io["scale"]))
@@ -1016,6 +1104,8 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
            "layers": [], "cpu_tail": [], "warnings": [], "unproven": []}
     ents, inkey, fwarn, show = _resolve(g)
     low["warnings"] += fwarn
+    if list(io["shape"]) != shp:
+        low["input"]["shape"] = list(io["shape"])
     lw = _Lowering(low, dtype, quant, fold, allow_none, ents, show)
     lw.blobs[inkey] = {"name": "data0", "chw": [C, H, W], "scale": sc, "zp": zp_in}
     for idx, (L, key, ins) in enumerate(ents):
@@ -1030,15 +1120,20 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
             if b.get("flat") and op != "fully_connected":
                 raise Refused("%s %s reads %r, a RESHAPE kept for a FULLY_CONNECTED: only a FULLY_CONNECTED may read it"
                               % (op, name, show[k]))
+        flat = op == "mean" and not L.get("keep_dims", False)
+        if op == "mean":
+            L, op = _mean_as_pool(L, srcs[0], name), "average_pool2d"
         if op == "average_pool2d":
             gap = _global_avg_as_conv(L, srcs[0], dtype, low)
             if gap is not None:
                 L, op = gap, "conv2d"
         if op not in LOWER_OPS:
-            raise Refused("op %s is not supported (conv2d, depthwise_conv2d, fully_connected, max_pool2d, average_pool2d, add, "
-                          "concat, relu; "
+            raise Refused("op %s is not supported (conv2d, depthwise_conv2d, fully_connected, max_pool2d, average_pool2d, mean, "
+                          "add, concat, relu; "
                           "reshape and softmax at the end)" % op)
         lw.blobs[key] = LOWER_OPS[op](lw, idx, L, op, name, key, ins, srcs)
+        if flat:
+            lw.blobs[key]["nhwc"] = [1, lw.blobs[key]["chw"][0]]     # MEAN without keep_dims: [1, C]
     if not low["layers"]:
         raise Refused("no layer runs on the NPU")
     if not any(l["kind"] == "conv" for l in low["layers"]):
@@ -1078,7 +1173,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
     low["npu_output"] = last["name"]
     low["npu_out_chw"] = last["out_chw"]
     C2, H2, W2 = last["out_chw"]
-    shape = [1, H2, W2, C2]
+    shape = lw.blobs[ents[-1][1]].get("nhwc", [1, H2, W2, C2])
     for t in low["cpu_tail"]:
         if t["op"] == "reshape":
             shape = t["shape"]
@@ -2215,6 +2310,73 @@ def selftest_models():
     td = read_tflite(graph_to_tflite(dg))
     [o_ for o_ in td["ops"] if o_["op"] == "DEPTHWISE_CONV_2D"][0]["opt"]["dil_h"] = 2
     ok.append(("depthwise dilation refused (TFLite)", "dilation 2x1" in _refusal(lambda: tflite_to_graph(td, "d"))))
+    ok += _selftest_patterns(strip)
+    return ok
+
+
+def _selftest_patterns(strip):
+    """TFLite patterns: MEAN, [1, N] inputs, SAME with a negative pad; the strides NPUC asserts on"""
+    ok, r = [], random.Random(9)
+    c1 = _sconv("c", 4, 4, r, k=1)
+    # MEAN over H, W = the global AVERAGE_POOL_2D: 8x8 (as a conv) and 3x3 (the NFU pool), keep_dims or not
+    for hw, kind in ((8, "conv"), (3, "pool")):
+        gm = _sgraph([c1, {"op": "mean", "name": "m", "axis": [1, 2], "keep_dims": True,
+                           "output": {"scale": 1 / 128, "zero_point": 0}}], shape=(1, hw, hw, 4))
+        ga = _sgraph([c1, {"op": "average_pool2d", "name": "m", "pool": [hw, hw], "strides": [hw, hw], "padding": "valid"}],
+                     shape=(1, hw, hw, 4))
+        lm = lower(gm)
+        ok.append(("MEAN over H, W on %dx%d = the global AVERAGE_POOL_2D (%s), output [1, 1, 1, 4]" % (hw, hw, kind),
+                   strip(lm) == strip(lower(ga)) and lm["layers"][-1]["kind"] == kind and lm["output"]["shape"] == [1, 1, 1, 4]))
+    gm["layers"][1]["keep_dims"] = False
+    ok.append(("MEAN without keep_dims: output shape [1, 4]", lower(gm)["output"]["shape"] == [1, 4]))
+    gm["layers"][1]["axis"] = [-3, -2]
+    ok.append(("MEAN axes -3, -2 = H, W", not _refuses(lambda: lower(gm))))
+    gm["layers"][1]["axis"] = [3]
+    ok.append(("MEAN over channels refused", "only the mean over H and W" in _refusal(lambda: lower(gm))))
+    gq = _sgraph([c1, {"op": "mean", "name": "m", "axis": [1, 2], "output": {"scale": 1 / 64, "zero_point": 0}}], shape=(1, 3, 3, 4))
+    lq = lower(gq)["layers"][-1]
+    ok.append(("MEAN 3x3 into another scale (1/128 -> 1/64): a 3x3 conv whose multiplier rescales (NFU pooling keeps the "
+               "scale)", lq["kind"] == "conv" and lq["k"] == [3, 3] and lq["out_scale"] == f32_hex(1 / 64) and
+               npuc_multiplier(1 / 128, 1 / 9, 1 / 64) == (lq["slope"], lq["shift"])))
+    gu = _sgraph([c1, {"op": "average_pool2d", "name": "g", "pool": [3, 2], "strides": [3, 2], "padding": "valid"}], shape=(1, 3, 2, 4))
+    ok.append(("a global average pool 3x2 (strides 3x2, NPUC's pooling asserts): as a conv", lower(gu)["layers"][-1]["kind"] == "conv"))
+    tq = lambda nm, sh, dt="int8", data=b"", sc=(1 / 128,): {"name": nm, "shape": sh, "dtype": dt, "scale": list(sc),
+                                                           "zero_point": [0] * len(sc), "qdim": 0, "data": data}
+    tfm = {"tensors": [tq("x", [1, 8, 8, 4]), tq("ax", [2], "int32", struct.pack("<2i", 1, 2), ()), tq("m", [1, 4])],
+           "inputs": [0], "outputs": [2], "ops": [{"op": "MEAN", "inputs": [0, 1], "outputs": [2], "opt": {"keep_dims": False}}]}
+    lt = lower(tflite_to_graph(tfm, "m.tflite"), allow_none=True)
+    ok.append(("TFLite MEAN (axes tensor [1, 2], keep_dims false) on 8x8x4: an 8x8 conv, output [1, 4]",
+               [(l["kind"], l["k"]) for l in lt["layers"]] == [("conv", [8, 8])] and lt["output"]["shape"] == [1, 4]))
+    # a [1, N] input = [1, 1, 1, N]
+    fc = {"op": "fully_connected", "name": "f", "units": 4, "activation": "relu",
+          "weights": {"dtype": "int8", "layout": "OI", "scale": 1 / 256, "zero_point": 0,
+                      "data": [r.randint(-9, 9) for _ in range(64)]}, "bias": [0] * 4, "output": {"scale": 1 / 128, "zero_point": 0}}
+    l2, l4 = lower(_sgraph([fc], shape=(1, 16))), lower(_sgraph([fc], shape=(1, 1, 1, 16)))
+    ok.append(("a [1, 16] input: the same lowered network as [1, 1, 1, 16], its shape kept",
+               strip(l2) == strip(l4) and l2["input"]["chw"] == [16, 1, 1] and l2["input"]["shape"] == [1, 16]))
+    tff = {"tensors": [tq("x", [1, 16]), tq("w", [4, 16], "int8", struct.pack("<64b", *fc["weights"]["data"]), (1 / 256,)),
+                       tq("f", [1, 4])], "inputs": [0], "outputs": [2],
+           "ops": [{"op": "FULLY_CONNECTED", "inputs": [0, 1, -1], "outputs": [2], "opt": {"act": "relu"}}]}
+    ok.append(("a TFLite [1, 16] input read and lowered as [1, 1, 1, 16]",
+               strip(lower(tflite_to_graph(tff, "f.tflite"))) == strip(l4)))
+    # SAME whose pad would be negative: TFLite's VALID; refused when the other dimension pads
+    sg = lambda k, st, pad: _sgraph([dict(_sconv("s", 8, 8, r, k=1), kernel=list(k), strides=list(st), padding=pad,
+                                          weights={"dtype": "int8", "layout": "OHWI", "scale": 1 / 256, "zero_point": 0,
+                                                   "data": [1] * (8 * k[0] * k[1] * 8)}, bias=[0] * 8)], shape=(1, 32, 32, 8))
+    ls_ = lower(sg((1, 1), (2, 2), "same"))
+    ok.append(("conv 1x1 stride 2 SAME on 32x32 (pad -1): lowered as VALID (16x16), warned",
+               strip(ls_) == strip(lower(sg((1, 1), (2, 2), "valid"))) and ls_["layers"][0]["padding"] == "VALID" and
+               ls_["layers"][0]["out_chw"] == [8, 16, 16] and any("clamps it to 0" in w for w in ls_["warnings"])))
+    ok.append(("conv 1x3 stride 2 SAME on 32x32 (pads -1 and +1) refused", "one padding mode" in _refusal(lambda: lower(sg((1, 3), (2, 2), "same")))))
+    # strides NPUC asserts on, refused up front with the rewrite
+    ok.append(("conv strides 2x1 refused (the kws-cnn-npu rewrite named)", "kws-cnn-npu" in _refusal(lambda: lower(sg((3, 3), (2, 1), "valid")))))
+    ok.append(("conv stride 4 VALID refused (the alexnet-96-npu rewrite named)", "alexnet-96-npu" in _refusal(lambda: lower(sg((5, 5), (4, 4), "valid")))))
+    ok.append(("conv stride 3 refused", "Stride > 2" in _refusal(lambda: lower(sg((3, 3), (3, 3), "same")))))
+    pg = lambda k, st: _sgraph([_sconv("a", 8, 8, r), {"op": "max_pool2d", "name": "p", "pool": list(k), "strides": list(st),
+                                                       "padding": "valid"}, _sconv("c", 8, 8, r)], shape=(1, 16, 16, 8))
+    ok.append(("pooling 2x2 stride 3 refused (stride > kernel)", "larger than its kernel" in _refusal(lambda: lower(pg((2, 2), (3, 3))))))
+    ok.append(("pooling strides 2x1 refused (absDiff < stride)", "absDiff" in _refusal(lambda: lower(pg((2, 2), (2, 1))))))
+    ok.append(("pooling strides 1x2 refused (not modelled by ncpgen)", "does not model" in _refusal(lambda: lower(pg((2, 2), (1, 2))))))
     return ok
 
 
