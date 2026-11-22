@@ -223,7 +223,7 @@ What unblocks the most models for the least work comes first. Items marked done 
 9. **Beyond the zoo**: leaky ReLU (Tiny YOLOv2's activation; the GReLU table could hold the slope, docs/format/grelu.md
    section 6, needs NPU experiments: days), per-channel weight scales (TFLite's default for every conv: NPUC's
    on-device filler takes one scale per layer, so this needs the per-DRU slopes NPUC fills anyway, studied on the
-   NPU: days). Done (2026-11-22): `graph_to_tflite` for every op npunet lowers, so the zoo writes TFLite and the
+   NPU: days; what folding them costs meanwhile: the section "Per-channel weight scales" below). Done (2026-11-22): `graph_to_tflite` for every op npunet lowers, so the zoo writes TFLite and the
    TFLite path is tested on real topologies (all 24 lower as their JSON; `tests/run.sh`).
 
 ## NPUC limits met here (V, the oracle)
@@ -253,6 +253,58 @@ What unblocks the most models for the least work comes first. Items marked done 
 The probes' networks (`probe-src/`, npu-net/1 JSON, our weights; `probe-stride/<probe>/model.json`) and NPUC's outputs
 (`probe/`, `probe3/`, `probe-pool/`, `probe-stride/`, `gaplim-defect/`) are in `$NCPGEN_WORK/zoo-evidence/` (outside `sweep/`, so `regress.sh` does not take
 them), with the resnet8 ordering variants (`order/`: add inputs swapped, shortcut first, both).
+
+## Per-channel weight scales: what `--fold-per-channel` costs
+
+TFLite's int8 converter gives every CONV_2D and DEPTHWISE_CONV_2D one weight scale per output channel (FULLY_CONNECTED
+one per tensor, in its spec); NPUC's on-device filler takes one scale per layer, so npunet refuses them unless
+`--fold-per-channel`, which rescales each channel's int8 weights and bias to the layer's largest scale and rounds them
+(the lowering warns, per layer, of the rounding). A channel whose scale is s_max / g keeps its weights in 127 / g
+levels: log2(g) bits fewer. No hardware change here, just the cost (`models/perchannel.py`, 6 random inputs per model
+and spread, 35 min with 4 jobs):
+
+- **The models**: the 15 zoo models with a conv (the published forms; the FC-only models have no per-channel layer),
+  made per-channel: each conv / depthwise output channel's weight scale times a gain in [1/R, 1] (log-uniform,
+  deterministic; the largest 1, the smallest 1/R: **R is the ratio of a layer's largest to its smallest weight scale**,
+  which a user can read from their model), the int8 weights and biases as they are (what per-channel quantisation of
+  those float weights gives: full-range int8 in every channel), the next layers' weight scales divided by the rms gain
+  of their input so every activation keeps its range. R = 1 is the zoo model itself.
+- **The reference (A)**: that per-channel model with every multiplier in x w_o / out exact (to 2^-48; TFLite's own is
+  a 31-bit fixed point). **B**: the folded model with exact multipliers, the cost of folding alone. **C**: the folded
+  model as npunet's reference computes it (NPUC's 16-bit slope, shift <= 15), what ncpgen's NCP computes.
+- **Each cell**: the share of the NPU part's output bytes (the logits, before the CPU's softmax) that differ from A /
+  the mean |difference| / the largest, in LSB of the output / for the classifiers, the share of inputs whose top-1 is
+  A's.
+
+| model (output bytes) | R = 1: B (folding) | R = 1: C (ncpgen) | R = 4: B (folding) | R = 4: C (ncpgen) | R = 16: B (folding) | R = 16: C (ncpgen) | R = 64: B (folding) | R = 64: C (ncpgen) |
+|---|---|---|---|---|---|---|---|---|
+| lenet5 (10) | 0.0 % / 0.00 / 0 / 100 % | 25.0 % / 0.25 / 1 / 100 % | 45.0 % / 0.48 / 2 / 67 % | 41.7 % / 0.45 / 2 / 100 % | 53.3 % / 0.65 / 2 / 67 % | 61.7 % / 0.77 / 3 / 100 % | 60.0 % / 0.80 / 3 / 67 % | 51.7 % / 0.62 / 2 / 67 % |
+| keras-mnist-cnn (10) | 0.0 % / 0.00 / 0 / 100 % | 13.3 % / 0.13 / 1 / 100 % | 40.0 % / 0.40 / 1 / 100 % | 43.3 % / 0.43 / 1 / 100 % | 58.3 % / 0.67 / 2 / 100 % | 65.0 % / 0.75 / 2 / 100 % | 58.3 % / 0.65 / 2 / 100 % | 45.0 % / 0.55 / 2 / 100 % |
+| tf-cifar-cnn (10) | 0.0 % / 0.00 / 0 / 100 % | 16.7 % / 0.17 / 1 / 100 % | 48.3 % / 0.50 / 2 / 100 % | 46.7 % / 0.48 / 2 / 100 % | 48.3 % / 0.58 / 2 / 100 % | 56.7 % / 0.63 / 2 / 100 % | 71.7 % / 0.93 / 2 / 100 % | 63.3 % / 0.80 / 3 / 100 % |
+| vgg-cifar (10) | 0.0 % / 0.00 / 0 / 100 % | 31.7 % / 0.33 / 2 / 100 % | 63.3 % / 0.72 / 2 / 100 % | 63.3 % / 0.73 / 2 / 100 % | 68.3 % / 0.92 / 3 / 100 % | 63.3 % / 0.87 / 3 / 100 % | 86.7 % / 1.40 / 4 / 100 % | 80.0 % / 1.40 / 3 / 100 % |
+| resnet8 (10) | 0.0 % / 0.00 / 0 / 100 % | 21.7 % / 0.22 / 1 / 100 % | 48.3 % / 0.50 / 2 / 100 % | 56.7 % / 0.60 / 2 / 100 % | 53.3 % / 0.63 / 2 / 100 % | 58.3 % / 0.73 / 2 / 100 % | 65.0 % / 0.85 / 3 / 100 % | 65.0 % / 0.77 / 3 / 100 % |
+| kws-cnn (12) | 0.0 % / 0.00 / 0 / 100 % | 68.1 % / 0.85 / 3 / 100 % | 59.7 % / 0.68 / 2 / 100 % | 56.9 % / 0.71 / 2 / 100 % | 73.6 % / 1.11 / 3 / 83 % | 68.1 % / 1.18 / 4 / 83 % | 68.1 % / 0.99 / 3 / 100 % | 55.6 % / 0.85 / 3 / 100 % |
+| micro-speech (4) | 0.0 % / 0.00 / 0 / 100 % | 16.7 % / 0.17 / 1 / 67 % | 12.5 % / 0.12 / 1 / 100 % | 25.0 % / 0.25 / 1 / 100 % | 50.0 % / 0.54 / 2 / 100 % | 54.2 % / 0.54 / 1 / 100 % | 58.3 % / 0.62 / 2 / 83 % | 50.0 % / 0.54 / 2 / 83 % |
+| magic-wand (4) | 0.0 % / 0.00 / 0 / 100 % | 16.7 % / 0.17 / 1 / 100 % | 33.3 % / 0.33 / 1 / 83 % | 37.5 % / 0.38 / 1 / 100 % | 62.5 % / 0.62 / 1 / 67 % | 45.8 % / 0.46 / 1 / 83 % | 58.3 % / 0.67 / 2 / 100 % | 58.3 % / 0.62 / 2 / 100 % |
+| squeezenet11-96 (10) | 0.0 % / 0.00 / 0 / 100 % | 28.3 % / 0.28 / 1 / 100 % | 18.3 % / 0.20 / 2 / 100 % | 20.0 % / 0.25 / 2 / 100 % | 30.0 % / 0.37 / 3 / 100 % | 25.0 % / 0.40 / 3 / 100 % | 31.7 % / 0.43 / 3 / 100 % | 33.3 % / 0.47 / 3 / 100 % |
+| alexnet-96 (10) | 0.0 % / 0.00 / 0 / 100 % | 51.7 % / 0.60 / 2 / 100 % | 46.7 % / 0.53 / 2 / 100 % | 45.0 % / 0.50 / 2 / 100 % | 65.0 % / 0.85 / 3 / 100 % | 75.0 % / 1.07 / 3 / 100 % | 83.3 % / 1.35 / 3 / 100 % | 86.7 % / 1.60 / 4 / 100 % |
+| vgg11-64 (200) | 0.0 % / 0.00 / 0 / 100 % | 42.4 % / 0.44 / 2 / 100 % | 56.9 % / 0.69 / 3 / 100 % | 60.8 % / 0.75 / 4 / 100 % | 67.4 % / 0.92 / 4 / 100 % | 69.5 % / 0.96 / 4 / 100 % | 76.0 % / 1.31 / 6 / 100 % | 77.2 % / 1.37 / 7 / 100 % |
+| yolov2-tiny-128 (2000) | 0.0 % / 0.00 / 0 | 31.2 % / 0.31 / 2 | 26.4 % / 0.27 / 2 | 27.9 % / 0.28 / 2 | 24.0 % / 0.25 / 3 | 23.0 % / 0.24 / 3 | 20.2 % / 0.21 / 4 | 20.3 % / 0.21 / 4 |
+| mobilenet-v1-025 (2) | 0.0 % / 0.00 / 0 / 100 % | 41.7 % / 0.42 / 1 / 100 % | 50.0 % / 0.75 / 2 / 100 % | 58.3 % / 0.67 / 2 / 100 % | 33.3 % / 0.42 / 2 / 100 % | 41.7 % / 0.50 / 2 / 100 % | 100.0 % / 1.25 / 2 / 100 % | 91.7 % / 1.33 / 3 / 100 % |
+| mobilenet-v2-035 (1000) | 0.0 % / 0.00 / 0 / 100 % | 46.5 % / 0.49 / 3 / 83 % | 66.7 % / 0.90 / 5 / 100 % | 64.4 % / 0.85 / 4 / 100 % | 67.8 % / 0.95 / 6 / 100 % | 69.6 % / 1.02 / 5 / 100 % | 73.5 % / 1.22 / 9 / 100 % | 73.1 % / 1.16 / 8 / 100 % |
+| ds-cnn (12) | 0.0 % / 0.00 / 0 / 100 % | 25.0 % / 0.25 / 1 / 100 % | 41.7 % / 0.46 / 2 / 100 % | 41.7 % / 0.46 / 2 / 100 % | 43.1 % / 0.43 / 1 / 100 % | 51.4 % / 0.53 / 2 / 100 % | 38.9 % / 0.42 / 2 / 100 % | 26.4 % / 0.26 / 1 / 100 % |
+
+Reading it: **folding costs about as much as NPUC's own multiplier rounding.** At R = 1 nothing is folded (B = 0) but
+C already differs from the exact multipliers on 13 to 68 % of the bytes, by up to 3 LSB (kws-cnn: slopes like 41/2^15,
+6 significant bits): the NPU's arithmetic, per tensor or not. Folding alone (B) moves 12 to 74 % of the output bytes at
+R = 4 and 16, by 0.1 to 1.1 LSB on average and 1 to 6 at most, and at R = 64 by up to 1.4 on average and 9 at most
+(mobilenet-v2's 1000 logits); C, both together, is of the same size (the two roundings do not add up). Folded, the
+top-1 class stayed A's on every input of 10 of the 14 classifiers at every R; it changed on 2 of 6 inputs at most
+(lenet5 at R = 4, 16 and 64; magic-wand at 16), on 1 for kws-cnn (R = 16) and micro-speech (R = 64). These models
+have our noise weights and the gains spread evenly in log scale; a real model's R and spread are its own (read them
+from its weight scales: npunet's warning gives each folded layer's rounding), and a channel at s_max / 128 or below
+keeps at most one level of its weights. The per-DRU slopes NPUC fills anyway (item 9)
+would make per-channel scales exact.
 
 ## The models
 
