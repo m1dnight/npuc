@@ -342,7 +342,11 @@ conv14 and the 1024 -> 1000 classifier in 3 groups each after its conv2 + dw2 st
 same block): the stream part's plan gives the groups (a chunk of pads only is a group without DMA), the DMA order,
 events and batch ids; frame's descriptors follow its DMAs one for one, but a cut layer that ends its block stores per
 chunk (`_range_store`), never pass by pass (its ring of 32 of 63 passes and Cout 1000 would otherwise store pass by
-pass).
+pass). **In a tiled stratum** (`_stratum_cmdq_estimate`, stream's `cut_tile`; V: SSD MobileNet v1's heads at 300
+px, camera t99, t102, t168): the stratum's estimate (one tile's instructions, its TRIM at 90 per plane slot) passes
+61440 and every tile is cut in chunks of n instructions (cmdq.md 7d: conv1 .. conv8 in 4 x 2 tiles, 2 groups a tile);
+the same `_tiled_cut` takes the stream's groups, events and batch ids, the tile descriptors following its DMAs one for
+one (tile 0's weight loads with their passes, the store in the tile's last chunk).
 
 ### 6.10 NPUC's tiling policy, read from its code (`npuc_policy`; V: decompiled, `oracle/ghidra/targets-tiling.txt`)
 
