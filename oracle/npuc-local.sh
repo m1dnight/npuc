@@ -34,7 +34,7 @@ out=$(N3_RUNS=$OUT/.runs bash "$ORACLE/run.sh" local "$ROOT" --prog npuc-net "${
   --push "$OUT/net.npuc" --net net.npuc --out net.ncp 2>&1); rc=$?
 run=$(printf '%s\n' "$out" | sed -n 's/^log: \(.*\)\/log\.txt (exit [0-9]*)$/\1/p' | tail -n 1)
 [ -n "$run" ] && [ -d "$run" ] || { printf '%s\n' "$out" | tail -n 20; echo "npuc-local: FAIL: no run directory"; exit 1; }
-rm -f "$OUT/run"; ln -s "$run" "$OUT/run"
+rm -f "$OUT/run"; ln -s ".runs/$(basename "$run")" "$OUT/run"   # relative: the folder can move
 cp "$run/log.txt" "$OUT/log.txt"
 for f in net.ncp net.json; do rm -f "$OUT/$f"; [ -f "$run/$f" ] && cp "$run/$f" "$OUT/$f"; done
 if [ $rc -ne 0 ] || [ ! -s "$OUT/net.ncp" ]; then
