@@ -50,7 +50,9 @@ listed misses of the zoo's standard-resolution models and of graph-large (NPUC's
 modelled: docs/format/frame.md 6.11). Tiling inside a graph follows NPUC's policy (frame.graph_policy). Common models:
 `models/` (26 of 32 zoo entries exact; models/README.md lists what the rest need). Depthwise is lowered
 to the dense block-diagonal conv NPUC itself compiles (docs/format/depthwise.md; NPUC's own depthwise-optimised path is
-off on the device and unproven on the NPU). Not supported yet: trim and spill and weight rings inside a graph, a CMDQ cut in a tiled
+off on the device and unproven on the NPU). Camera models: models/camera.md (person_detect exact as published;
+per-channel scales as per-channel shifts, docs/format/perchannel.md; the harness's setScale hook needs
+root-40bb3e3f). Not supported yet: trim and spill and weight rings inside a graph, a CMDQ cut in a tiled
 plan's single blocks, channel split/slice, other
 activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling (NPUC's deconvolution crashed in the
 harness), several outputs. Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the
