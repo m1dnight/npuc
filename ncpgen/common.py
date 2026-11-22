@@ -3,6 +3,7 @@ CMDQ instruction encoding, the sections of an NCP (docs/format/), and memoisatio
 import collections
 import copy
 import hashlib
+import heapq
 import json
 import struct
 
@@ -88,20 +89,37 @@ def topology(low):
 
 
 def exec_order(out, ins, cons, src):
-    """NPUC's layer order (V: its NODE ORDER logs; add2, cat3, cat-pool, cat-chain, res-two and every graph compile):
-    from the output back, a layer is entered once every layer reading it is, its inputs in order (depth first); the
-    names, run in reverse"""
-    seen, lst, stack = {out}, [out], [(out, 0)]
+    """NPUC's layer order, the names (V: its NODE ORDER logs, every graph compile of the sweeps with one, 278; resnet8
+    and its variants: an eltwise's input order does not change it, the layer list's order does). NPUC numbers its
+    graph's nodes breadth first from the network input, each tensor's readers in layer-list order (cons as topology()
+    builds it; run/ir_graph_init.txt), then runs, of the layers whose inputs are all done, the one with the highest
+    number. Only the layers the output `out` depends on are run."""
+    nid, q, seen = {}, collections.deque([src]), {src}
+    while q:
+        for c in cons.get(q.popleft(), []):
+            if c not in seen:
+                seen.add(c)
+                nid[c] = len(nid) + 1
+                q.append(c)
+    need, stack = {out}, [out]
     while stack:
-        n, i = stack.pop()
-        if i < len(ins[n]):
-            stack.append((n, i + 1))
-            t = ins[n][i]
-            if t != src and t not in seen and all(r in seen for r in cons[t]):
-                seen.add(t)
-                lst.append(t)
-                stack.append((t, 0))
-    return lst[::-1]
+        for t in ins.get(stack.pop(), []):
+            if t != src and t not in need:
+                need.add(t)
+                stack.append(t)
+    done, order = {src}, []
+    ready = [(-nid[n], n) for n in need if all(x in done for x in ins[n])]
+    heapq.heapify(ready)
+    queued = {n for _, n in ready}
+    while ready:
+        _, n = heapq.heappop(ready)
+        order.append(n)
+        done.add(n)
+        for c in cons.get(n, []):
+            if c in need and c not in queued and all(x in done for x in ins[c]):
+                queued.add(c)
+                heapq.heappush(ready, (-nid[c], c))
+    return order
 
 
 def feeds_eltwise(t, by, cons):

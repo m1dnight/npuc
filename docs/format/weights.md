@@ -105,7 +105,8 @@ block except in section 7's cases).
 ## 6. Graphs: eltwise, concat, standalone ReLU (V: graph 98/98, graph-random 47/47, graph-random2 66/66)
 
 - **Order.** One block per conv, eltwise and ReLU layer, in NPUC's execution order (the stream part's rule, cmdq.md
-  7c: from the single output back, a layer entered once every reader is, inputs in order, depth first; reversed).
+  7c: the nodes numbered breadth first from the input, readers in layer-list order; the ready layer with the highest
+  number runs next).
 - **Convs** pack as in section 1 to 10, with one exception: a conv that reads a **concat kept in SRAM** (the stream
   part's rule: every input a pool or a conv with a multiple of 16 channels, not the output, no eltwise reading it, no
   fork that an eltwise joins) sees per core [input 1's core share, input 2's, ...]: each input split over the cores

@@ -5,10 +5,9 @@
 #   tests/regress.sh [set...]       (default: every set under $NCPGEN_WORK/sweep)
 # Prints "<set>: <exact> of <n>" per set and a total. Known misses: graph 93/98 and graph-random2 64/66 (NPUC's own
 # uninitialised bytes, docs/oracle.md); grelu/r 1/5 (hand-edited net.npuc files whose lowered.json does not describe the
-# compiled network: ncpgen refuses them); zoo 2: resnet8 (NPUC runs its shortcut convs in an order ncpgen's exec_order
-# does not model yet) and mobilenet-v2-035-dense (a graph whose large layers NPUC splits over several groups: frame.py's
-# graph plan takes one group per layer), models/README.md. Every other set must be exact. Exit 0 when only those known
-# misses remain.
+# compiled network: ncpgen refuses them); zoo 1: mobilenet-v2-035-dense (a graph whose large layers NPUC splits over
+# several groups: frame.py's graph plan takes one group per layer), models/README.md. Every other set must be exact.
+# Exit 0 when only those known misses remain.
 set -uo pipefail
 . "$(dirname "$0")/../oracle/env.sh"
 S=$NCPGEN_WORK/sweep
@@ -17,7 +16,7 @@ if [ $# -gt 0 ]; then sets=("$@"); else
   mapfile -t sets < <(find . -mindepth 3 -name lowered.json -path '*/*/lowered.json' | sed 's|^\./||; s|/[^/]*/lowered.json$||' | sort -u)
 fi
 tot=0; ok=0; bad=0
-declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=2)
+declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=1)
 for s in "${sets[@]}"; do
   ls -d "$S/$s"/*/ > /dev/null 2>&1 || continue
   line=$(python3 -I "$NCPGEN/ncpgen/ncpgen.py" check "$S/$s"/*/ 2>&1 | tail -n 1)

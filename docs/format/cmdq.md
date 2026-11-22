@@ -442,11 +442,14 @@ seeds 1..50: 47/47; unseen seeds 100..179: 62/66 (14 more crash NPUC itself, one
 of `oracle/ops/mknets.py` 12/12 (after setting quant-3 zero points to 128: see 9). `plan_dmas` = the
 oracle's io (flag, bid, group, direction, SRAM offset) on 208 of 211.
 
-**Order (V: NODE ORDER of add2, cat3, cat-pool, res-two).** NPUC walks back from the output depth first, entering a
-layer once every layer reading it has been entered, its inputs in order; it runs the reverse (`exec_order`). So of
-two branches the one named last runs first. One NCP group per layer, none for a concat. Atoms (NPUC nodes, the order
-numbers of live ranges): pad, reformat, conv; pool; ReLU: 1; eltwise: 2 (a "pre" node holding CU_BIN and the shift
-chunks, then the eltwise); concat: 1; then the unflatten.
+**Order (V: NODE ORDER of every graph compile of the sweeps that logs one, 278; the zoo's resnet8 and its variants).**
+NPUC numbers its graph's nodes breadth first from the network input, each tensor's readers in layer-list order
+(`run/ir_graph_init.txt`), then runs, of the layers whose inputs are all done, the one with the highest number
+(`exec_order`). So of two branches from one tensor the one listed last runs first, and an eltwise's input order does
+not matter (resnet8: a stage's 1x1 shortcut conv, listed after the block's two 3x3 convs, runs before them; listed
+before them, after them; the add's inputs swapped, the same NCP). One NCP group per layer, none for a concat. Atoms
+(NPUC nodes, the order numbers of live ranges): pad, reformat, conv; pool; ReLU: 1; eltwise: 2 (a "pre" node holding
+CU_BIN and the shift chunks, then the eltwise); concat: 1; then the unflatten.
 
 **Where tensors live.** Every tensor stays in SRAM until its last reader (live range to that reader's first atom),
 except:

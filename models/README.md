@@ -38,10 +38,10 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
 
 ## Status (2026-11-22, NPUC root-314e61a6)
 
-**24 models: 15 exact, 2 compile but differ, 4 fail in NPUC, 3 refused by npunet.** Every model npunet lowers has its
+**24 models: 16 exact, 1 compiles but differs, 4 fail in NPUC, 3 refused by npunet.** Every model npunet lowers has its
 CPU reference (`npunet.py ref`, 0.1 to 18 s). The three `-npu` rewrites give byte for byte the reference of the
-published model. Every NCP NPUC compiled is regression data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: 15 of
-17, the two known misses below), and the 15 exact ones are rows of `tests/golden.txt`, so `tests/run.sh` regenerates
+published model. Every NCP NPUC compiled is regression data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: 16 of
+17, the known miss below), and the 16 exact ones are rows of `tests/golden.txt`, so `tests/run.sh` regenerates
 them with no vendor file. The NPUC column's time includes npunet's lowering and was measured under a parallel load.
 
 | model | input | options | lowering | NPUC | ncpgen check | CPU reference |
@@ -51,7 +51,7 @@ them with no vendor file. The NPUC column's time includes npunet's lowering and 
 | mnist-mlp | 1x1x784 | --allow-none | ok, 3 NPU layers | PASS, 852 KB, 8.1 s | **EXACT** (2 s) | cbfaca9fb6f4, 10 B, 0.4 s |
 | tf-cifar-cnn | 32x32x3 | --allow-none | ok, 7 NPU layers | PASS, 168 KB, 5.5 s | **EXACT** (0 s) | e78c8338eb6e, 10 B, 0.5 s |
 | vgg-cifar | 32x32x3 | --allow-none | ok, 11 NPU layers | PASS, 685 KB, 24.5 s | **EXACT** (3 s) | c5c997d7131b, 10 B, 3.8 s |
-| resnet8 | 32x32x3 | --quant 3 --allow-none | ok, 17 NPU layers | PASS, 202 KB, 7.3 s | **differs**: groups 5-7 and weight blocks 5-7 in another order (ncpgen's layer order: need 1) | 29f02bf6832a, 10 B, 1.4 s |
+| resnet8 | 32x32x3 | --quant 3 --allow-none | ok, 17 NPU layers | PASS, 202 KB, 7.3 s | **EXACT** (1 s) | 29f02bf6832a, 10 B, 1.4 s |
 | ad-autoencoder | 1x1x640 | --allow-none | ok, 10 NPU layers | PASS, 463 KB, 8.7 s | **EXACT** (1 s) | 533c72a18436, 640 B, 0.2 s |
 | kws-cnn | 49x10x1 | --allow-none | ok, 5 NPU layers | FAIL: solutionFound && "Couldn't find a correct processing strategy for a single node" | - | 7a44e7c3827a, 12 B, 0.3 s |
 | kws-cnn-npu | 49x10x1 | --allow-none | ok, 5 NPU layers | PASS, 116 KB, 3.2 s | **EXACT** (0 s) | 7a44e7c3827a, 12 B, 0.4 s |
@@ -72,17 +72,17 @@ them with no vendor file. The NPUC column's time includes npunet's lowering and 
 | ds-cnn-dense | 49x10x1 | --allow-none | ok, 11 NPU layers | PASS, 209 KB, 22.2 s | **EXACT** (3 s) | ad2c9fdec999, 12 B, 2.0 s |
 
 Per published model: LeNet-5, the Keras MNIST convnet and MLP, the TensorFlow CIFAR CNN, a VGG-style CIFAR CNN, the
-DCASE/MLPerf Tiny autoencoder, the TFLM sine model, SqueezeNet 1.1, VGG-11 and Tiny YOLOv2 are **exact as published**
-(with the generic adaptations above). The Hello Edge KWS CNN, magic wand and AlexNet are **exact after an exact rewrite**
-(`-npu`). MobileNet v1, DS-CNN (and MobileNet v2, but for the frame gap below) are **exact with depthwise written as
-dense** (`-dense`). ResNet-8 compiles but **differs** (ncpgen's layer order). micro_speech **fails in NPUC**.
+DCASE/MLPerf Tiny autoencoder, the TFLM sine model, SqueezeNet 1.1, VGG-11, Tiny YOLOv2 and ResNet-8 are **exact as
+published** (with the generic adaptations above; ResNet-8's shortcuts SAME -> VALID, the same output). The Hello Edge
+KWS CNN, magic wand and AlexNet are **exact after an exact rewrite** (`-npu`). MobileNet v1, DS-CNN (and MobileNet v2,
+but for the frame gap below) are **exact with depthwise written as dense** (`-dense`). micro_speech **fails in NPUC**.
 
 ## What ncpgen and npunet need, ranked
 
-What unblocks the most models for the least work comes first. None of it is applied here (ncpgen/*.py is being
-refactored elsewhere).
+What unblocks the most models for the least work comes first. Items marked done have been applied since.
 
-1. **ncpgen: NPUC's layer order for graphs** (`weights.exec_order`, `stream.exec_order`; frame.py calls the latter).
+1. **Done (2026-11-22): ncpgen: NPUC's layer order for graphs** (`common.exec_order`; resnet8 exact, `tests/regress.sh`
+   3330 of 3342 with only the known misses).
    resnet8 differs only because of it: NPUC runs each stage's shortcut 1x1 conv before the block's two 3x3 convs, and
    ncpgen runs it after them. NPUC's order depends on the layer order of the net file, **not** on the order of an
    add's inputs (V: swapping the add's inputs gives the same NCP; moving the shortcut line before the block changes
@@ -228,7 +228,7 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Ops**: conv2d 3x3 x5, add x3, conv2d 3x3/2 x2, conv2d 1x1/2 x2, average_pool2d, reshape, fully_connected, softmax; 0.08 M weights; output 1x1x10; `--quant 3 --allow-none`
 - **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two and every zero point 0 (quant 3): NPUC's Eltwise add aligns by shifts only and has no zero-point term; the 1x1 stride-2 shortcut convs: SAME -> VALID (the same output; npunet refuses SAME when the pad would be negative, where TFLite clamps it to 0); no activation on the second conv of each block and on the shortcuts: --allow-none (ncpgen's corrected GReLU table makes 'none' right on the NPU; NPUC's own table only for ceil(Cout/8) even)
 - **Missing for the published form**: SAME 1x1 stride-2 conv (negative pad): npunet should clamp the pad at 0 like TFLite
-- **Status**: differs (lowering: ok, 17 NPU layers; NPUC: PASS, 202 KB, 7.3 s; ncpgen check: NPUC runs the shortcut conv of each stage first, ncpgen last: need 1)
+- **Status**: exact (lowering: ok, 17 NPU layers; NPUC: PASS, 202 KB, 7.3 s; ncpgen check: EXACT (1 s))
 
 ### ad-autoencoder
 

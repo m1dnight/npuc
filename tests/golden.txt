@@ -114,6 +114,7 @@ zoo-keras-mnist-cnn|zoo:keras-mnist-cnn|--allow-none|04c1fcd4a8696f0bd668e2c6cbf
 zoo-mnist-mlp|zoo:mnist-mlp|--allow-none|6df4e736eb89ee536dd779f108181b70f7faa8687f0655b3e14561db1652feff
 zoo-tf-cifar-cnn|zoo:tf-cifar-cnn|--allow-none|bf2830264607ed1ab5bfa81769f253c9ed9fb7a70a6bf9590160f7b6b3e314c9
 zoo-vgg-cifar|zoo:vgg-cifar|--allow-none|86ea5e943b581e8801786498754ffe1c2b141f979c2600786e2eeb3560448583
+zoo-resnet8|zoo:resnet8|--quant 3 --allow-none|e4805a2518a369eb8675c1c2a3161988b6833348534052d692aecf91f14609ea
 zoo-ad-autoencoder|zoo:ad-autoencoder|--allow-none|9a7e9f10c28c007b143abe281c6520f5ea0e23031c58e5ddf07e5862bacfb20d
 zoo-kws-cnn-npu|zoo:kws-cnn-npu|--allow-none|31cc2eb2b852c5cb24336fadcb72dfa000a6de3f79fdcd0032a81d310ccd9b93
 zoo-magic-wand-npu|zoo:magic-wand-npu|--allow-none|4ea01a0020cd1b2c36d8913fdab6989879c5eb9a7b632a168f5c7ac1bc0c28fa
