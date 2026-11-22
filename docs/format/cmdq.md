@@ -571,8 +571,17 @@ concat's DRAM buffer (its chunk stores at its offset there), a reader of the net
 reformat (its chunks' slot loads; their tensor is the layer's input), a kernel over 4 MiB loaded core by core.
 `Plan.group_layers` names each group's layer for frame.py (frame.md 6.8).
 
-Not modelled: a cut tile group (none seen: c512's tiles estimate 58590), a cut layer with pools or eltwise (NPUC would
-need more than 300 pooled plane slots).
+**In a tiled stratum** (`Plan.cut_tile`; V: SSD MobileNet v1's heads at 300 px, `$NCPGEN_WORK/sweep/camera/
+ssd-mobilenet-v1-t99/-t102/-t168`: conv1 .. conv8 one stratum of 4 x 2 tiles, every tile in 2 groups, 16 for the
+stratum): NPUC estimates the stratum's layer block once, from one tile's instructions (every layer's passes and
+plane-slot NFU ops, the tile's TRIM at **90 per plane slot**: 16350 + 44 x 1020 + 45 x 60 + 25 x 102 + 90 = 66570, its
+log's "Heuristically predicted size of CMDQ"; the copy groups of the same compile, 64 trimmed slots, print 22110 =
+16350 + 64 x 90 and n = 682), halves n the same way (115 instructions, n = 70) and cuts every tile's instructions in
+chunks of n, each its own NCP group: tile 0's weight loads go with their passes (chunk 1 loads conv1 .. conv6 and 3 of
+conv7's 8 passes, chunk 2 the rest), the tile's input load stays with its TRIM, its store goes in its last chunk. The
+events and batch ids follow (one counter, nothing reordered). Not modelled (refused): a cut inside a tile's last layer
+(would its store come per chunk?) or before an NFU op reading the tile's input (its loads per chunk?), a cut layer
+with pools or eltwise (NPUC would need more than 300 pooled plane slots). c512's tiles estimate 58590: whole.
 
 ## 8. Unknowns and proposals
 

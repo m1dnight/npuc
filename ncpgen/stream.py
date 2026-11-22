@@ -831,7 +831,7 @@ class Plan:
             o0, o1, q0, q1 = t["out"]
             ops.append(Op("store", flags=[self.event() for _ in range(ns)], tile=ti, sram=src * 64,
                           region=(o0, o1 + 1, q0, q1 + 1)))
-            self.groups.append(ops)
+            self.groups += self.cut_tile(ops)
 
     def tile_to_end(self, t, lis, shapes, layers=None):
         """a tile that ends on the stratum output's last row (column) computes every layer's output to that layer's
@@ -1029,8 +1029,67 @@ class Plan:
     # NPUC's per-layer CMDQ size estimate (V: its log, "Heuristically predicted size of CMDQ" on 1619 layer blocks):
     # 16350 + 1020 per conv pass + 60 per padded plane slot + 150 per pooled one + 102 per reformatted one + 1500 per
     # eltwise; the plane-slot ops count once whatever their NFU pieces
-    CMDQ_COST = {"conv": 1020, "pad": 60, "pool": 150, "reformat": 102, "trim": 60, "eltnop": 1500}
+    # (a TRIM: 90 per plane slot, V: ssd-mobilenet-v1-t99, a tile's 66570 with one trimmed slot and the copy groups'
+    # 22110 = 16350 + 64 x 90)
+    CMDQ_COST = {"conv": 1020, "pad": 60, "pool": 150, "reformat": 102, "trim": 90, "eltnop": 1500}
     CMDQ_LIMIT = 61440
+
+    def _cmdq_inst(self, o):
+        """an instruction of NPUC's CMDQ estimate: a conv pass, or an NFU op's plane slot (its first piece only)"""
+        if o.kind == "conv":
+            return True
+        if o.kind not in self.CMDQ_COST:
+            return False
+        if o.kind == "reformat":
+            return o.x0 == 0 and o.y0 == 0
+        return not hasattr(o, "pc") or (o.pc["first"] and o.rc["first"])
+
+    def cut_tile(self, ops):
+        """NPUC's "CMDQ seems too big" in a tiled stratum (V: ssd-mobilenet-v1-t99/-t102/-t168, conv1 .. conv8 at 300
+        px in 4 x 2 tiles, each tile in 2 groups): the estimate is the stratum's (one tile's instructions: every
+        layer's passes and plane-slot NFU ops, its trim), n = (61440 // (estimate share per instruction)) // 2 as for
+        a layer, and every tile's instructions go in chunks of n, each its own NCP group, loads with their consumer
+        (tile 0's weight loads with their passes), the tile's store in its last chunk. Not modelled (refused): a chunk
+        boundary inside the last layer's passes (its store per chunk?) or before an NFU op that reads the loaded input"""
+        inst = [i for i, o in enumerate(ops) if self._cmdq_inst(o)]
+        cost = sum(self.CMDQ_COST[ops[i].kind] for i in inst)
+        if 16350 + cost <= self.CMDQ_LIMIT or not inst:
+            return [ops]
+        n = (self.CMDQ_LIMIT // (cost // len(inst))) // 2
+        starts = set(inst[k] for k in range(n, len(inst), n))
+        st = [i for i, o in enumerate(ops) if o.kind == "store"]
+        if len(st) != 1 or st[0] != len(ops) - 1:
+            raise Unsupported("a CMDQ cut of a tile without one store at its end (not modelled)")
+        last_l = next(o.L for o in reversed(ops) if o.kind in ("conv", "pool"))
+        first_last = next(i for i, o in enumerate(ops) if o.kind in ("conv", "pool", "pad", "reformat")
+                          and o.L is last_l)
+        if any(i > first_last for i in starts):
+            raise Unsupported("a CMDQ cut inside a tile's last layer (not modelled)")
+        ifm = {i for i, o in enumerate(ops) if o.kind == "load" and o.what == "ifm"}
+        if any(set(o.deps) & ifm for i, o in enumerate(ops) if i >= min(starts) and hasattr(o, "deps")):
+            raise Unsupported("a CMDQ cut of a tile before an op reading its input (not modelled)")
+        chunks, cur, pending = [], [], []
+        for i, o in enumerate(ops[:-1]):
+            if o.kind == "load":
+                pending.append(i)
+                continue
+            if i in starts and cur:
+                chunks.append(cur)
+                cur = []
+            cur += pending + [i]
+            pending = []
+        chunks.append(cur + pending + [len(ops) - 1])
+        out = []
+        for ch in chunks:
+            idx = {old: k for k, old in enumerate(ch)}
+            new = []
+            for old in ch:
+                o = ops[old]
+                if hasattr(o, "deps"):
+                    o.deps = [idx[x] for x in o.deps if x in idx]
+                new.append(o)
+            out.append(new)
+        return out
 
     def cut(self, ops, ev0):
         """NPUC's "CMDQ seems too big" (V: the cut sweep `stream_variants_cut.txt`, big4, MobileNet's 1024 x 1024 1x1):

@@ -47,7 +47,7 @@ first in their rank.
 | 1 | **several outputs** (the detection heads) | 9: SSD v1, SSD v2, MobileDet, SSDLite, EfficientDet, face SSD, PoseNet, MoveNet, YOLO-Fastest | the other agent's work. Each head alone now lowers and compiles (`--output`) |
 | 2 | **the CPU tail** (stop before RESHAPE/CONCAT across anchors, LOGISTIC, DEQUANTIZE, the post-process op) | 9: the 8 with a post-process or decoder + Tiny YOLO v2's DEQUANTIZE | **partly done**: `--output TENSOR` cuts the model at one tensor (tflite_cut). What remains is lowering, not hardware: cut at the set of tensors that feed the first CPU-only op (with several outputs) and keep the rest as a CPU tail graph (npunet's cpu_tail runs only RESHAPE and SOFTMAX today; LOGISTIC, CONCATENATION along an axis, DEQUANTIZE and TFLite_Detection_PostProcess would be host code) |
 | 3 | **ADD with any scales and zero points** | 7: SSD v2, MobileDet, SSDLite, EfficientDet, face SSD, MoveNet, YOLO-Fastest (none of their 124 ADDs has power-of-two scales; 2 of MoveNet's have equal zero points; counted in the files) | NPUC's Eltwise only shifts (quant 3, scales 2^-n, no zero-point term). Proposed lowering (G, not tried): concat the two inputs (NPUC places them as they are) and a 1x1 conv over the 2C channels with weights s_a/s_w and s_b/s_w on two identity blocks and the zero-point difference in the bias: exact up to the rounding of the two scale ratios to int8 |
-| 3 | **resolution over 224** (tiling inside a graph) | 7: SSD v1/v2 (300), MobileDet, EfficientDet, face SSD (320), SSDLite (300), PoseNet (353x481) | ncpgen follows NPUC's graph tiling; SSD v1's heads: section "SSD detectors" |
+| 3 | **resolution over 224** (tiling inside a graph) | 7: SSD v1/v2 (300), MobileDet, EfficientDet, face SSD (320), SSDLite (300), PoseNet (353x481) | ncpgen follows NPUC's graph tiling; SSD v1's heads exact at 300 px (section "SSD detectors"); the camera backbones in the zoo: section "Camera resolutions in the zoo" |
 | 5 | **per-channel weight scales** | 6: person_detect, SSDLite, EfficientDet, MoveNet, YOLO-Fastest, Tiny YOLO v2 | **done**: NPUC has no per-channel multiplier and the NPU no per-channel slope; `--per-channel-shifts` keeps each channel's power of two in its DRU's shift word (unproven on the NPU), `--fold-per-channel` folds all (docs/format/perchannel.md) |
 | 6 | **uint8 weight zero points other than 128** | 5: SSD v1, SSD v2, MobileDet, face SSD, PoseNet | **done**: NPUC compiles any (MTC 0x1b0's low half), ncpgen exact on 20 probes (`$NCPGEN_WORK/sweep/wzp-probe`, quant 1); npunet takes them in quant 1 (unproven on the NPU: every run had 128) |
 | 7 | a CPU head (QUANTIZE of the input, float input, CAST/SUB/MUL preprocessing) | 4: SSDLite, EfficientDet, MoveNet, Tiny YOLO v2 | not done: a requantisation of the input on the host before the NPU part |
@@ -59,7 +59,7 @@ first in their rank.
 | - | LOGISTIC, HARD_SWISH on the NPU | 0: every LOGISTIC is in a CPU tail, no HARD_SWISH | - |
 
 What each model still lacks after this work: person_detect nothing; **SSD v1 and PoseNet only several outputs and
-the CPU tail** (and the tiling at their resolution: below); SSD v2, MobileDet + ADD; face SSD + ADD, PAD; SSDLite +
+the CPU tail** (SSD v1's heads are exact at 300 px one at a time: below); SSD v2, MobileDet + ADD; face SSD + ADD, PAD; SSDLite +
 ADD, a CPU head; EfficientDet + ADD, upsampling, a CPU head; MoveNet + ADD, upsampling, a CPU head; YOLO-Fastest +
 ADD, upsampling, PAD; Tiny YOLO v2 a CPU head and leaky ReLU.
 
@@ -100,11 +100,13 @@ decoding and NMS).
   once): `$NCPGEN_WORK/sweep/camera/ssd-mobilenet-v1-t99` (box head 0, 24 layers), `-t102` (class head 0, 273
   channels), `-t168` (the last class head: the whole trunk and the extra layers, 36 layers, 11.8 MB NCP). NPUC's logs are gzipped there (675 MB for
   t168).
-- **ncpgen**: the weight blocks are exact on all three (uint8 weight zero points, the 1024-channel depthwise layers as
-  dense convs); the streams and frame refuse them: NPUC tiles the 150x150 and 75x75 layers (nodes 1..8; node 7 in 2
-  row tiles, node 8 in 3) where ncpgen's plan keeps them whole ("NeedsTiling: SRAM 278528 B per core > 256 KiB";
-  29 groups planned against NPUC's 37 for t99, 44 against 58 for t168): the tiling of a chain at 300 px, the
-  big-models work (frame.md 6.11). `tests/regress.sh camera` lists them as its 3 known misses.
+- **ncpgen: exact on all three** (`tests/regress.sh camera`: 5 of 5 with person_detect's two). NPUC's policy at
+  300 px was already ncpgen's (`frame_sweep.py policy`: every node's tiles, the stratum, every memory print): conv1 ..
+  conv8 (the 150x150 and 75x75 layers down to 38x38) one stratum of 4 x 2 tiles, the rest single blocks with 4
+  trim-and-spill copies before the 3x3 depthwise layers at 19x19x512. What ncpgen missed was NPUC's **CMDQ cut of a
+  tile** (cmdq.md 7d): the stratum's estimate, 66570 with the tile's TRIM at 90 per plane slot, passes 61440, so
+  every tile is two groups (16 for the stratum: 37 groups for t99 where ncpgen made 29, 58 for t168). Modelled now
+  (`stream.Plan.cut_tile`, `frame._stratum_cmdq_estimate`, frame.md 6.9).
 - **For the whole detector**: several outputs (the 12 heads in one NCP: the other agent's work) and a lowering change
   for the tail: `tflite_cut` takes one tensor; it should take the set of tensors read by the first CPU-only ops (here
   the 12 heads), lowered.json then carrying several NPU outputs and a CPU tail graph (RESHAPE, CONCATENATION on an

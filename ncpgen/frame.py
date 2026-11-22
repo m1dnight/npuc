@@ -2118,9 +2118,22 @@ def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
            "shapes": shapes, "strata": plan_strata, "unflatten": outs[0], "outputs": outs, "tiled": True}
     cut = [li for st in plan_strata if st["kind"] == "single" for li in st["layers"]
            if _cmdq_estimate(layers[li], shapes[li]) > CMDQ_LIMIT]
-    if cut and not _IN_STREAM:
+    # a stratum whose tiles NPUC cuts for their CMDQ size (6.9; V: ssd-mobilenet-v1 at 300 px, 2 groups a tile)
+    tcut = any(_stratum_cmdq_estimate(layers, shapes, st) > CMDQ_LIMIT for st in plan_strata if st["kind"] == "tiled")
+    if (cut or tcut) and not _IN_STREAM:
         _tiled_cut(low, out, dmas, cut, v_ims, nu)
     return out
+
+
+def _stratum_cmdq_estimate(layers, shapes, st):
+    """NPUC's "Heuristically predicted size of CMDQ" for a tiled stratum (one tile's ops; V: ssd-mobilenet-v1-t99,
+    66570 for conv1 .. conv8 with a trimmed 3-channel input): 16350 + per layer its _cmdq_estimate share + 90 per
+    trimmed plane slot"""
+    lis = st["layers"]
+    e = 16350 + sum(_cmdq_estimate(layers[li], shapes[li]) - 16350 for li in lis)
+    if any(o["op"] == "TRIM" for o in st["ops"]):
+        e += 90 * cdiv(cell(shapes[lis[0]]["in"][0], 1, 1)["cpi"], 2)
+    return e
 
 
 def _tiled_cut(low, p, dmas, cut, v_ims, nu):
