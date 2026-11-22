@@ -36,14 +36,15 @@ the compiler, and it is tested on the host against NPUC.
 | Generate | `ncpgen/ncpgen.py gen model out.ncp [--grelu npuc\|fixed]`; check a part: `ncpgen/<part>.py check <dirs>` |
 | Dump / diff an NCP | `oracle/ncp-dump.py net.ncp --log log.txt [--section isa\|io\|...]` |
 | Ghidra | `oracle/ghidra/run-ghidra.sh decompile <targets.txt>` (one process at a time; JAVA_HOME unset) |
-| Rebuild the harness | `docker run --rm --platform linux/amd64 -v "$PWD":"$PWD" -w "$PWD" python:3.12-slim-bookworm oracle/harness/build.sh` → root-314e61a6 |
+| Rebuild the harness | `docker run --rm --platform linux/amd64 -v "$PWD":"$PWD" -w "$PWD" python:3.12-slim-bookworm oracle/harness/build.sh` → root-fd659af2 (with `dwconv`; `work/n3/root-current`) |
 
 Python: `python3 -I`, standard library only. The host has docker (arm64 containers run NPUC; amd64 ones run the NDK).
 
 ## Where things stand (2026-11-22)
 
 Byte-exact with NPUC on every compiled network except NPUC's 7 uninitialised-byte eltwises (`tests/regress.sh`).
-Not supported yet, in a sensible order: depthwise convolutions (NPUC's ConvAttr has a `group` field: try it in
-`oracle/harness/npuc-net.cpp`), channel split/slice, other activations (leaky ReLU, SiLU; the NCP has a LUT memory type),
+Depthwise: NPUC compiles it as a dense block-diagonal conv, which ncpgen already generates (docs/format/depthwise.md);
+npunet.py must still lower DEPTHWISE_CONV_2D to it. Common models: `models/` (models/README.md). Not supported yet:
+channel split/slice, other activations (leaky ReLU, SiLU; the NCP has a LUT memory type),
 upsampling (NPUC's deconvolution crashed in the harness), several outputs. Nothing beyond one example has been run on
 the NPU; the NPU runs are done elsewhere (the nervesinator porting kit).
