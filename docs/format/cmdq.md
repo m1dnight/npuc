@@ -360,10 +360,10 @@ and targets-trigger, target lists in the stream part's scratch):
   with a DMA on every set, 7891 of 7891** (tiling3, final-chains, frame/fs/{wlive, wstream, spill, ringc}: 1345 of
   1345; the old batch-start replay 1187 of 1396). ARM groups (eltwise) keep the firmware's events (stream.elt_group's
   flags); after one the cursor continues at stream.py's next flag (graph sets: 20 + 18 groups otherwise off by those).
-- **The memory profile, generated (V; `stream.npuc_profile`)**: every element of every group of the chain and tiled
-  sets (corpus .. tiling3, frame/fs/*, frame/s*: 1460 compiles, 140000 elements) matches NPUC's logged profile
-  element by element (the read-back sized by NPUC's own output: wq-w's extra pool column), and the ev2set lines and
-  waits of the schedule run on it equal NPUC's on all 6348 of their groups with a DMA; the graph sets too. Byte
+- **The memory profile, generated (V; `stream.npuc_profile`)**: every element of every non-ARM group of every set
+  (chains, tiles, graphs, the stream sweep: 137198 elements) matches NPUC's logged profile element by element (the
+  read-back sized by NPUC's own output: wq-w's extra pool column; a ReLU's dummy conv reads its pass's slots: g502),
+  and the ev2set lines and waits of the schedule run on it equal NPUC's on all 7891 groups with a DMA. Byte
   ranges per IDP (core k at k x 0x40000), as NPUC logs them (some are not the real accesses: they are what its graph
   sees):
   - a load writes one range per IDP of its cores, its SRAM offset + k x 0x40000, the bytes per core (an input: planes
@@ -558,7 +558,8 @@ need more than 300 pooled plane slots).
 - `stream.plan_dmas(low)`: every DMA in io-descriptor order with its trig_flag, bid (trigger batch), sgid (= NCP
   group), kind, SRAM offset, and for tiles the tile, core and tensor region (rows y0..y1, columns x0..x1: the loaded
   input region aligned to cells, or the stored output region); weight loads carry layer, pass and ring slot offset.
-  Count, flag, bid and sgid match the oracle's io descriptors (bids from `npuc_batch_ids`, 7b).
+  Count, flag, bid and sgid match the oracle's io descriptors on every compile (2635; bids from `npuc_batch_ids`,
+  7b; the tiling3 ra rings loaded core by core were 40 misses under the fitted rule).
 - **frame.py** took the tile geometry (`tile_to_end`), the read-back count (now NPUC's policy, which stream uses
   too) and a 15-weight cap in `batches_from_streams` (c634f9d).
 - NPUC's feature-map sizes can exceed lowered.json's (a VALID pool on an odd width with an even-covered height adds a
