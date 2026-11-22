@@ -25,7 +25,9 @@ interpreter takes and gives them.
 
 What runs on the NPU (the ops nn-eden-drv's NNNetworkBuilder itself hands NPUC on this firmware, V: its strings
 "operator type is conv2d / average_pool_2d / max_pool_2d / reshape / concat", else "not yet supported"):
-CONV_2D (fused NONE or RELU; RELU6 accepted when its clamp is a no-op), MAX_POOL_2D, AVERAGE_POOL_2D,
+CONV_2D (fused NONE or RELU; RELU6 accepted when its clamp is a no-op: TFLite's bound zp + round(6 / scale), float32
+division rounded half away, at or above the type's maximum, as for TFLite's own ReLU6 output 6/255 zp -128: relu6_top),
+MAX_POOL_2D, AVERAGE_POOL_2D,
 FULLY_CONNECTED (lowered here to a CONV_2D whose kernel covers its input). RESHAPE before a FULLY_CONNECTED or at the
 end, and SOFTMAX at the end, run on the host's CPU. Graph ops through the harness's "npuc-net 2" layers
 (docs/harness-ops.md; NPUC compiles them, nothing of them has run on the NPU yet):
@@ -538,11 +540,33 @@ def _resolve(g):
     return out, "#in", warns, show
 
 
+def relu6_top(zp, scale):
+    """TFLite's quantised RELU6 upper bound, in the lowered u8 domain, before TFLite caps it at the type's maximum:
+    zp + round(6 / scale), the division in float32 and the rounding half away from zero (kernel_util.cc Quantize:
+    TfLiteRound(f / scale), i.e. std::round, for a fused RELU6; activations.cc QuantizedReluX: roundf(6.0f / scale)
+    for the RELU6 op). TFLite's standard ReLU6 output, scale 6/255 with zero point -128 (u8 0): the float32 quotient
+    is exactly 255.0, the bound 0 + 255 = 255 (int8 127), so TFLite's clamp at 6.0 is the saturation and the layer is
+    a RELU (the exact quotient, 254.999995, would put the clamp inside the range)."""
+    return zp + int(math.floor(f32(6.0 / f32(scale)) + 0.5))
+
+
+def _relu6_as_relu(name, zp, scale, low):
+    """True (with a warning) when RELU6's clamp at 6.0 is a no-op for this output quantisation (relu6_top)"""
+    top = relu6_top(zp, scale)
+    if top < 255:
+        return False
+    if zp + 6.0 / scale >= 255:
+        low["warnings"].append("%s: RELU6 taken as RELU (6.0 is above the output range: the clamp is a no-op)" % name)
+    else:
+        low["warnings"].append("%s: RELU6 taken as RELU (TFLite's bound zp + round(6 / scale) is the saturation, %d: "
+                               "the clamp is a no-op)" % (name, 127 if low["io_dtype"] == "int8" else 255))
+    return True
+
+
 def _fused_act(name, what, act, zp, scale, low):
     """a fused activation on an op whose activation becomes a relu layer: none or relu (RELU6 when its clamp is a no-op)"""
     if act == "relu6":
-        if zp + 6.0 / scale >= 255:
-            low["warnings"].append("%s: RELU6 taken as RELU (6.0 is above the output range: the clamp is a no-op)" % name)
+        if _relu6_as_relu(name, zp, scale, low):
             return "relu"
         raise Refused("%s: %s with RELU6 clamping inside the output range: NPUC's standalone ReLU6 clamps at a fixed "
                       "accumulator value (0x60) whatever the scales (docs/format/grelu.md 7)" % (name, what))
@@ -693,9 +717,7 @@ def _lower_conv(lw, idx, L, op, name, key, ins, srcs):
     oz = lw.u8zp(int(outq["zero_point"]))
     act = L.get("activation", "none")
     if act == "relu6":
-        q6 = oz + 6.0 / os_
-        if q6 >= 255:
-            lw.low["warnings"].append("%s: RELU6 taken as RELU (6.0 is above the output range: the clamp is a no-op)" % name)
+        if _relu6_as_relu(name, oz, os_, lw.low):
             act = "relu"
         else:
             raise Refused("%s: RELU6 clamps inside the output range (NPUC: 'Unsupported FusedActivation type' 3)" % name)
@@ -1948,6 +1970,26 @@ def selftest_graph():
     r6b["layers"][0]["output"]["scale"] = 0.1
     r6b["layers"][3]["output"]["scale"] = 0.1
     ok.append(("RELU6 clamping inside the range refused (NPUC's fixed clamp at 0x60)", "0x60" in _refusal(lambda: lower(r6b))))
+    # RELU6 at TFLite's own output quantisation 6/255, zp -128: 6.0f / scale is 255.0 in float32 (254.999995 exact),
+    # TFLite's bound -128 + 255 = 127 = the saturation: a RELU, fused, after an ADD and standalone; 6/254 clamps at 126
+    ok.append(("RELU6 bound: 6/255 zp -128 -> 255 (u8; int8 127), 6/127 zp 0 -> 255, 6/254 -> 254",
+               (relu6_top(0, 6 / 255), relu6_top(128, 6 / 127), relu6_top(0, 6 / 254)) == (255, 255, 254)))
+    t6 = _sgraph([dict(_sconv("a", 8, 8, r), activation="relu6", output={"scale": 6 / 255, "zero_point": -128})])
+    l6 = lower(t6)
+    ok.append(("fused RELU6 at 6/255 zp -128: a RELU conv (TFLite's rounding), warned",
+               l6["layers"][0]["act"] == 1 and any("round(6 / scale)" in w for w in l6["warnings"])))
+    t6b = json.loads(json.dumps(t6))
+    t6b["layers"][0]["output"]["scale"] = 6 / 254
+    ok.append(("fused RELU6 at 6/254 zp -128 (bound 126) refused", "RELU6 clamps inside" in _refusal(lambda: lower(t6b))))
+    t6c = _sgraph([_sconv("a", 8, 8, r, out_scale=6 / 255), {"op": "max_pool2d", "name": "p", "pool": [2, 2], "strides": [2, 2]},
+                   {"op": "relu6", "name": "r"}, _sconv("c", 8, 8, r)])
+    t6c["layers"][0]["output"]["zero_point"] = -128
+    ok.append(("standalone RELU6 at 6/255 zp -128: a ReLU layer", [l["kind"] for l in lower(t6c)["layers"]][2] == "relu"))
+    t6d = _sgraph([_sconv("a", 8, 8, r, inp="x", act="none", out_scale=1 / 64), _sconv("b", 8, 8, r, inp="x", act="none", out_scale=1 / 64),
+                   {"op": "add", "name": "s", "inputs": ["a", "b"], "activation": "relu6", "output": {"scale": 1 / 64, "zero_point": 0}},
+                   _sconv("c", 8, 8, r)])
+    ok.append(("ADD with fused RELU6 at 2^-6 zp 0 (bound 128 + 384): eltwise + relu layer",
+               [l["kind"] for l in lower(t6d, quant=3, allow_none=True)["layers"]] == ["conv", "conv", "eltwise", "relu", "conv"]))
     rq = json.loads(json.dumps(pg))
     rq["layers"][2]["output"] = {"scale": 1 / 64, "zero_point": 0}
     ok.append(("RELU with another output quantisation refused", "keeps its input's quantisation" in _refusal(lambda: lower(rq))))
