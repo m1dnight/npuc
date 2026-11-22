@@ -28,13 +28,15 @@ What runs on the NPU (the ops nn-eden-drv's NNNetworkBuilder itself hands NPUC o
 CONV_2D (fused NONE or RELU; RELU6 accepted when its clamp is a no-op: TFLite's bound zp + round(6 / scale), float32
 division rounded half away, at or above the type's maximum, as for TFLite's own ReLU6 output 6/255 zp -128: relu6_top),
 MAX_POOL_2D, AVERAGE_POOL_2D,
-FULLY_CONNECTED (lowered here to a CONV_2D whose kernel covers its input). RESHAPE before a FULLY_CONNECTED or at the
+FULLY_CONNECTED (lowered here to a CONV_2D whose kernel covers its input), DEPTHWISE_CONV_2D (depth multiplier 1:
+lowered to the CONV_2D whose kernel is the dense C x C block diagonal, the form NPUC itself compiles on the device
+path, docs/format/depthwise.md; the CPU reference is that conv's). RESHAPE before a FULLY_CONNECTED or at the
 end, and SOFTMAX at the end, run on the host's CPU. Graph ops through the harness's "npuc-net 2" layers
 (docs/harness-ops.md; NPUC compiles them, nothing of them has run on the NPU yet):
   ADD -> eltwise Add (--quant 3 only, every scale 2^-n, no broadcasting; a fused RELU -> a relu layer after it);
   CONCATENATION -> concat (channels only, every input already in the output's quantisation, not the network input);
   RELU (RELU6 when its clamp is a no-op) -> folded into the conv before it when it alone reads that conv, else relu.
-Anything else (DEPTHWISE_CONV_2D, MUL...) is refused with its name. A chain of conv/pool layers is written as
+Anything else (MUL, LOGISTIC...) is refused with its name. A chain of conv/pool layers is written as
 "npuc-net 1", exactly as before; "npuc-net 2" only when a graph op is present.
 
 NPUC's arithmetic, as far as it is known (dossier/npu-compiler.md section 9.12):
@@ -336,7 +338,10 @@ def _read_tflite(data):
                             "stride_h": opt.scalar(2, "i", 0), "act": ACTS.get(opt.scalar(3, "b", 0), "?"),
                             "dil_w": opt.scalar(4, "i", 1), "dil_h": opt.scalar(5, "i", 1)}
             elif name == "DEPTHWISE_CONV_2D" and otype == 2:
-                d["opt"] = {"padding": PADS[opt.scalar(0, "b", 0)], "act": ACTS.get(opt.scalar(4, "b", 0), "?")}
+                d["opt"] = {"padding": PADS[opt.scalar(0, "b", 0)], "stride_w": opt.scalar(1, "i", 0),
+                            "stride_h": opt.scalar(2, "i", 0), "depth_multiplier": opt.scalar(3, "i", 0),
+                            "act": ACTS.get(opt.scalar(4, "b", 0), "?"), "dil_w": opt.scalar(5, "i", 1),
+                            "dil_h": opt.scalar(6, "i", 1)}
             elif name in ("MAX_POOL_2D", "AVERAGE_POOL_2D") and otype == 5:
                 d["opt"] = {"padding": PADS[opt.scalar(0, "b", 0)], "stride_w": opt.scalar(1, "i", 0),
                             "stride_h": opt.scalar(2, "i", 0), "filter_w": opt.scalar(3, "i", 0),
@@ -405,25 +410,36 @@ def tflite_to_graph(tf, src):
             if t not in known:
                 raise Refused("%s (%r) reads tensor %d (%r), which is neither the model's input nor an earlier op's output "
                               "(a constant operand is not supported)" % (op, name, t, T[t]["name"] if 0 <= t < len(T) else "?"))
-        if op in ("CONV_2D", "FULLY_CONNECTED"):
+        if op in ("CONV_2D", "FULLY_CONNECTED", "DEPTHWISE_CONV_2D"):
             w, b = T[o["inputs"][1]], (T[o["inputs"][2]] if len(o["inputs"]) > 2 and o["inputs"][2] >= 0 else None)
             if w["dtype"] not in ("int8", "uint8"):
                 raise Refused("%s %r: weights %s (int8/uint8 wanted)" % (op, name, w["dtype"]))
             os_, oz = _q1(out, op + " output")
-            L = {"op": "conv2d" if op == "CONV_2D" else "fully_connected", "name": name,
+            nout = w["shape"][-1] if op == "DEPTHWISE_CONV_2D" else w["shape"][0]
+            L = {"op": {"CONV_2D": "conv2d", "FULLY_CONNECTED": "fully_connected",
+                        "DEPTHWISE_CONV_2D": "depthwise_conv2d"}[op], "name": name,
                  "activation": o["opt"].get("act", "none"),
-                 "weights": {"dtype": w["dtype"], "layout": "OHWI" if op == "CONV_2D" else "OI", "shape": w["shape"],
+                 "weights": {"dtype": w["dtype"], "layout": {"CONV_2D": "OHWI", "FULLY_CONNECTED": "OI",
+                                                             "DEPTHWISE_CONV_2D": "1HWO"}[op], "shape": w["shape"],
                              "scale": [float(v) for v in w["scale"]], "zero_point": [int(v) for v in w["zero_point"]],
                              "data": _ints(w["data"], w["dtype"])},
-                 "bias": _ints(b["data"], "int32") if b is not None and b["data"] else [0] * w["shape"][0],
+                 "bias": _ints(b["data"], "int32") if b is not None and b["data"] else [0] * nout,
                  "output": {"scale": os_, "zero_point": oz}}
             if b is not None and b["dtype"] != "int32":
                 raise Refused("%s %r: bias %s (int32 wanted)" % (op, name, b["dtype"]))
-            if op == "CONV_2D":
+            if op in ("CONV_2D", "DEPTHWISE_CONV_2D"):
                 if o["opt"].get("dil_w", 1) != 1 or o["opt"].get("dil_h", 1) != 1:
-                    raise Refused("CONV_2D %r: dilation (not supported)" % name)
-                L.update({"filters": w["shape"][0], "kernel": [w["shape"][1], w["shape"][2]],
+                    raise Refused("%s %r: dilation %dx%d (not supported)" % (op, name, o["opt"]["dil_h"], o["opt"]["dil_w"]))
+                L.update({"kernel": [w["shape"][1], w["shape"][2]],
                           "strides": [o["opt"]["stride_h"], o["opt"]["stride_w"]], "padding": o["opt"]["padding"]})
+                if op == "CONV_2D":
+                    L["filters"] = w["shape"][0]
+                else:
+                    # per-channel weight scales run along the channel axis (3) of the 1HWO filter
+                    if len(w["scale"]) > 1 and w["qdim"] != 3:
+                        raise Refused("DEPTHWISE_CONV_2D %r: %d weight scales on axis %d (axis 3 wanted)"
+                                      % (name, len(w["scale"]), w["qdim"]))
+                    L["depth_multiplier"] = o["opt"]["depth_multiplier"]
             else:
                 L["units"] = w["shape"][0]
         elif op in ("MAX_POOL_2D", "AVERAGE_POOL_2D"):
@@ -448,8 +464,8 @@ def tflite_to_graph(tf, src):
             s_, z_ = _q1(out, op + " output")
             L = {"op": op.lower(), "name": name, "output": {"scale": s_, "zero_point": z_}}
         else:
-            raise Refused("op %s (%r) is not supported: the NPU path takes CONV_2D, MAX/AVERAGE_POOL_2D, FULLY_CONNECTED, "
-                          "ADD, CONCATENATION and RELU; RESHAPE and SOFTMAX run on the CPU at the end" % (op, name))
+            raise Refused("op %s (%r) is not supported: the NPU path takes CONV_2D, DEPTHWISE_CONV_2D, "
+                          "MAX/AVERAGE_POOL_2D, FULLY_CONNECTED, ADD, CONCATENATION and RELU; RESHAPE and SOFTMAX run on the CPU at the end" % (op, name))
         L["id"] = "t%d" % o["outputs"][0]
         L["inputs"] = ["t%d" % t for t in data]
         g["layers"].append(L)
@@ -753,6 +769,56 @@ def _lower_conv(lw, idx, L, op, name, key, ins, srcs):
     return {"name": name, "chw": [cout, ho, wo], "scale": os_, "zp": oz}
 
 
+def depthwise_dense(L, C, name):
+    """An npu-net/1 depthwise_conv2d (filter 1HWO, TFLite's layout) on C input channels -> the conv2d NPUC compiles in
+    its place on the device path: C outputs, the dense OHWI kernel holding channel o's taps at input o and the weight
+    zero point elsewhere, the same scales (per channel: output o's), bias, strides, padding and activation (V: the
+    stock path's NCP is byte for byte this conv's on 118 networks, docs/format/depthwise.md section 4). Depth
+    multiplier 1 only (a filter of C channels); no dilation."""
+    kh, kw = L["kernel"]
+    wt = L["weights"]
+    if wt.get("layout", "1HWO") != "1HWO":
+        raise Refused("depthwise %s: weights layout %s (1HWO wanted, TFLite's)" % (name, wt.get("layout")))
+    if list(L.get("dilation", [1, 1])) != [1, 1]:
+        raise Refused("depthwise %s: dilation %s (not supported)" % (name, L["dilation"]))
+    data = wt["data"]
+    if not kh * kw or len(data) % (kh * kw):
+        raise Refused("depthwise %s: %d weights for a %dx%d kernel" % (name, len(data), kh, kw))
+    co = len(data) // (kh * kw)
+    dm = int(L.get("depth_multiplier", 1))     # TFLite's option; 0 (unset) leaves it to the filter
+    if co != C or dm not in (0, 1):
+        raise Refused("depthwise %s: a %d-channel filter on %d input channels (depth_multiplier %d): only multiplier 1 is "
+                      "lowered, to the dense block-diagonal conv NPUC compiles on the device path (its ConvAttr takes "
+                      "group = C, one output per input channel; docs/format/depthwise.md)" % (name, co, C, dm))
+    zps = wt.get("zero_point", 0)
+    zps = [int(v) for v in zps] if isinstance(zps, list) else [int(zps)]
+    if len(set(zps)) != 1:
+        raise Refused("depthwise %s: per-channel weight zero points %s (one wanted)" % (name, sorted(set(zps))))
+    K = kh * kw
+    dense = [zps[0]] * (C * K * C)
+    for o in range(C):
+        for t in range(K):
+            dense[(o * K + t) * C + o] = data[t * C + o]
+    return {"op": "conv2d", "name": L.get("name", name), "filters": C, "kernel": [kh, kw],
+            "strides": L.get("strides", [1, 1]), "padding": L.get("padding", "same"),
+            "activation": L.get("activation", "none"),
+            "weights": {"dtype": wt["dtype"], "layout": "OHWI", "scale": wt["scale"], "zero_point": wt.get("zero_point", 0),
+                        "data": dense},
+            "bias": L["bias"], "output": L["output"]}
+
+
+def _lower_depthwise(lw, idx, L, op, name, key, ins, srcs):
+    """DEPTHWISE_CONV_2D (multiplier 1) as the regular conv with the dense block-diagonal kernel (depthwise_dense):
+    then CONV_2D's rules (per-channel scales: --fold-per-channel), its lowered layer and its CPU reference"""
+    C, kh, kw = srcs[0]["chw"][0], L["kernel"][0], L["kernel"][1]
+    blob = _lower_conv(lw, idx, depthwise_dense(L, C, name), "conv2d", name, key, ins, srcs)
+    lw.low["layers"][-1]["from"] = "depthwise_conv2d"
+    lw.low["warnings"].append("%s: DEPTHWISE_CONV_2D %dx%d on %d channels lowered to the dense %dx%d conv with "
+                              "block-diagonal weights (NPUC's own form on the device path)" % (name, kh, kw, C, kh, kw))
+    lw.low["unproven"].append("%s: depthwise as the dense block-diagonal conv NPUC compiles (not run on the NPU)" % name)
+    return blob
+
+
 def _lower_pool(lw, idx, L, op, name, key, ins, srcs):
     """MAX/AVERAGE_POOL_2D (NFU strides up to 3, the input's quantisation kept)"""
     cur = srcs[0]
@@ -924,7 +990,8 @@ def _lower_softmax(lw, idx, L, op, name, key, ins, srcs):
     return dict(cur, tail=True)
 
 
-LOWER_OPS = {"conv2d": _lower_conv, "fully_connected": _lower_conv, "max_pool2d": _lower_pool,
+LOWER_OPS = {"conv2d": _lower_conv, "fully_connected": _lower_conv, "depthwise_conv2d": _lower_depthwise,
+             "max_pool2d": _lower_pool,
              "average_pool2d": _lower_pool, "add": _lower_add, "concat": _lower_concat, "relu": _lower_relu,
              "relu6": _lower_relu, "reshape": _lower_reshape, "softmax": _lower_softmax}
 
@@ -968,7 +1035,8 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
             if gap is not None:
                 L, op = gap, "conv2d"
         if op not in LOWER_OPS:
-            raise Refused("op %s is not supported (conv2d, fully_connected, max_pool2d, average_pool2d, add, concat, relu; "
+            raise Refused("op %s is not supported (conv2d, depthwise_conv2d, fully_connected, max_pool2d, average_pool2d, add, "
+                          "concat, relu; "
                           "reshape and softmax at the end)" % op)
         lw.blobs[key] = LOWER_OPS[op](lw, idx, L, op, name, key, ins, srcs)
     if not low["layers"]:
@@ -1510,13 +1578,20 @@ def graph_to_tflite(g):
     ops, codes = [], []
     acts = {"none": 0, "relu": 1, "relu6": 3}
 
-    def tensor(name, shape, dtype, scale=None, zp=None, data=None):
+    def tensor(name, shape, dtype, scale=None, zp=None, data=None, qdim=0):
         bi = 0
         if data is not None:
             buffers.append(bytes(data))
             bi = len(buffers) - 1
-        tensors.append({"name": name, "shape": shape, "dtype": dtype, "scale": scale, "zp": zp, "buffer": bi})
+        tensors.append({"name": name, "shape": shape, "dtype": dtype, "scale": scale, "zp": zp, "buffer": bi,
+                        "qdim": qdim})
         return len(tensors) - 1
+
+    def lst(v):
+        return list(v) if isinstance(v, list) else [v]
+
+    def osz(n, k, s, pad):
+        return (n + s - 1) // s if pad == "same" else (n - k) // s + 1
 
     def code(name):
         if OPCODE[name] not in codes:
@@ -1551,6 +1626,24 @@ def graph_to_tflite(g):
                                                                (1, "i", L["strides"][1]), (2, "i", L["strides"][0]),
                                                                (3, "b", acts[L["activation"]]),
                                                                (4, "i", 1), (5, "i", 1)]))
+        elif L["op"] == "depthwise_conv2d":
+            w = L["weights"]
+            kh, kw = L["kernel"]
+            sh, sw = L.get("strides", [1, 1])
+            C = len(w["data"]) // (kh * kw)
+            ws, wz = lst(w["scale"]), lst(w.get("zero_point", 0))
+            wt = tensor(L["name"] + "/weights", [1, kh, kw, C], w["dtype"], ws, wz * (len(ws) // len(wz) or 1),
+                        struct.pack("<%d%s" % (len(w["data"]), "b" if w["dtype"] == "int8" else "B"), *w["data"]),
+                        qdim=3 if len(ws) > 1 else 0)
+            bt = tensor(L["name"] + "/bias", [C], "int32", [sc * s for s in ws], [0] * len(ws),
+                        struct.pack("<%di" % len(L["bias"]), *L["bias"]))
+            pad = L.get("padding", "same")
+            o = tensor(L["name"], [1, osz(shape[1], kh, sh, pad), osz(shape[2], kw, sw, pad), C], dt,
+                       [L["output"]["scale"]], [L["output"]["zero_point"]])
+            ops.append(("DEPTHWISE_CONV_2D", [ins[0], wt, bt], [o], 2, [
+                (0, "b", 0 if pad == "same" else 1), (1, "i", sw), (2, "i", sh),
+                (3, "i", int(L.get("depth_multiplier", 1))), (4, "b", acts[L.get("activation", "none")]),
+                (5, "i", 1), (6, "i", 1)]))
         elif L["op"] == "max_pool2d":
             kh, kw = L["pool"]
             sh, sw = L["strides"]
@@ -1575,7 +1668,8 @@ def graph_to_tflite(g):
 
     def wq(t):
         return lambda: fb.table([(2, "ref", lambda: fb.vec_scalars("f", t["scale"])),
-                                 (3, "ref", lambda: fb.vec_scalars("q", t["zp"], 8))])
+                                 (3, "ref", lambda: fb.vec_scalars("q", t["zp"], 8))] +
+                                ([(6, "i", t["qdim"])] if t["qdim"] else []))
 
     def wtensor(t):
         f = [(0, "ref", lambda: fb.vec_scalars("i", t["shape"])), (1, "b", TTYPE[t["dtype"]]), (2, "I", t["buffer"]),
@@ -1844,6 +1938,7 @@ def selftest():
     bad3["input"]["zero_point"] = -5
     ok.append(("quant mode 3 with a zero point != 0 (int8) refused", _refuses(lambda: lower(bad3, quant=3))))
     ok += selftest_graph()
+    ok += selftest_models()
     for name, v in ok:
         print("selftest: %-70s %s" % (name, "ok" if v else "FAIL"))
     good = all(v for _, v in ok)
@@ -2019,7 +2114,7 @@ def selftest_graph():
     b8 = _sgraph([_sconv("a", 8, 8, r, inp="nope")])
     ok.append(("a layer reading an unknown tensor refused", "neither the network input" in _refusal(lambda: lower(b8))))
     ok.append(("an unsupported op refused with its name (npu-net/1)",
-               "depthwise_conv2d" in _refusal(lambda: lower(_sgraph([_sconv("a", 8, 8, r), {"op": "depthwise_conv2d"}])))))
+               "op mul is not" in _refusal(lambda: lower(_sgraph([_sconv("a", 8, 8, r), {"op": "mul"}])))))
     tq = {"name": "x", "shape": [1, 4, 4, 2], "dtype": "int8", "scale": [0.5], "zero_point": [0], "data": b""}
     tf = {"tensors": [tq, dict(tq, name="m"), dict(tq, name="k")], "inputs": [0], "outputs": [1],
           "ops": [{"op": "MUL", "inputs": [0, 0], "outputs": [1], "opt": {}}]}
@@ -2052,6 +2147,74 @@ def selftest_graph():
     u5 = lower(_sgraph(wg, shape=(1, 16, 17, 8)))["unproven"]
     ok.append(("a VALID pool widened by NPUC, read by a conv: named unproven (cmdq.md 7); last layer: not",
                any("cmdq.md 7" in u for u in u4) and not any("cmdq.md 7" in u for u in u5)))
+    return ok
+
+
+def _dwgraph(C=8, k=3, s=1, pad="same", r=None, scale=1 / 256, extra=None):
+    """input 8x8xC int8 -> depthwise kxk (multiplier 1, 1HWO weights) -> 1x1 conv"""
+    r = r or random.Random(7)
+    dw = {"op": "depthwise_conv2d", "name": "dw", "kernel": [k, k], "strides": [s, s], "padding": pad,
+          "depth_multiplier": 1, "activation": "relu",
+          "weights": {"dtype": "int8", "layout": "1HWO", "scale": scale, "zero_point": 0,
+                      "data": [r.randint(-40, 40) for _ in range(k * k * C)]},
+          "bias": [r.randint(-300, 300) for _ in range(C)], "output": {"scale": 1 / 128, "zero_point": 0}}
+    dw.update(extra or {})
+    return _sgraph([dw, _sconv("pw", C, 8, r, k=1)], shape=(1, 8, 8, C))
+
+
+def selftest_models():
+    """what real models need: DEPTHWISE_CONV_2D as the dense block-diagonal conv"""
+    ok = []
+    strip = lambda l: [{k: v for k, v in x.items() if k not in ("src_name", "from")} for x in l["layers"]]
+    # depthwise -> the dense conv NPUC compiles on the device path: taps on the diagonal, the zero point elsewhere
+    dg = _dwgraph()
+    ld = lower(dg)
+    L0, dw = ld["layers"][0], dg["layers"][0]
+    w = L0["weights_oihw_u8"]
+    diag = all(w[((o * 8 + i) * 3 + y) * 3 + x] == (dw["weights"]["data"][(y * 3 + x) * 8 + o] + 128 if i == o else 128)
+               for o in range(8) for i in range(8) for y in range(3) for x in range(3))
+    ok.append(("depthwise 3x3 on 8 channels -> a conv 8->8, from depthwise_conv2d, the dense block-diagonal kernel",
+               L0["kind"] == "conv" and L0["from"] == "depthwise_conv2d" and L0["cout"] == 8 and diag))
+    dense = json.loads(json.dumps(dg))
+    dense["layers"][0] = depthwise_dense(dw, 8, "dw")
+    ok.append(("depthwise: the same lowered layers as the network written with the dense conv (zoo's -dense form)",
+               strip(ld) == strip(lower(dense)) and npuc_text(ld) == npuc_text(lower(dense))))
+    # the reference: the regular conv's, = a direct depthwise formula
+    x = bytes(random.Random(8).randrange(256) for _ in range(512))
+    xc = model_in_to_chw(ld, x)
+    y = ref_conv(L0, xc, "half_away", False, 1)
+    wd, bias = dw["weights"]["data"], dw["bias"]
+    exp = bytearray()
+    for o in range(8):
+        for yy in range(8):
+            for xx in range(8):
+                acc = bias[o] + sum((xc[(o * 8 + yy + i - 1) * 8 + xx + j - 1] - 128) * wd[(i * 3 + j) * 8 + o]
+                                    for i in range(3) for j in range(3) if 0 <= yy + i - 1 < 8 and 0 <= xx + j - 1 < 8)
+                q = 128 + rnd(Fraction(acc * L0["slope"], 1 << L0["shift"]), "half_away")
+                exp.append(max(128, min(255, q)))
+    ok.append(("depthwise reference = a direct per-channel formula (SAME, relu, half away)", y == bytes(exp)))
+    # stride 2 VALID, 5x5
+    l2 = lower(_dwgraph(C=16, k=5, s=2, pad="valid"))
+    ok.append(("depthwise 5x5 stride 2 VALID on 16 channels -> a 5x5 s2 conv 16->16, out 16x2x2",
+               l2["layers"][0]["k"] == [5, 5] and l2["layers"][0]["stride"] == [2, 2] and l2["layers"][0]["out_chw"] == [16, 2, 2]))
+    # the TFLite form (DEPTHWISE_CONV_2D, filter [1, kh, kw, C], per-channel scales on axis 3) lowers the same
+    pc = _dwgraph(scale=[1 / 256 * (1 + c / 16) for c in range(8)])
+    tf = read_tflite(graph_to_tflite(pc))
+    wt = [t for t in tf["tensors"] if t["name"] == "dw/weights"][0]
+    ok.append(("depthwise TFLite: filter [1, 3, 3, 8], 8 scales on axis 3", wt["shape"] == [1, 3, 3, 8] and
+               len(wt["scale"]) == 8 and wt["qdim"] == 3))
+    a, b = lower(pc, fold=True), lower(tflite_to_graph(tf, "dw.tflite"), fold=True)
+    ok.append(("depthwise TFLite round trip (per-channel scales folded): the same lowered layers", strip(a) == strip(b)))
+    ok.append(("depthwise per-channel scales refused without --fold-per-channel", "per-channel" in _refusal(lambda: lower(pc))))
+    # refusals: multiplier 2, dilation (JSON and TFLite)
+    m2 = _dwgraph(extra={"depth_multiplier": 2})
+    m2["layers"][0]["weights"]["data"] *= 2
+    m2["layers"][0]["bias"] *= 2
+    ok.append(("depthwise multiplier 2 refused (only 1)", "only multiplier 1" in _refusal(lambda: lower(m2))))
+    ok.append(("depthwise dilation refused (npu-net/1)", "dilation" in _refusal(lambda: lower(_dwgraph(extra={"dilation": [2, 2]})))))
+    td = read_tflite(graph_to_tflite(dg))
+    [o_ for o_ in td["ops"] if o_["op"] == "DEPTHWISE_CONV_2D"][0]["opt"]["dil_h"] = 2
+    ok.append(("depthwise dilation refused (TFLite)", "dilation 2x1" in _refusal(lambda: tflite_to_graph(td, "d"))))
     return ok
 
 

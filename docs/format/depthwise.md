@@ -21,7 +21,9 @@ Tags: **V** verified (bytes, NPUC's log or code read), **G** guess. Sweep tool: 
 - **ncpgen already writes those NCPs**: `ncpgen.py check` on the dense form: 78/78 whole files exact, the full
   MobileNet v1 0.25 on 96x96x1 (quant 1 and 3) included, and 39/40 on the unseen random set (V). The miss is a gap in
   weights.py's existing sub-batch rule, not a depthwise matter (section 4). Supporting depthwise in ncpgen is a
-  lowering job in npunet.py (section 6), no format work.
+  lowering job in npunet.py (section 6), no format work: **done** (`npunet.depthwise_dense`, TFLite DEPTHWISE_CONV_2D
+  and npu-net/1 `depthwise_conv2d`, multiplier 1). The zoo's MobileNet v1 0.25 and v2 0.35 (models/zoo.py) compiled
+  by NPUC from their depthwise form give their `-dense` NCPs byte for byte; v1 is exact in ncpgen (V).
 - **NPUC also has a real depthwise path ("DW opt")**, used for Caffe models off the device: the frontend takes it only
   when the layer's framework string is "scaffe", and the on-device frontend's is always "stensorflow". Through the
   harness's hook it compiles: mostly the same instruction count, a smaller weight block (a 16-input-channel conv per
@@ -130,7 +132,7 @@ dense ones (one bunch), and so is the NCP except where the stride-2 planner sizi
 
 ## 6. What ncpgen and npunet.py need
 
-**Part 1, stock depthwise (small; the only one needed to run MobileNet-class models)**
+**Part 1, stock depthwise (small; the only one needed to run MobileNet-class models): done 2026-11-22**
 - npunet.py: lower TFLite DEPTHWISE_CONV_2D (filter [1, kh, kw, C x m], depth_multiplier m, padding, strides,
   dilation 1, fused activation) and npu-net/1's own depthwise op to a lowered `conv` with cout = C and the dense
   diagonal OIHW kernel: w[o][i][y][x] = tap(o, y, x) when i == o, else the weight zero point (128 in npunet's u8

@@ -102,12 +102,11 @@ class Net:
     0.75..1.5; ReLU6 outputs use TFLite's (6/255, zp -128; quant 3: 6/127, zp 0). pow2=True rounds every activation
     scale to a power of two (what NPUC's Eltwise add needs). quant 3 (native s8) puts every zero point at 0."""
 
-    def __init__(self, family, hwc, scale, zp, quant=1, pow2=False, dense=False, relu6_as=None, shapes_only=False,
-                 desc=""):
+    def __init__(self, family, hwc, scale, zp, quant=1, pow2=False, dense=False, shapes_only=False, desc=""):
         if quant == 3 and zp != 0:
             raise ValueError("quant 3: input zero point 0")
         self.family, self.quant, self.pow2, self.dense = family, quant, pow2, dense
-        self.relu6_as, self.shapes_only, self.desc = relu6_as, shapes_only, desc
+        self.shapes_only, self.desc = shapes_only, desc
         rms = math.sqrt(sum((v - zp) ** 2 for v in range(-128, 128)) / 256)  # a uniform random input, centred
         self.T = {"input": {"hwc": list(hwc), "scale": f32(scale), "zp": zp, "rms": rms, "nonneg": False}}
         self.inp = {"name": "input", "shape": [1] + list(hwc), "dtype": "int8", "scale": f32(scale), "zero_point": zp}
@@ -135,7 +134,7 @@ class Net:
     def _act(self, act):
         if act == "none":
             self.none = True
-        return self.relu6_as if act == "relu6" and self.relu6_as else act
+        return act
 
     def _emit(self, L, t, inp):
         if L["name"] in self.T:
@@ -673,14 +672,8 @@ def _mnv1(n):
 
 MNV1_SRC = ("MobileNet v1 0.25 (Howard et al. 2017), the TensorFlow Lite Micro person_detection model: 13 depthwise-"
             "separable blocks, 8..256 channels, average pool 3x3/2, 1x1 conv to 2 classes")
-MNV1_GAPS = ["DEPTHWISE_CONV_2D (13 layers): not supported (npunet refuses the op; NPUC's ConvAttr has a group field)",
-             "fused RELU6 with TFLite's output quantisation (6/255, zp -128): the clamp is the saturation (TFLite: "
-             "zp + round(6/scale) = 127), but npunet tests zp + 6/scale >= 255 in float32 (254.999995) and refuses it: "
-             "use TFLite's rounding"]
-
-
 @model("mobilenet-v1-025", "mobilenet-v1-025", MNV1_SRC, "person detection, 96x96x1 grayscale, 2 classes",
-       adapt=COMMON[:1] + ["the logits conv (no activation): --allow-none"], gaps=MNV1_GAPS, expect="refused")
+       adapt=COMMON[:1] + ["the logits conv (no activation): --allow-none"])
 def _mnv1_pub(n):
     _mnv1(n)
 
@@ -688,8 +681,6 @@ def _mnv1_pub(n):
 @model("mobilenet-v1-025-dense", "mobilenet-v1-025", MNV1_SRC, "person detection, 96x96x1 grayscale, 2 classes",
        adapt=COMMON[:1] + ["each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function; "
                            "C times the weights of that layer counted dense, the zeros skipped by NPUC's weight format)",
-                           "RELU6 written as RELU with ReLU6's quantisation (6/255, zp -128): the same function, since "
-                           "the clamp at 6.0 is the int8 saturation (npunet's float test refuses RELU6 there)",
                            "the logits conv: --allow-none"])
 def _mnv1_dense(n):
     _mnv1(n)
@@ -725,8 +716,8 @@ MNV2_AD = COMMON[:1] + ["every activation scale a power of two except ReLU6's, e
 
 
 @model("mobilenet-v2-035", "mobilenet-v2-035", MNV2_SRC, "96x96x3 images, 1000 classes", adapt=MNV2_AD,
-       gaps=["DEPTHWISE_CONV_2D (17 layers)", "MEAN (Keras' GlobalAveragePooling2D) is not taken by npunet's TFLite "
-             "reader: lower MEAN over H, W like a global AVERAGE_POOL_2D"], expect="refused")
+       gaps=["MEAN (Keras' GlobalAveragePooling2D) is not taken by npunet's TFLite reader: lower MEAN over H, W like a "
+             "global AVERAGE_POOL_2D"])
 def _mnv2_pub(n):
     _mnv2(n)
 
@@ -757,8 +748,7 @@ DSCNN_SRC = ("DS-CNN (Zhang et al. 2017, Hello Edge), the MLPerf Tiny keyword-sp
 
 
 @model("ds-cnn", "ds-cnn", DSCNN_SRC, "keyword spotting, 49x10 MFCC, 12 classes", adapt=COMMON,
-       gaps=["DEPTHWISE_CONV_2D (4 layers)",
-             "the 25x5 global average pool: npunet refuses a pool kernel > 14 ('as a conv its kernel may be up to 14x14 "
+       gaps=["the 25x5 global average pool: npunet refuses a pool kernel > 14 ('as a conv its kernel may be up to 14x14 "
              "(V)'), but NPUC compiles a 25x5 VALID conv over 64 channels, byte-exact in ncpgen (probe 2026-11-22): "
              "relax the limit to what NPUC takes"], expect="refused")
 def _dscnn_pub(n):
@@ -791,8 +781,7 @@ INPUTS = {
 def build(name, shapes_only=False):
     m = MODELS[name]
     hwc, sc, zp, q, p2 = INPUTS[m["family"]]
-    n = Net(m["family"], hwc, sc, zp, quant=q, pow2=p2, dense=name.endswith("-dense"),
-            relu6_as="relu" if name == "mobilenet-v1-025-dense" else None, shapes_only=shapes_only,
+    n = Net(m["family"], hwc, sc, zp, quant=q, pow2=p2, dense=name.endswith("-dense"), shapes_only=shapes_only,
             desc="models/zoo.py %s: %s" % (name, m["source"]))
     m["build"](n)
     return n
@@ -813,7 +802,7 @@ def ops_summary(g):
 
 
 # ---- write --------------------------------------------------------------------------------------------------------
-TFLITE_OPS = ("conv2d", "max_pool2d", "add", "concat", "relu")  # what npunet.graph_to_tflite writes
+TFLITE_OPS = ("conv2d", "depthwise_conv2d", "max_pool2d", "add", "concat", "relu")  # what npunet.graph_to_tflite writes
 
 
 def _strip(low):

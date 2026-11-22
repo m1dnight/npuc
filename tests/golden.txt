@@ -125,3 +125,4 @@ zoo-vgg11-64|zoo:vgg11-64|--allow-none|c912ada5d9a8ac97bbd724434afdae902a8677c22
 zoo-yolov2-tiny-128|zoo:yolov2-tiny-128|--allow-none|43210e9516d32f0c743d14f95ffb34982b1bd07fc44faa3f04f1b38376da1826
 zoo-mobilenet-v1-025-dense|zoo:mobilenet-v1-025-dense|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0
 zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
+zoo-mobilenet-v1-025|zoo:mobilenet-v1-025|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0

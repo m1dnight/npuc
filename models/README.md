@@ -30,19 +30,21 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
 - **Variants.** `<model>-npu`: the published model rewritten so NPUC compiles it, computing the **same function** (its
   CPU reference equals the published model's byte for byte wherever npunet lowers both: kws-cnn, magic-wand,
   alexnet-96). `<model>-dense`: each depthwise convolution written as the dense convolution with block-diagonal
-  weights (the same function). The depthwise study under way (docs/format/depthwise.md) finds that NPUC itself compiles
-  a depthwise layer exactly this way on the device path, its weight format skipping the zeros with bitmaps.
+  weights (the same function). NPUC itself compiles a depthwise layer exactly this way on the device path, its weight
+  format skipping the zeros with bitmaps (docs/format/depthwise.md), and npunet now lowers DEPTHWISE_CONV_2D to it:
+  the `-dense` variants remain as the cross-check (their NCP is their depthwise model's, byte for byte).
 - **TFLite**: `write` adds `<model>.tflite` when `npunet.graph_to_tflite` can write the model and the TFLite lowers to
   the same network as the JSON. It can write none of the zoo today (it writes conv2d, VALID max_pool2d, add, concat and
   relu only; every model here has a fully_connected, average_pool2d, reshape, softmax, a SAME pool or a depthwise conv).
 
 ## Status (2026-11-22, NPUC root-314e61a6)
 
-**24 models: 16 exact, 1 compiles but differs, 4 fail in NPUC, 3 refused by npunet.** Every model npunet lowers has its
+**24 models: 17 exact, 2 compile but differ, 4 fail in NPUC, 1 refused by npunet.** Every model npunet lowers has its
 CPU reference (`npunet.py ref`, 0.1 to 18 s). The three `-npu` rewrites give byte for byte the reference of the
-published model. Every NCP NPUC compiled is regression data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: 16 of
-17, the known miss below), and the 16 exact ones are rows of `tests/golden.txt`, so `tests/run.sh` regenerates
-them with no vendor file. The NPUC column's time includes npunet's lowering and was measured under a parallel load.
+published model, and the depthwise models the reference of their `-dense` form. Every NCP NPUC compiled is regression
+data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: 17 of 19, the known misses below), and the 17 exact ones are
+rows of `tests/golden.txt`, so `tests/run.sh` regenerates them with no vendor file. The NPUC column's time includes
+npunet's lowering and was measured under a parallel load.
 
 | model | input | options | lowering | NPUC | ncpgen check | CPU reference |
 |---|---|---|---|---|---|---|
@@ -64,18 +66,21 @@ them with no vendor file. The NPUC column's time includes npunet's lowering and 
 | alexnet-96-npu | 96x96x3 | --allow-none | ok, 12 NPU layers | PASS, 4576 KB, 17.9 s | **EXACT** (43 s) | 6d9704d8711f, 10 B, 9.5 s |
 | vgg11-64 | 64x64x3 | --allow-none | ok, 16 NPU layers | PASS, 3838 KB, 122.5 s | **EXACT** (14 s) | 5456870cc263, 200 B, 16.0 s |
 | yolov2-tiny-128 | 128x128x3 | --allow-none | ok, 15 NPU layers | PASS, 4607 KB, 99.8 s | **EXACT** (20 s) | b4805006f2b0, 2000 B, 9.0 s |
-| mobilenet-v1-025 | 96x96x1 | --allow-none | refused: l1_conv1: RELU6 clamps inside the output range (NPUC: 'Unsupported FusedActivation type' 3) | - | - | - |
-| mobilenet-v1-025-dense | 96x96x1 | --allow-none | ok, 29 NPU layers | PASS, 797 KB, 62.8 s | **EXACT** (6 s) | 5af11588254e, 2 B, 5.7 s |
-| mobilenet-v2-035 | 96x96x3 | --quant 3 --allow-none | refused: op depthwise_conv2d is not supported (conv2d, fully_connected, max_pool2d, average_pool2d, add, concat, relu; reshape and softmax at the end) | - | - | - |
+| mobilenet-v1-025 | 96x96x1 | --allow-none | ok, 29 NPU layers | PASS, 797 KB, 45.6 s | **EXACT** (1 s) | 5af11588254e, 2 B, 5.1 s |
+| mobilenet-v1-025-dense | 96x96x1 | --allow-none | ok, 29 NPU layers | PASS, 797 KB, 6.3 s | **EXACT** (1 s) | 5af11588254e, 2 B, 4.9 s |
+| mobilenet-v2-035 | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 67.1 s | **differs**: NPUC's NCP is the `-dense` one byte for byte, so the same frame gap (need 4) | 0cc597e5b755, 1000 B, 10.3 s |
 | mobilenet-v2-035-dense | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 211.2 s | **differs**: 69 groups for 65 layers in a graph; frame.py raises (need 4) | 0cc597e5b755, 1000 B, 17.6 s |
-| ds-cnn | 49x10x1 | --allow-none | refused: op depthwise_conv2d is not supported (conv2d, fully_connected, max_pool2d, average_pool2d, add, concat, relu; reshape and softmax at the end) | - | - | - |
+| ds-cnn | 49x10x1 | --allow-none | refused: pool1: a global average pool over 25x5: NPUC's pooling takes strides up to 3, and as a conv its kernel may be up to 14x14 (V); pool in steps first | - | - | - |
 | ds-cnn-dense | 49x10x1 | --allow-none | ok, 11 NPU layers | PASS, 209 KB, 22.2 s | **EXACT** (3 s) | ad2c9fdec999, 12 B, 2.0 s |
 
 Per published model: LeNet-5, the Keras MNIST convnet and MLP, the TensorFlow CIFAR CNN, a VGG-style CIFAR CNN, the
 DCASE/MLPerf Tiny autoencoder, the TFLM sine model, SqueezeNet 1.1, VGG-11, Tiny YOLOv2 and ResNet-8 are **exact as
 published** (with the generic adaptations above; ResNet-8's shortcuts SAME -> VALID, the same output). The Hello Edge
-KWS CNN, magic wand and AlexNet are **exact after an exact rewrite** (`-npu`). MobileNet v1, DS-CNN (and MobileNet v2,
-but for the frame gap below) are **exact with depthwise written as dense** (`-dense`). micro_speech **fails in NPUC**.
+KWS CNN, magic wand and AlexNet are **exact after an exact rewrite** (`-npu`). MobileNet v1 is **exact as published**
+(DEPTHWISE_CONV_2D and TFLite's ReLU6 quantisation: npunet lowers each depthwise layer to the dense block-diagonal
+conv, and NPUC's NCP for the depthwise form is the `-dense` form's byte for byte); MobileNet v2 lowers and compiles the
+same way, but for the frame gap below; DS-CNN is **exact with depthwise written as dense** (`-dense`; the published form
+waits for a global average pool over 25x5). micro_speech **fails in NPUC**.
 
 ## What ncpgen and npunet need, ranked
 
@@ -111,12 +116,16 @@ What unblocks the most models for the least work comes first. Items marked done 
    With both functions replaced in memory (no file changed): resnet8 is exact, and `ncpgen check` over all 392 graph
    compiles in `$NCPGEN_WORK/sweep` gives 385, the 7 misses being the known NPUC uninitialised-byte ones (graph rc4-*,
    graph-random2 g120/g134). **Effort: an hour** (the code above plus the regression run).
-2. **npunet: RELU6 the way TFLite rounds it** (`lower()` and `_fused_act`). TFLite's int8 ReLU6 output is scale 6/255
+2. **Done (2026-11-22): npunet: RELU6 the way TFLite rounds it** (`npunet.relu6_top`: TFLite's `zp + round(6.0f /
+   scale)`, float32 division rounded half away, from kernel_util.cc `Quantize` and activations.cc `QuantizedReluX`).
+   TFLite's int8 ReLU6 output is scale 6/255
    with zero point -128, and TFLite clamps at `zp + round(6 / scale)` = 127, the saturation (a no-op). npunet tests
    `zp + 6 / scale >= 255` in float32, gets 254.999995 and refuses it. So every TFLite MobileNet (and EfficientNet-lite,
    MobileNet-SSD...) is refused at its first layer, before its depthwise layers. Fix: `zp + round(6 / scale) >= 255`.
    **Effort: minutes.**
-3. **npunet: DEPTHWISE_CONV_2D** (mobilenet-v1-025, mobilenet-v2-035, ds-cnn): lower it to the dense convolution with
+3. **Done (2026-11-22): npunet: DEPTHWISE_CONV_2D** (`npunet.depthwise_dense`, TFLite and npu-net/1, multiplier 1,
+   per-channel scales by `--fold-per-channel`; mobilenet-v1-025 exact, mobilenet-v2-035 = its `-dense` NCP, ds-cnn
+   then stops at 5). Lower it to the dense convolution with
    block-diagonal weights, which is what NPUC itself does on the device path (the depthwise study under way,
    docs/format/depthwise.md). The `-dense` models show ncpgen exact on that form for MobileNet v1 and DS-CNN. Needed:
    a `depthwise_conv2d` op in npu-net/1 (the zoo writes it as TFLite stores it: layout 1HWO, `depth_multiplier` 1), the
@@ -338,16 +347,15 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Task / input**: person detection, 96x96x1 grayscale, 2 classes; input 96x96x1 int8 (scale 0.00392157, zero point -128)
 - **Ops**: conv2d 3x3/2, depthwise 3x3 x13, conv2d 1x1 x14, average_pool2d, reshape, softmax; 0.21 M weights; output 1x1x2; `--allow-none`
 - **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); the logits conv (no activation): --allow-none
-- **Missing for the published form**: DEPTHWISE_CONV_2D (13 layers): not supported (npunet refuses the op; NPUC's ConvAttr has a group field); fused RELU6 with TFLite's output quantisation (6/255, zp -128): the clamp is the saturation (TFLite: zp + round(6/scale) = 127), but npunet tests zp + 6/scale >= 255 in float32 (254.999995) and refuses it: use TFLite's rounding
-- **Status**: refused (lowering: refused: l1_conv1: RELU6 clamps inside the output range (NPUC: 'Unsupported FusedActivation type' 3); NPUC: -; ncpgen check: -)
+- **Status**: exact (lowering: ok, 29 NPU layers; NPUC: PASS, 797 KB, 45.6 s; ncpgen check: EXACT (1 s))
 
 ### mobilenet-v1-025-dense
 
 - **Source**: MobileNet v1 0.25 (Howard et al. 2017), the TensorFlow Lite Micro person_detection model: 13 depthwise-separable blocks, 8..256 channels, average pool 3x3/2, 1x1 conv to 2 classes
 - **Task / input**: person detection, 96x96x1 grayscale, 2 classes; input 96x96x1 int8 (scale 0.00392157, zero point -128)
 - **Ops**: conv2d 3x3/2 x5, conv2d 3x3 x9, conv2d 1x1 x14, average_pool2d, reshape, softmax; 1.77 M weights; output 1x1x2; `--allow-none`
-- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function; C times the weights of that layer counted dense, the zeros skipped by NPUC's weight format); RELU6 written as RELU with ReLU6's quantisation (6/255, zp -128): the same function, since the clamp at 6.0 is the int8 saturation (npunet's float test refuses RELU6 there); the logits conv: --allow-none
-- **Status**: exact (lowering: ok, 29 NPU layers; NPUC: PASS, 797 KB, 62.8 s; ncpgen check: EXACT (6 s))
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function; C times the weights of that layer counted dense, the zeros skipped by NPUC's weight format); the logits conv: --allow-none
+- **Status**: exact (lowering: ok, 29 NPU layers; NPUC: PASS, 797 KB, 6.3 s; ncpgen check: EXACT (1 s))
 
 ### mobilenet-v2-035
 
@@ -355,8 +363,8 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Task / input**: 96x96x3 images, 1000 classes; input 96x96x3 int8 (scale 0.0078125, zero point 0)
 - **Ops**: conv2d 3x3/2, depthwise 3x3 x17, conv2d 1x1 x34, add x10, average_pool2d, reshape, fully_connected, softmax; 1.66 M weights; output 1x1x1000; `--quant 3 --allow-none`
 - **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); global average pool as AVERAGE_POOL_2D 3x3 (Keras writes MEAN, which npunet does not take); the linear bottlenecks and the classifier: --allow-none
-- **Missing for the published form**: DEPTHWISE_CONV_2D (17 layers); MEAN (Keras' GlobalAveragePooling2D) is not taken by npunet's TFLite reader: lower MEAN over H, W like a global AVERAGE_POOL_2D
-- **Status**: refused (lowering: refused: op depthwise_conv2d is not supported (conv2d, fully_connected, max_pool2d, average_pool2d, add, concat, relu; reshape and softmax at the end); NPUC: -; ncpgen check: -)
+- **Missing for the published form**: MEAN (Keras' GlobalAveragePooling2D) is not taken by npunet's TFLite reader: lower MEAN over H, W like a global AVERAGE_POOL_2D
+- **Status**: differs (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 67.1 s; ncpgen check: strea g65@0x1f2 g66@0x120 g67@0x120 | intri - | weigh ok | file - (4 s))
 
 ### mobilenet-v2-035-dense
 
@@ -372,8 +380,8 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Task / input**: keyword spotting, 49x10 MFCC, 12 classes; input 49x10x1 int8 (scale 0.6, zero point 80)
 - **Ops**: conv2d 10x4/2, depthwise 3x3 x4, conv2d 1x1 x4, average_pool2d, reshape, fully_connected, softmax; 0.02 M weights; output 1x1x12; `--allow-none`
 - **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); dropout removed (inference)
-- **Missing for the published form**: DEPTHWISE_CONV_2D (4 layers); the 25x5 global average pool: npunet refuses a pool kernel > 14 ('as a conv its kernel may be up to 14x14 (V)'), but NPUC compiles a 25x5 VALID conv over 64 channels, byte-exact in ncpgen (probe 2026-11-22): relax the limit to what NPUC takes
-- **Status**: refused (lowering: refused: op depthwise_conv2d is not supported (conv2d, fully_connected, max_pool2d, average_pool2d, add, concat, relu; reshape and softmax at the end); NPUC: -; ncpgen check: -)
+- **Missing for the published form**: the 25x5 global average pool: npunet refuses a pool kernel > 14 ('as a conv its kernel may be up to 14x14 (V)'), but NPUC compiles a 25x5 VALID conv over 64 channels, byte-exact in ncpgen (probe 2026-11-22): relax the limit to what NPUC takes
+- **Status**: refused (lowering: refused: pool1: a global average pool over 25x5: NPUC's pooling takes strides up to 3, and as a conv its kernel may be up to 14x14 (V); pool in steps first; NPUC: -; ncpgen check: -)
 
 ### ds-cnn-dense
 
