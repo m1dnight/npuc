@@ -1,0 +1,26 @@
+# the NPU2020 LIR kernel pack (weights part): counter, orderings, planner's packs (Ghidra addresses = objdump + 0x100000)
+addr:3c48b8
+addr:3c4ef8
+addr:3c5110
+addr:3c4834
+addr:3c5794
+addr:3c7be0
+addr:3c72b0
+addr:3c52ec
+addr:3c5548
+addr:39c618
+addr:39df7c
+addr:39ea18
+addr:39ec28
+sym:22StridedChannelOrdering
+sym:21NormalChannelOrdering
+sym:25AllocationChannelOrdering
+sym:DynamicBuffer20setChannelMFAccIndex
+sym:DynamicBuffer27getChannelIndexByMergeIndex
+sym:DynamicBuffer15getChannelIndex
+sym:DynamicBuffer17setChannelIndices
+sym:DynamicBuffer17setChannelIfmIndex
+sym:DynamicBuffer23setChannelIfmNormalIndex
+sym:LIRGenExecutor202016getConvKerLoader
+sym:12ReformedView
+sym:13NReformedView

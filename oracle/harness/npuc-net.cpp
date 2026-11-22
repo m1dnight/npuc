@@ -1,0 +1,808 @@
+// npuc-net: PORT-32, a network of our own compiled by Samsung's NPUC on the phone (npu/README.md). npuc-conv
+// generalised: reads a chain of convolution and pooling layers from a text file written on the host by npu/npunet.py
+// ("npuc-net 1" format below), builds the NNNetwork the way nn-eden-drv's NNNetworkBuilder does (getConvolutionLayer,
+// getPoolLayer: NPUC's own layer constructors, each layer's shapes computed by NPUC's computeOutputShape as the HAL
+// does) and calls NPUCompiler::compile. Our own code; no vendor byte (it links against the vendor libraries' symbol
+// tables only).
+//
+//   linker64 ./npuc-net --net net.npuc [--out net.ncp]
+//   (LD_LIBRARY_PATH = the run directory; NPUC_LOG_LEVEL, NPUC_GOLDEN... are read by NPUC itself)
+//
+// Input, whitespace-separated tokens (one layer per line by convention; lines starting with # are comments):
+//   npuc-net 1
+//   soc <2>  quant <1|3>
+//   input <name> <C> <H> <W>
+//   conv <name> <input> <cout> <kh> <kw> <sh> <sw> <SAME|VALID> <act 0|1>
+//        <in scale f32 hex> <in zp> <w scale f32 hex> <w zp> <out scale f32 hex> <out zp> <weights: OIHW uint8, hex> <nbias> <bias int32...>
+//   pool <name> <input> <MaxPool|AvgPool> <kh> <kw> <sh> <sw> <SAME|VALID> <act 0|1> <in scale hex> <in zp> <out scale hex> <out zp>
+//   end
+// Scales travel as float32 bit patterns (0x3c000000 = 1/128): NPUC truncates the multiplier it derives from them
+// (ScaleONFiller::setScale), so the host's CPU reference must see the very same floats.
+//
+// "npuc-net 2" files may also hold these lines (dossier/npuc-harness-ops.md; layers NPUC's graph layer has but the
+// stock HAL never hands it). A layer's inputs are any earlier blobs (the input or a layer), so graphs are allowed:
+//   eltwise <name> <in1> <in2> Add <in1 scale hex> <in1 zp> <in2 scale hex> <in2 zp> <out scale hex> <out zp>
+//        two different blobs of the same C x H x W; Caffe type "Eltwise". NPUC's Eltwise adds by powers of two only:
+//        every scale must be 2^-n (n = its fractional length, given to NPUC through the hook below) and the three zero
+//        points equal (no zero-point term: quant 3 with zero points 0 is the meaningful case)
+//   concat <name> 1 <n> <in1> ... <in_n> <out scale hex> <out zp>
+//        channel concatenation (NCHW axis 1, the only one NPUC does), H and W equal; Caffe type "Concat",
+//        nn-eden-drv's ConcatAttr; NPUC places each input as a channel slice, in this order, without rescaling
+//   relu <name> <input> <ReLU|ReLU6>
+//        a standalone activation layer (Caffe type "ReLU"/"ReLU6"; NPUC makes it a 1x1 convolution)
+// In an "npuc-net 2" file every reader must declare the scale and zero point its input blob already has (NPUC does not
+// rescale between layers on this path); "npuc-net 1" files are read exactly as before (the new lines refused there).
+//
+// Output: the NCP written to --out and <out>.json (what NPUC made of each layer: its output shape and pads, read back
+// after computeOutputShape; the NCP's size), both announced as "FILE <name>" for run-n3.sh to fetch; "npuc-net: PASS"
+// or the step that failed. Exit 0 PASS, 1 bad input, 2 compile error, 3 not an NCP.
+#include "npuc.h"
+
+#include <cctype>
+#include <cinttypes>
+#include <csignal>
+#include <dlfcn.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <new>
+#include <string>
+#include <vector>
+
+using namespace NPUC;
+
+// liblog replacement (NPUC imports __android_log_print unversioned; nothing in its NEEDED list provides it)
+extern "C" __attribute__((visibility("default"))) int __android_log_print(int prio, const char *tag, const char *fmt, ...)
+{
+	va_list ap;
+	fprintf(stderr, "alog %d/%s: ", prio, tag ? tag : "-");
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	if (!*fmt || fmt[strlen(fmt) - 1] != '\n')
+		fputc('\n', stderr);
+	return 1;
+}
+
+extern "C++" {
+void npuc_NNLayer_C2(NNLayer *, std::string, std::string, std::vector<std::string>, std::vector<std::string>,
+                     std::shared_ptr<LayerAttr>)
+	__asm__("_ZN4NPUC7NNLayerC2ENSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_NS1_6vectorIS7_"
+	        "NS5_IS7_EEEESA_NS1_10shared_ptrINS_9LayerAttrEEE");
+void npuc_NNConvLayer_C2(NNConvLayer *, std::string, std::string, std::vector<std::string>, std::vector<std::string>,
+                         std::shared_ptr<ConvAttr>)
+	__asm__("_ZN4NPUC11NNConvLayerC2ENSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_NS1_6vector"
+	        "IS7_NS5_IS7_EEEESA_NS1_10shared_ptrINS_8ConvAttrEEE");
+void npuc_NNPoolLayer_C2(NNPoolLayer *, std::string, std::string, std::vector<std::string>, std::vector<std::string>,
+                         std::shared_ptr<PoolAttr>)
+	__asm__("_ZN4NPUC11NNPoolLayerC2ENSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES7_NS1_6vector"
+	        "IS7_NS5_IS7_EEEESA_NS1_10shared_ptrINS_8PoolAttrEEE");
+int npuc_compile(NPUCompiler *, NNNetwork *, __NCPBuffer *)
+	__asm__("_ZN4NPUC11NPUCompiler7compileEPNS_9NNNetworkEPNS_11__NCPBufferE");
+// weak: the host test's stub NPUC (a static build) does not define it; NPUC's libnpuc_frontend exports it
+void npuc_mergeConcatLayer(NNNetwork *) __asm__("_ZN4NPUC9NNNetwork16mergeConcatLayerEv") __attribute__((weak));
+void *npuc_GetInstance() __asm__("_ZN4NPUC14CompileOptions11GetInstanceEv");
+}
+
+// ---- Eltwise: the one thing NPUC's on-device chain leaves out (dossier/npuc-harness-ops.md) ---------------------
+// NPUC's Eltwise op aligns its two inputs by power-of-two exponents (fractional lengths) that only the off-device
+// NNGraphNodeMultipleInputFiller sets (node +0xe8); on the on-device chain the slot stays empty and the LIR generator
+// dereferences it (SIGSEGV in EltwiseNode2020::buildMetaDataDram). This executable defines NPUC's exported
+// NNGraphCgObject::addElemtWiseGraphNode, which addGraphNode calls through the PLT (so Bionic binds that call here,
+// the executable being first in the lookup scope): for an Eltwise node of ours it fills the slot with the fractional
+// lengths read from the net file, then runs NPUC's own function (RTLD_NEXT). Networks without Eltwise never get here.
+struct EltwiseFL {
+	int fl1, fl2, flo;
+};
+static std::map<std::string, EltwiseFL> g_eltwise;  // layer name -> fractional lengths (scale = 2^-fl)
+
+#if defined(__aarch64__)  // (the host test's x86_64 build with a stub NPUC has neither NPUC's vtable nor libdl)
+extern "C++" __attribute__((visibility("default"))) void npuc_hook_addElemtWiseGraphNode(void *self, void *node)
+	__asm__("_ZN4NPUC15NNGraphCgObject21addElemtWiseGraphNodeEPNS_11NNGraphNodeE");
+void npuc_hook_addElemtWiseGraphNode(void *self, void *node)
+{
+	using fn_t = void (*)(void *, void *);
+	static fn_t orig = reinterpret_cast<fn_t>(dlsym(RTLD_NEXT, kSymAddElemtWise));
+	auto *n = static_cast<char *>(node);
+	NNLayer *l = *reinterpret_cast<NNLayer **>(n + NNGraphNodeOff::layer);
+	auto it = l ? g_eltwise.find(l->name) : g_eltwise.end();
+	if (it != g_eltwise.end() && !l->outputs.empty()) {
+		auto &slot = *reinterpret_cast<std::shared_ptr<NPUMultipleInputMemoryData> *>(n + NNGraphNodeOff::multipleInput);
+		const auto &os = l->shapes[l->outputs[0]];
+		size_t c = os.size() == 4 ? (size_t)os[1] : 0;
+		if (slot)
+			printf("eltwise %s: NPUC already set its multiple-input data; left as is\n", l->name.c_str());
+		else {
+			std::shared_ptr<NPUMultipleInputMemoryData> d(new NPUMultipleInputMemoryData());
+			d->fl[0].assign(c, (uint8_t)it->second.fl1);
+			d->fl[1].assign(c, (uint8_t)it->second.fl2);
+			d->fl[8].assign(c, (uint8_t)it->second.flo);
+			slot = d;
+			printf("eltwise %s: multiple-input data set (node type 0x%x): %zu channels, fractional lengths in1 %d in2 %d "
+			       "out %d\n", l->name.c_str(), *reinterpret_cast<int32_t *>(n + NNGraphNodeOff::type), c,
+			       it->second.fl1, it->second.fl2, it->second.flo);
+		}
+	}
+	if (!orig) {
+		printf("npuc-net: FAIL (no NPUC addElemtWiseGraphNode behind the hook)\n");
+		_exit(2);
+	}
+	orig(self, node);
+}
+#endif
+
+// ---- crash locator (as npuc-conv): a fault prints PC, LR and the frame-pointer chain as library+offset ---------
+static const char *step = "start";
+static std::string stepbuf;
+
+static void put(const char *s) { ssize_t r = write(2, s, strlen(s)); (void)r; }
+
+static void where(const char *what, uintptr_t a)
+{
+	char b[400];
+	Dl_info di;
+	memset(&di, 0, sizeof di);
+	if (a && dladdr((void *)a, &di) && di.dli_fname) {
+		const char *n = strrchr(di.dli_fname, '/');
+		uintptr_t off = a - (uintptr_t)di.dli_fbase;
+		snprintf(b, sizeof b, "crash: %-3s 0x%012lx = %s+0x%lx (Ghidra 0x%lx)%s%s\n", what, (unsigned long)a,
+		         n ? n + 1 : di.dli_fname, (unsigned long)off, (unsigned long)(off + 0x100000),
+		         di.dli_sname ? " in " : "", di.dli_sname ? di.dli_sname : "");
+	} else
+		snprintf(b, sizeof b, "crash: %-3s 0x%012lx (no library)\n", what, (unsigned long)a);
+	put(b);
+}
+
+static void on_fault(int sig, siginfo_t *si, void *ucv)
+{
+	char b[300];
+	auto *uc = static_cast<ucontext_t *>(ucv);
+	snprintf(b, sizeof b, "crash: signal %d code %d fault addr %p during step \"%s\"\n", sig, si->si_code, si->si_addr,
+	         step);
+	put(b);
+#if defined(__aarch64__)  // (the host test builds npuc-net for x86_64 with a stub NPUC: no frame walk there)
+	where("pc", (uintptr_t)uc->uc_mcontext.pc);
+	where("lr", (uintptr_t)uc->uc_mcontext.regs[30]);
+	uintptr_t fp = (uintptr_t)uc->uc_mcontext.regs[29], sp = (uintptr_t)uc->uc_mcontext.sp;
+	for (int i = 0; i < 24 && fp >= sp && fp - sp < (8u << 20) && (fp & 7) == 0; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+		if (!ret)
+			break;
+		snprintf(b, sizeof b, "#%d", i);
+		where(b, ret);
+		if (next <= fp)
+			break;
+		fp = next;
+	}
+#else
+	(void)uc;
+	(void)where;
+#endif
+	put("crash: end\n");
+}
+
+static void install_crash_locator()
+{
+	static char alt[64 * 1024];
+	stack_t ss;
+	ss.ss_sp = alt;
+	ss.ss_size = sizeof alt;
+	ss.ss_flags = 0;
+	sigaltstack(&ss, nullptr);
+	struct sigaction sa;
+	memset(&sa, 0, sizeof sa);
+	sa.sa_sigaction = on_fault;
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+	sigemptyset(&sa.sa_mask);
+	for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP})
+		sigaction(sig, &sa, nullptr);
+}
+
+static void STEP(const std::string &s)
+{
+	stepbuf = s;
+	step = stepbuf.c_str();
+	printf("step: %s\n", step);
+}
+
+// ---- the input file ------------------------------------------------------------------------------------------
+struct Tok {
+	std::vector<std::string> t;
+	size_t i = 0;
+	bool bad = false;
+	std::string why;
+	bool more() const { return i < t.size(); }
+	std::string str()
+	{
+		if (i >= t.size()) {
+			fail("unexpected end of file");
+			return "";
+		}
+		return t[i++];
+	}
+	long num(long lo, long hi, const char *what)
+	{
+		std::string s = str();
+		char *e = nullptr;
+		long v = strtol(s.c_str(), &e, 0);
+		if (s.empty() || *e || v < lo || v > hi)
+			fail(std::string(what) + " '" + s + "' out of range");
+		return v;
+	}
+	float f32hex(const char *what)
+	{
+		std::string s = str();
+		char *e = nullptr;
+		unsigned long v = strtoul(s.c_str(), &e, 16);
+		float f;
+		uint32_t u = (uint32_t)v;
+		memcpy(&f, &u, 4);
+		if (s.size() != 10 || s.compare(0, 2, "0x") || *e || !(f > 0.0f) || f != f)
+			fail(std::string(what) + " '" + s + "' is not a positive float32 bit pattern 0x........");
+		return f;
+	}
+	void fail(const std::string &w)
+	{
+		if (!bad) {
+			bad = true;
+			why = w + " (token " + std::to_string(i) + ")";
+		}
+	}
+};
+
+struct Shape {
+	int c = 0, h = 0, w = 0;
+};
+
+static bool read_file(const char *path, std::string &out)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return false;
+	char buf[65536];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof buf, f)) > 0)
+		out.append(buf, n);
+	fclose(f);
+	return true;
+}
+
+static std::vector<uint8_t> unhex(const std::string &s, bool &ok)
+{
+	std::vector<uint8_t> v;
+	ok = s.size() % 2 == 0;
+	for (size_t i = 0; ok && i < s.size(); i += 2) {
+		char b[3] = {s[i], s[i + 1], 0};
+		char *e = nullptr;
+		long x = strtol(b, &e, 16);
+		ok = *e == 0 && isxdigit((unsigned char)b[0]) && isxdigit((unsigned char)b[1]);
+		v.push_back((uint8_t)x);
+	}
+	return v;
+}
+
+static void print_shapes(const std::shared_ptr<NNLayer> &l)
+{
+	for (auto &e : l->shapes) {
+		printf("shape %s[%s] =", l->name.c_str(), e.first.c_str());
+		for (int v : e.second)
+			printf(" %d", v);
+		printf("\n");
+	}
+}
+
+int main(int argc, char **argv)
+{
+	const char *netf = nullptr, *out = "net.ncp";
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--net") && i + 1 < argc)
+			netf = argv[++i];
+		else if (!strcmp(argv[i], "--out") && i + 1 < argc)
+			out = argv[++i];
+		else {
+			fprintf(stderr, "npuc-net: bad argument %s\n", argv[i]);
+			return 1;
+		}
+	}
+	if (!netf) {
+		fprintf(stderr, "npuc-net: --net <file> is required\n");
+		return 1;
+	}
+	setvbuf(stdout, nullptr, _IOLBF, 0);
+	install_crash_locator();
+	std::string text;
+	if (!read_file(netf, text)) {
+		printf("npuc-net: FAIL (cannot read %s)\n", netf);
+		return 1;
+	}
+	Tok tk;
+	// tokens: whitespace-separated; a line whose first character is '#' is a comment (no iostreams: NPUC's exported
+	// libc++, the one C++ runtime of this process, has no istringstream for the NDK's headers)
+	for (size_t i = 0, bol = 1; i < text.size();) {
+		char c = text[i];
+		if (bol && c == '#') {
+			while (i < text.size() && text[i] != '\n')
+				i++;
+			continue;
+		}
+		if (isspace((unsigned char)c)) {
+			bol = c == '\n';
+			i++;
+			continue;
+		}
+		size_t j = i;
+		while (j < text.size() && !isspace((unsigned char)text[j]))
+			j++;
+		tk.t.push_back(text.substr(i, j - i));
+		i = j;
+		bol = 0;
+	}
+	std::string magic = tk.str(), version = tk.str();
+	if (magic != "npuc-net" || (version != "1" && version != "2")) {
+		printf("npuc-net: FAIL (%s is not an \"npuc-net 1\" or \"npuc-net 2\" file)\n", netf);
+		return 1;
+	}
+	const int ver = version == "2" ? 2 : 1;
+	bool hasConcat = false;
+	std::vector<std::shared_ptr<LayerAttr>> attrs;  // the new kinds' attributes (kept alive until the compile is over)
+	int soc = SOC_NEUS, quant = 1;
+	std::map<std::string, Shape> blobs;  // blob name -> CHW shape (NPUC's, read back)
+	// "npuc-net 2" only: each blob's quantisation (its producer's output scale and zero point; the input's from its first
+	// reader). On this path NPUC never rescales between layers (no graph filter runs on the on-device chain, so no
+	// ConcatScaleFolding; Eltwise only shifts), so a reader that declares another scale is an error in the file.
+	struct BlobQ {
+		float s;
+		int zp;
+	};
+	std::map<std::string, BlobQ> bq;
+	auto qin = [&](Tok &t, const std::string &layer, const std::string &blob, float s, int zp) {
+		if (ver < 2)
+			return;
+		auto it = bq.find(blob);
+		if (it == bq.end())
+			bq[blob] = {s, zp};
+		else if (memcmp(&it->second.s, &s, 4) != 0 || it->second.zp != zp)
+			t.fail("layer " + layer + ": reads " + blob + " as scale " + std::to_string(s) + " zp " + std::to_string(zp) +
+			       ", but " + blob + " is scale " + std::to_string(it->second.s) + " zp " + std::to_string(it->second.zp) +
+			       " (NPUC does not rescale between layers)");
+	};
+	std::vector<std::shared_ptr<NNLayer>> layers;
+	std::vector<std::shared_ptr<ConvAttr>> convs;  // kept alive with their data until the compile is over
+	std::vector<std::string> order;
+	std::string last;
+	STEP("CompileOptions::GetInstance");
+	void *opts = npuc_GetInstance();
+	printf("CompileOptions::GetInstance() = %p\n", opts);
+	std::string jl;  // the per-layer JSON, assembled while the layers are built (no tmpfile: Bionic's wants /data/local/tmp)
+	bool first = true;
+	while (!tk.bad && tk.more()) {
+		std::string kw = tk.str();
+		if (kw == "end")
+			break;
+		if (kw == "soc") {
+			soc = (int)tk.num(0, 3, "soc");
+		} else if (kw == "quant") {
+			quant = (int)tk.num(1, 3, "quant");
+		} else if (kw == "input") {
+			std::string name = tk.str();
+			Shape s;
+			s.c = (int)tk.num(1, 4096, "C");
+			s.h = (int)tk.num(1, 4096, "H");
+			s.w = (int)tk.num(1, 4096, "W");
+			if (tk.bad || !layers.empty()) {
+				tk.fail("input: one, first");
+				break;
+			}
+			auto ia = std::make_shared<InputAttr>();
+			ia->shape[0] = 1, ia->shape[1] = s.c, ia->shape[2] = s.h, ia->shape[3] = s.w;
+			auto *in = static_cast<NNLayer *>(::operator new(sizeof(NNLayer)));
+			STEP("NNLayer C2 (input " + name + ")");
+			npuc_NNLayer_C2(in, name, "Input", {"ROOT"}, {name}, ia);
+			std::shared_ptr<NNLayer> l(in);
+			l->shapes[name] = {1, s.c, s.h, s.w};
+			if (ver >= 2) {
+				// as nn-eden-drv's createDummyInputLayer: NNLayer::computeOutputShape (NPUC's) on the input layer, which
+				// also records shapes["ROOT"]; NPUC's policy maker reads it when the input feeds a Concat directly
+				STEP("computeOutputShape (NPUC's) for input " + name);
+				l->computeOutputShape(std::vector<std::vector<int32_t>>{{1, s.c, s.h, s.w}});
+			}
+			layers.push_back(l);
+			blobs[name] = s;
+			last = name;
+			printf("layer %s Input out %dx%dx%d\n", name.c_str(), s.c, s.h, s.w);
+		} else if (kw == "conv" || kw == "pool") {
+			std::string name = tk.str(), input = tk.str();
+			auto bi = blobs.find(input);
+			if (bi == blobs.end()) {
+				tk.fail("layer " + name + ": unknown input " + input);
+				break;
+			}
+			if (blobs.count(name)) {
+				tk.fail("layer " + name + ": duplicate name");
+				break;
+			}
+			Shape is = bi->second;
+			const std::vector<int32_t> inShape = {1, is.c, is.h, is.w};
+			std::shared_ptr<NNLayer> l;
+			int cout = is.c, kh, kw_, sh, sw, act;
+			std::string padType, ptype;
+			if (kw == "conv") {
+				cout = (int)tk.num(1, 4096, "cout");
+				kh = (int)tk.num(1, 64, "kh"), kw_ = (int)tk.num(1, 64, "kw");
+				sh = (int)tk.num(1, 16, "sh"), sw = (int)tk.num(1, 16, "sw");
+				padType = tk.str();
+				act = (int)tk.num(0, 1, "act");
+				float inS = tk.f32hex("in scale");
+				int inZ = (int)tk.num(0, 255, "in zp");
+				float wS = tk.f32hex("w scale");
+				int wZ = (int)tk.num(0, 255, "w zp");
+				float outS = tk.f32hex("out scale");
+				int outZ = (int)tk.num(0, 255, "out zp");
+				bool ok;
+				std::vector<uint8_t> wbytes = unhex(tk.str(), ok);
+				size_t nw = (size_t)cout * is.c * kh * kw_;
+				if (!ok || wbytes.size() != nw)
+					tk.fail("conv " + name + ": weights: want " + std::to_string(nw) + " bytes in hex, got " +
+					        std::to_string(wbytes.size()));
+				long nb = tk.num(0, 4096, "nbias");
+				if (nb != cout)
+					tk.fail("conv " + name + ": " + std::to_string(nb) + " biases for " + std::to_string(cout) + " outputs");
+				auto bd = std::make_shared<std::vector<int32_t>>();
+				for (long j = 0; j < nb && !tk.bad; j++)
+					bd->push_back((int32_t)tk.num(-2147483647L - 1, 2147483647L, "bias"));
+				if (padType != "SAME" && padType != "VALID")
+					tk.fail("conv " + name + ": pad type " + padType + " (NPUC 1.36.1.a's NNConvLayer knows SAME and VALID)");
+				qin(tk, name, input, inS, inZ);
+				if (tk.bad)
+					break;
+				if (ver >= 2)
+					bq[name] = {outS, outZ};
+				// loadConvAttrForConvolutionLayer, as npuc-conv
+				std::shared_ptr<ConvAttr> ca(new ConvAttr());
+				ca->attrType = "Conv2D";
+				ca->pad = {0, 0, 0, 0};  // NPUC's computeOutputShape writes SAME's pads back here
+				ca->stride = {1, 1, sh, sw};
+				ca->dilation = {1, 1, 1, 1};
+				ca->padType = padType;
+				ca->group = 1;
+				ca->numInput = is.c;
+				ca->numOutput = cout;
+				ca->kernel = {kh, kw_};
+				ca->kernelName = name + "_weight_1";
+				ca->biasName = name + "_bias_2";
+				ca->hasBias = true;
+				ca->kernelData = std::make_shared<std::vector<uint8_t>>(wbytes);
+				ca->biasData = bd;
+				ca->inScale = {inS};
+				ca->inZp = {inZ};
+				ca->outScale = {outS};
+				ca->outZp = {outZ};
+				ca->wScale = {wS};
+				ca->wZp = {wZ};
+				ca->bScale = {inS * wS};
+				ca->bZp = {0};
+				ca->fusedActivation = act;
+				convs.push_back(ca);
+				auto *cv = static_cast<NNConvLayer *>(::operator new(sizeof(NNConvLayer)));
+				STEP("NNConvLayer C2 (" + name + ")");
+				npuc_NNConvLayer_C2(cv, name, "Convolution", {input}, {name}, ca);
+				l.reset(cv);
+				printf("layer %s Convolution in %s %dx%dx%d, %dx%d stride %dx%d %s act %d, %d -> %d channels, "
+				       "scales in %.9g zp %d w %.9g zp %d out %.9g zp %d\n", name.c_str(), input.c_str(), is.c, is.h,
+				       is.w, kh, kw_, sh, sw, padType.c_str(), act, is.c, cout, (double)inS, inZ, (double)wS, wZ,
+				       (double)outS, outZ);
+			} else {
+				ptype = tk.str();
+				kh = (int)tk.num(1, 64, "kh"), kw_ = (int)tk.num(1, 64, "kw");
+				sh = (int)tk.num(1, 64, "sh"), sw = (int)tk.num(1, 64, "sw");
+				padType = tk.str();
+				act = (int)tk.num(0, 1, "act");
+				float inS = tk.f32hex("in scale");
+				int inZ = (int)tk.num(0, 255, "in zp");
+				float outS = tk.f32hex("out scale");
+				int outZ = (int)tk.num(0, 255, "out zp");
+				if (ptype != "MaxPool" && ptype != "AvgPool")
+					tk.fail("pool " + name + ": type " + ptype + " (MaxPool or AvgPool)");
+				if (padType != "SAME" && padType != "VALID")
+					tk.fail("pool " + name + ": pad type " + padType + " (SAME or VALID)");
+				qin(tk, name, input, inS, inZ);
+				if (tk.bad)
+					break;
+				if (ver >= 2)
+					bq[name] = {outS, outZ};
+				// loadPoolAttrForPoolLayer
+				auto pa = std::make_shared<PoolAttr>();
+				pa->pad = {0, 0, 0, 0};
+				pa->stride = {1, 1, sh, sw};
+				pa->kernel = {1, 1, kh, kw_};
+				pa->padType = padType;
+				pa->poolType = ptype;
+				pa->inScale = {inS};
+				pa->inZp = {inZ};
+				pa->outScale = {outS};
+				pa->outZp = {outZ};
+				pa->fusedActivation = act;
+				auto *pl = static_cast<NNPoolLayer *>(::operator new(sizeof(NNPoolLayer)));
+				STEP("NNPoolLayer C2 (" + name + ")");
+				npuc_NNPoolLayer_C2(pl, name, "Pooling", {input}, {name}, pa);
+				l.reset(pl);
+				printf("layer %s Pooling %s in %s %dx%dx%d, %dx%d stride %dx%d %s act %d, scales in %.9g zp %d out "
+				       "%.9g zp %d\n", name.c_str(), ptype.c_str(), input.c_str(), is.c, is.h, is.w, kh, kw_, sh, sw,
+				       padType.c_str(), act, (double)inS, inZ, (double)outS, outZ);
+			}
+			l->shapes[input] = inShape;
+			// the HAL computes each layer's shapes as it builds it (getConvolutionLayer / getPoolLayer: then
+			// "->computeOutputShape" through the vtable); NPUC itself does not (npu-compiler.md section 9.8)
+			STEP("computeOutputShape (NPUC's) for " + name);
+			l->computeOutputShape(std::vector<std::vector<int32_t>>{inShape});
+			auto it = l->shapes.find(name);
+			if (it == l->shapes.end() || it->second.size() != 4 || it->second[0] != 1 || it->second[1] != cout ||
+			    it->second[2] < 1 || it->second[3] < 1) {
+				print_shapes(l);
+				tk.fail("layer " + name + ": NPUC's computeOutputShape gave no 1 x " + std::to_string(cout) +
+				        " x H x W output (pad type " + padType + ")");
+				break;
+			}
+			Shape os;
+			os.c = it->second[1], os.h = it->second[2], os.w = it->second[3];
+			blobs[name] = os;
+			std::vector<int32_t> pads = kw == "conv" ? convs.back()->pad
+			                                         : std::static_pointer_cast<PoolAttr>(l->attr)->pad;
+			while (pads.size() < 4)
+				pads.push_back(-1);
+			printf("layer %s out %dx%dx%d pads %d %d %d %d (top bottom left right, NPUC's)\n", name.c_str(), os.c,
+			       os.h, os.w, pads[0], pads[1], pads[2], pads[3]);
+			print_shapes(l);
+			char lb[512];
+			snprintf(lb, sizeof lb, "%s{\"name\": \"%s\", \"type\": \"%s\", \"input\": \"%s\", \"out_shape\": [1, %d, %d, %d], "
+			         "\"pads\": [%d, %d, %d, %d]}", first ? "" : ",\n  ", name.c_str(),
+			         kw == "conv" ? "Convolution" : "Pooling", input.c_str(), os.c, os.h, os.w, pads[0], pads[1], pads[2],
+			         pads[3]);
+			jl += lb;
+			first = false;
+			layers.push_back(l);
+			last = name;
+		} else if (kw == "eltwise" || kw == "concat" || kw == "relu") {
+			if (ver < 2) {
+				tk.fail("'" + kw + "' needs an \"npuc-net 2\" file");
+				break;
+			}
+			std::string name = tk.str(), type;
+			std::vector<std::string> ins;
+			std::shared_ptr<LayerAttr> attr;
+			Shape os;
+			char extra[256] = "";
+			if (kw == "eltwise") {
+				ins.push_back(tk.str());
+				ins.push_back(tk.str());
+				if (ins[0] == ins[1])
+					tk.fail("eltwise " + name + ": both inputs are " + ins[0] +
+					        " (NPUC's policy maker asserts on it: PGraph::clone \"this->equals(graph)\")");
+				std::string op = tk.str();
+				float s1 = tk.f32hex("in1 scale");
+				int z1 = (int)tk.num(0, 255, "in1 zp");
+				float s2 = tk.f32hex("in2 scale");
+				int z2 = (int)tk.num(0, 255, "in2 zp");
+				float so = tk.f32hex("out scale");
+				int zo = (int)tk.num(0, 255, "out zp");
+				// getEltwiseParam knows Add, Multiply and Maximum, but NPUC 1.36.1.a's backend implements Add only
+				// (Multiply: "Unsupported eltwise op!" in NcpEltwiseOp::Execute; Maximum: an assert in
+				// EltwiseNode2020::getEltwiseOpcode)
+				if (op != "Add")
+					tk.fail("eltwise " + name + ": operation " + op + " (NPUC compiles Add only)");
+				// NPUC's Eltwise only shifts: every scale must be 2^-fl, and there is no zero-point term
+				EltwiseFL fl{0, 0, 0};
+				int *fls[3] = {&fl.fl1, &fl.fl2, &fl.flo};
+				const float sc[3] = {s1, s2, so};
+				for (int j = 0; j < 3 && !tk.bad; j++) {
+					uint32_t u;
+					memcpy(&u, &sc[j], 4);
+					*fls[j] = 127 - (int)((u >> 23) & 0xff);  // a normal positive float: 2^(exponent - 127) x 1.mantissa
+					if ((u & 0x7fffff) != 0 || *fls[j] < 0 || *fls[j] > 31)
+						tk.fail("eltwise " + name + ": scale " + std::to_string(sc[j]) +
+						        " is not 2^-n with n in 0..31 (NPUC's Eltwise aligns by powers of two only)");
+				}
+				if (!tk.bad && (z1 != zo || z2 != zo))
+					tk.fail("eltwise " + name + ": zero points " + std::to_string(z1) + ", " + std::to_string(z2) + ", " +
+					        std::to_string(zo) + " differ (NPUC's Eltwise has no zero-point term)");
+				qin(tk, name, ins[0], s1, z1);
+				qin(tk, name, ins[1], s2, z2);
+				if (tk.bad)
+					break;
+				bq[name] = {so, zo};
+				g_eltwise[name] = fl;
+				type = "Eltwise";
+				auto ea = std::make_shared<EltwiseAttr>();
+				ea->op = op;
+				attr = ea;
+				snprintf(extra, sizeof extra, "%s, scales in1 %.9g zp %d in2 %.9g zp %d out %.9g zp %d", op.c_str(),
+				         (double)s1, z1, (double)s2, z2, (double)so, zo);
+			} else if (kw == "concat") {
+				// NPUC never reads ConcatAttr on this path (getConcatParam throws for "stensorflow"): it places each
+				// input as a channel slice of the output (ChannelSlicedFeatureNode, in input order), so channels only
+				int axis = (int)tk.num(1, 1, "axis (NCHW; NPUC concatenates channels only)");
+				long n = tk.num(2, 64, "number of inputs");
+				for (long j = 0; j < n && !tk.bad; j++)
+					ins.push_back(tk.str());
+				float so = tk.f32hex("out scale");
+				int zo = (int)tk.num(0, 255, "out zp");
+				for (auto &in : ins) {
+					qin(tk, name, in, so, zo);  // the bytes are placed as they are: every input in the output's quantisation
+					if (!layers.empty() && in == layers.front()->name)
+						tk.fail("concat " + name + ": input " + in + " is the network input (NPUC would write it straight "
+						        "into a channel slice, and its policy maker asserts \"DataNode id isn't found in the NNGraph "
+						        "inputs\")");
+				}
+				if (tk.bad)
+					break;
+				bq[name] = {so, zo};
+				type = "Concat";
+				auto ca = std::make_shared<ConcatAttr>();
+				ca->axis = axis;
+				ca->outScale = {so};
+				attr = ca;
+				hasConcat = true;
+				snprintf(extra, sizeof extra, "axis %d, out scale %.9g zp %d", axis, (double)so, zo);
+			} else {
+				ins.push_back(tk.str());
+				type = tk.str();
+				if (type != "ReLU" && type != "ReLU6")
+					tk.fail("relu " + name + ": type " + type + " (ReLU or ReLU6)");
+				if (tk.bad)
+					break;
+				if (bq.count(ins[0]))
+					bq[name] = bq[ins[0]];  // addReLUGraphNode's 1x1 conv keeps the input's quantisation (G)
+				attr = std::make_shared<PlainAttr>();
+				snprintf(extra, sizeof extra, "%s", type.c_str());
+			}
+			if (blobs.count(name)) {
+				tk.fail("layer " + name + ": duplicate name");
+				break;
+			}
+			std::vector<std::vector<int32_t>> inShapes;
+			for (auto &in : ins) {
+				auto bi = blobs.find(in);
+				if (bi == blobs.end()) {
+					tk.fail("layer " + name + ": unknown input " + in);
+					break;
+				}
+				inShapes.push_back({1, bi->second.c, bi->second.h, bi->second.w});
+			}
+			if (tk.bad)
+				break;
+			// the output shape, by the layer's own rule (no NPUC code computes these: the HAL's NNConcatLayer has its
+			// own computeOutputShape, and there is no HAL Eltwise/ReLU layer)
+			os.c = inShapes[0][1], os.h = inShapes[0][2], os.w = inShapes[0][3];
+			for (size_t j = 1; j < inShapes.size(); j++) {
+				const auto &s = inShapes[j];
+				int axis = kw == "concat" ? std::static_pointer_cast<ConcatAttr>(attr)->axis : 0;
+				for (int d = 1; d < 4; d++)
+					if (d != axis && s[d] != inShapes[0][d])
+						tk.fail("layer " + name + ": input " + ins[j] + " is " + std::to_string(s[1]) + "x" +
+						        std::to_string(s[2]) + "x" + std::to_string(s[3]) + ", " + ins[0] + " is " +
+						        std::to_string(inShapes[0][1]) + "x" + std::to_string(inShapes[0][2]) + "x" +
+						        std::to_string(inShapes[0][3]));
+				if (axis == 1)
+					os.c += s[1];
+				else if (axis == 2)
+					os.h += s[2];
+				else if (axis == 3)
+					os.w += s[3];
+			}
+			if (tk.bad)
+				break;
+			attrs.push_back(attr);
+			auto *nl = static_cast<NNLayer *>(::operator new(sizeof(NNLayer)));
+			STEP("NNLayer C2 (" + type + " " + name + ")");
+			npuc_NNLayer_C2(nl, name, type, ins, {name}, attr);
+			std::shared_ptr<NNLayer> l(nl);
+			for (size_t j = 0; j < ins.size(); j++)
+				l->shapes[ins[j]] = inShapes[j];
+			l->shapes[name] = {1, os.c, os.h, os.w};
+			blobs[name] = os;
+			std::string inl;
+			for (auto &in : ins)
+				inl += (inl.empty() ? "" : ", ") + in;
+			printf("layer %s %s in %s, %s, out %dx%dx%d\n", name.c_str(), type.c_str(), inl.c_str(), extra, os.c, os.h,
+			       os.w);
+			print_shapes(l);
+			std::string ij;
+			for (auto &in : ins)
+				ij += (ij.empty() ? "\"" : ", \"") + in + "\"";
+			char lb[512];
+			snprintf(lb, sizeof lb, "%s{\"name\": \"%s\", \"type\": \"%s\", \"input\": \"%s\", \"inputs\": [%s], "
+			         "\"out_shape\": [1, %d, %d, %d], \"pads\": [0, 0, 0, 0]}", first ? "" : ",\n  ", name.c_str(),
+			         type.c_str(), ins[0].c_str(), ij.c_str(), os.c, os.h, os.w);
+			jl += lb;
+			first = false;
+			layers.push_back(l);
+			last = name;
+		} else {
+			tk.fail("unknown keyword '" + kw + "'");
+		}
+	}
+	if (tk.bad || layers.size() < 2) {
+		printf("npuc-net: FAIL (input: %s)\n", tk.bad ? tk.why.c_str() : "no layer after the input");
+		return 1;
+	}
+
+	NNNetwork net;
+	STEP("append layers");
+	for (auto &l : layers)
+		if (npuc_append(net, l)) {
+			printf("npuc-net: FAIL (append %s: duplicate)\n", l->name.c_str());
+			return 2;
+		}
+	if (ver >= 2) {
+		// a blob no layer reads, other than the last, would become an extra network output
+		for (auto &l : layers) {
+			bool used = l->name == last;
+			for (auto &m : layers)
+				for (auto &in : m->inputs)
+					used = used || (in == l->name && m != l);
+			if (!used)
+				printf("note: blob %s is read by no layer (NPUC makes it an output of the network)\n", l->name.c_str());
+		}
+	}
+	if (hasConcat) {
+		// nn-eden-drv's buildNNNetwork ends with NNNetwork::mergeConcatLayer() (concat chains); a no-op without Concat
+		STEP("NNNetwork::mergeConcatLayer (NPUC's)");
+		if (npuc_mergeConcatLayer)
+			npuc_mergeConcatLayer(&net);
+		printf("network after mergeConcatLayer: %zu layers\n", net.layers.size());
+	}
+	NPUCompilerConfig cfg;
+	cfg.soc = soc;
+	cfg.quantMode = quant;
+	cfg.unk8 = 0;
+	cfg.inputFormat = "NO_FORMAT";
+	NPUCompiler comp{nullptr, &cfg};
+	__NCPBuffer buf{nullptr, 0, 0};
+	printf("network: %zu layers, output %s, soc %d, quant %d\n", layers.size(), last.c_str(), soc, quant);
+	STEP("NPUCompiler::compile (NPUC runs: frontend fillers, GraphIR/LIR, backend NCP)");
+	int rc = npuc_compile(&comp, &net, &buf);
+	STEP("after compile");
+	printf("NPUCompiler::compile = %d, addr %p, size %d\n", rc, buf.addr, buf.size);
+	if (rc != 0 || !buf.addr || buf.size < 0x80) {
+		printf("npuc-net: FAIL (compile)\n");
+		return 2;
+	}
+	FILE *f = fopen(out, "wb");
+	if (!f || fwrite(buf.addr, 1, (size_t)buf.size, f) != (size_t)buf.size || fclose(f) != 0) {
+		printf("npuc-net: FAIL (cannot write %s)\n", out);
+		return 2;
+	}
+	uint32_t w[32];
+	memcpy(w, buf.addr, sizeof w);
+	printf("NCP %s: %d bytes, magic1 0x%08" PRIx32 " version %" PRIu32 " magic2 0x%08" PRIx32 "\n", out, buf.size,
+	       w[0], w[1], w[31]);
+	if (w[0] != 0x0C0FFEE0u || w[1] != 22 || w[31] != 0xC0DEC0DEu) {
+		printf("npuc-net: FAIL (not an NCP v22 header)\n");
+		return 3;
+	}
+	std::string pj = std::string(out);
+	pj = (pj.size() > 4 && pj.compare(pj.size() - 4, 4, ".ncp") == 0 ? pj.substr(0, pj.size() - 4) : pj) + ".json";
+	FILE *j = fopen(pj.c_str(), "w");
+	if (!j) {
+		printf("npuc-net: FAIL (cannot write %s)\n", pj.c_str());
+		return 2;
+	}
+	Shape is = blobs[layers.front()->name], os = blobs[last];
+	fprintf(j, "{\"format\": \"npuc-net-out/1\", \"ncp\": \"%s\", \"ncp_size\": %d, \"soc\": %d, \"quant_mode\": %d,\n"
+	           " \"input\": \"%s\", \"in_shape\": [1, %d, %d, %d], \"output\": \"%s\", \"out_shape\": [1, %d, %d, %d],\n"
+	           " \"layers\": [", out, buf.size, soc, quant, layers.front()->name.c_str(), is.c, is.h, is.w, last.c_str(),
+	        os.c, os.h, os.w);
+	fputs(jl.c_str(), j);
+	fprintf(j, "]}\n");
+	if (fclose(j) != 0) {
+		printf("npuc-net: FAIL (cannot write %s)\n", pj.c_str());
+		return 2;
+	}
+	printf("FILE %s\nFILE %s\n", out, pj.c_str());
+	printf("npuc-net: PASS\n");
+	return 0;
+}

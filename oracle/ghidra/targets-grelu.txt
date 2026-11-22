@@ -1,0 +1,7 @@
+# the GReLU/DRU settings of an NPU2020 convolution (N3c)
+sym:_ZN7NPU202017NcpMtcConvolution
+sym:LIRGenExecutor202012setDRUParams
+sym:LIRGenExecutor202019convCreateOperation
+sym:NPUConvSlope
+sym:NPUSlope
+str:GReLU configuration

@@ -1,0 +1,55 @@
+# NPUC's tiling policy (frame part): which nodes are tiled, how many tiles, per-node tile counts in a stratum, the memory estimate
+# Ghidra keeps these names mangled: match the mangled form (NewPolicyMaker18computeTilesNumber, ...)
+sym:getBestProcessingParams
+sym:recalculateTilingForStratum
+sym:setBasicOfmTilingParameters
+sym:setSuccessorIfmTilingParameters
+sym:NewPolicyMaker18computeTilesNumber
+sym:NewPolicyMaker23computeTilingParameters
+sym:NewPolicyMaker18markNodesToBeTiled
+sym:NewPolicyMaker20performStratumTiling
+sym:NewPolicyMaker19setTilingParameters
+sym:NewPolicyMaker9tileGraph
+sym:NewPolicyMaker19checkSpecialWeights
+sym:PolicyMaker10isTileable
+sym:TilingUtils20calcBasicTileLengths
+sym:TilingUtils20calcBasicTilesLayout
+sym:PNodeOperation30estimateFullMemoryRequirements
+sym:PNodeOperation17getRequiredMemory
+sym:PNodeAtomicConvolution17getRequiredMemory
+sym:PNodeAtomicOperation17getRequiredMemory
+sym:PNodeAtomicReformat17getRequiredMemory
+sym:PolicyMaker29requiredPartialSummationBlock
+sym:FullFFCalculator28getInitialMemoryRequirements
+sym:TileBackPropagator25checkTilesFittingValidity
+sym:TileBackPropagator20fitInputTilesLayout
+sym:PolicyMaker10splitTiles
+# the helpers getBestProcessingParams calls (weights partly allocated; the fit test of a tile count)
+addr:3b0e2c
+addr:3b0fe8
+str:Memory requirements calculated on tiled nodes
+str:A valid Stratum chain created
+str:Started accumulating a chain
+str:trying to use stratum style tiling
+str:Continued chain accumulation
+# the memory estimate behind estimateFullMemoryRequirements / estimateStratumMemoryRequirements
+sym:PNodeOperation18calcRequiredMemory
+sym:PNodeAtomicOperation18calcRequiredMemory
+sym:PFeatureShape14requiredMemory
+sym:PTraits20getMaxNodeInputShape
+sym:PNode18backPropagateTiles
+sym:PTilesLayout19getLargestTileShape
+sym:PNodeConvolution13toAtomicChain
+sym:PNodeOperation13toAtomicChain
+sym:getRequiredPartialSummationBlock
+sym:requiredSideEffectMemoryBlock
+sym:PNode19calcRequiredWeights
+sym:PNodeOperation18getRequiredWeights
+# tile back-propagation (input tile lengths and overlaps) and the tile shapes
+sym:TilingUtils28KernelNodeTileBackPropagator
+sym:TilingUtils26PoolNodeTileBackPropagator
+sym:TilingUtils24PaddedTileBackPropagator
+sym:TilingUtils18TileBackPropagator
+sym:PTilesLayout12getTileShape
+sym:PNode20backPropagateOverlap
+sym:PTraits18getMaxPUInputShape

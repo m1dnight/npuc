@@ -1,0 +1,9 @@
+# DMA trigger batches and events (stream part)
+sym:BlobTransfer
+sym:EventSchedule
+sym:ScheduleEventAndWait
+sym:setBatchTrigger
+sym:enterBatchLoop
+sym:addBatchTransfer
+str:cannot allocate event
+str:batch_id

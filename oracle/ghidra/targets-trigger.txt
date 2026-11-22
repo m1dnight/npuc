@@ -1,0 +1,28 @@
+# trigger emission (stream part): where a load's ev2set lands, the wait sequence, the event schedule's placement
+sym:IsaFunc2020
+sym:IsaFunc7ExecuteIsa
+sym:IsaFunc13PreProcessing
+sym:IsaFunc14PostProcessing
+sym:IsaFunc15getWaitEventMap
+sym:IsaProcessor6MapIsa
+sym:IsaProcessor14IdentifyIRList
+sym:EventSchedule6MapIsa
+sym:EventSchedule15ReleaseResource
+sym:EventSchedule23FindNextReleasePosition
+sym:EventSchedule29InsertResourceReleaseSequence
+sym:EventSchedule15FindNextElement
+sym:EventSchedule20UpdateEventWaitField
+sym:NcpBlobLoad2020
+sym:NcpLoadDram2Sram
+sym:NPU2020CodeBinBuffer10addTrigger
+sym:CodeBinBuffer10addTrigger
+sym:NPU2020CodeBinBuffer22addSimpleLoadOperation
+sym:NPU2020CodeBinBuffer20addBlobLoadOperation
+sym:CmdQCodeGen
+callers:setBatchTrigger
+callers:EventSchedule12AllocEventId
+callers:addTrigger
+# the dependency graph's memory map (BuildGraphByDataDeps: ref / push / deref) and what runs before the event schedule
+sym:MemoryManager
+sym:GroupDivider
+sym:ProcessBlobTransfer

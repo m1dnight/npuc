@@ -1,0 +1,8 @@
+# ON-device fillers and the data filler (phone SIGSEGV 105104Z)
+sym:_ZN4NPUC21NNGraphNodeDataFiller
+sym:_ZNK4NPUC21NNGraphNodeDataFiller
+sym:NNGraphNodeBiasONFiller
+sym:NNGraphNodeKernelONFiller
+sym:NNGraphNodeScaleONFiller
+sym:NNGraphNodeShiftONFiller
+sym:_ZN4NPUC26NNGraphNodeZeroPointFiller

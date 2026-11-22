@@ -1,0 +1,78 @@
+# The tiled sweep (stream_sweep.sh <this file> $NCPGEN_WORK/sweep/tile): large maps, many channels, tiled convs with pools and chains.
+# name [quant=3] [none] <npuc-variant.py args>. Our own seeded weights; compiled NCPs stay in output/ (git-ignored).
+# ---- t1
+tw256       --in 8,256,8 --conv 8,3
+tw260       --in 8,260,8 --conv 8,3
+tw300k1     --in 8,300,8 --conv 8,1
+tw320       --in 8,320,8 --conv 8,3
+tw400       --in 4,400,8 --conv 8,3
+tw512       --in 4,512,8 --conv 8,3
+tw600       --in 4,600,8 --conv 8,3
+tw320v      --in 8,320,8 --conv 8,3,1,valid
+tw320k5     --in 8,320,8 --conv 8,5
+tw320c16    --in 8,320,16 --conv 16,3
+th256       --in 256,8,8 --conv 8,3
+th300       --in 300,8,8 --conv 8,3
+th400       --in 400,4,8 --conv 8,3
+th600       --in 600,4,8 --conv 8,3
+t64x320     --in 64,320,8 --conv 8,3
+ts208       --in 208,208,8 --conv 8,3
+ts224       --in 224,224,8 --conv 8,3
+ts256       --in 256,256,8 --conv 8,3
+ts128c32    --in 128,128,32 --conv 32,3
+ts128c32k1  --in 128,128,32 --conv 32,1
+ts160c16    --in 160,160,16 --conv 16,3
+ts192c16    --in 192,192,16 --conv 16,3
+stem        --in 224,224,3 --conv 16,3,2,same
+stem32      --in 224,224,3 --conv 32,3,2,same
+stemv       --in 225,225,3 --conv 16,3,2,valid
+ts224c3     --in 224,224,3 --conv 8,3
+c256        --in 32,32,256 --conv 256,3
+c512        --in 32,32,512 --conv 512,3
+c256k1      --in 32,32,256 --conv 256,1
+ci512       --in 32,32,512 --conv 16,3
+co512       --in 32,32,16 --conv 512,3
+tw320p      --in 8,320,8 --conv 8,3 --pool max,2
+th300p      --in 300,8,8 --conv 8,3 --pool max,2
+ts208p      --in 208,208,8 --conv 8,3 --pool max,2
+stemp       --in 224,224,3 --conv 16,3,2,same --pool max,2
+tw320cc     --in 8,320,8 --conv 8,3 --conv 8,3
+# ---- t2
+r_c256h24   --in 24,24,256 --conv 256,3
+r_c256h16   --in 16,16,256 --conv 256,3
+r_c320h24   --in 24,24,320 --conv 320,3
+r_c192h32   --in 32,32,192 --conv 192,3
+r_c256co128 --in 32,32,256 --conv 128,3
+r_c384      --in 32,32,384 --conv 384,3
+r_c512h16   --in 16,16,512 --conv 512,3
+r_c512h24   --in 24,24,512 --conv 512,3
+r_c448      --in 32,32,448 --conv 448,3
+r_c512k1    --in 32,32,512 --conv 512,1
+r_c384h48   --in 48,48,384 --conv 64,3
+r_c256h40   --in 40,40,256 --conv 256,3
+r_c256h48   --in 48,48,256 --conv 256,3
+# ---- t3
+th268       --in 268,8,8 --conv 8,3
+th276       --in 276,8,8 --conv 8,3
+th270k5     --in 270,8,8 --conv 8,5
+tw270       --in 4,270,8 --conv 8,3
+tw330k5     --in 4,330,8 --conv 8,5
+tw300c20    --in 8,300,20 --conv 20,3
+tw300c9     --in 8,300,8 --conv 9,3
+tw300c40    --in 8,300,40 --conv 24,3
+tw300q3     quant=3 --in 8,300,8 --conv 8,3
+tw300none   none --in 8,300,8 --conv 8,3,1,same,none
+ts216       --in 216,216,8 --conv 8,3
+ts240c8     --in 240,240,8 --conv 8,1
+ts176c16    --in 176,176,16 --conv 16,3
+ts144c32    --in 144,144,32 --conv 32,3
+ts112c64    --in 112,112,64 --conv 64,3
+ts96c96     --in 96,96,96 --conv 96,3
+tw320pc20   --in 8,320,8 --conv 20,3 --pool max,2
+ts208pavg   --in 208,208,8 --conv 8,3 --pool avg,2
+tch1        --in 8,320,8 --conv 8,3 --conv 8,1
+tch2        --in 8,160,8 --conv 8,3 --pool max,1,1 --conv 8,3
+tch3        --in 16,300,8 --conv 8,3 --pool max,2 --conv 16,3
+tch4        --in 208,208,8 --conv 8,3 --pool max,2 --conv 8,3
+tch5        --in 8,280,8 --conv 8,3 --pool max,3,1,same --conv 8,3
+tc_s2       --in 8,600,8 --conv 8,3,2,same

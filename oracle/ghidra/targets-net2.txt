@@ -1,0 +1,2 @@
+# npuc-net: how NPUC sizes conv outputs and splits SAME padding (stride > 1)
+sym:NNConvLayer.*computeOutputShape

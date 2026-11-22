@@ -1,0 +1,5 @@
+# fifth pass: where nn-eden-drv creates and configures npuCompiler_ (NPUCompiler and its config struct)
+str:Invalid type is delivered
+str:bitSum = 0x
+str:CompilerManager] %s:448
+str:CompilerManager] %s:555

@@ -1,0 +1,5 @@
+# the filler chain after FusedActivation (phone SIGSEGV 105104Z)
+sym:generateGraph
+sym:NNGraphNodeFillerChain3run
+sym:NNGraphNodeFillerChain
+sym:_ZN4NPUC32NNGraphNodeFusedActivationFiller

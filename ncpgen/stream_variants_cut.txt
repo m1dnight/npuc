@@ -1,0 +1,47 @@
+# NPUC's 'CMDQ seems too big' cut (stream.py): passes 40..128, k1 / k3, small and big inputs, rings or not
+# (compile: stream_sweep.sh stream_variants_cut.txt $NCPGEN_WORK/sweep/cut)
+k1c40-ci64   --in 4,4,64 --conv 640,1
+k1c41-ci64   --in 4,4,64 --conv 656,1
+k1c42-ci64   --in 4,4,64 --conv 672,1
+k1c43-ci64   --in 4,4,64 --conv 688,1
+k1c44-ci64   --in 4,4,64 --conv 704,1
+k1c46-ci64   --in 4,4,64 --conv 736,1
+k1c48-ci64   --in 4,4,64 --conv 768,1
+k1c52-ci64   --in 4,4,64 --conv 832,1
+k1c56-ci64   --in 4,4,64 --conv 896,1
+k1c60-ci64   --in 4,4,64 --conv 960,1
+k1c64-ci64   --in 4,4,64 --conv 1024,1
+k1c44-ci1024 --in 4,4,1024 --conv 704,1
+k1c48-ci1024 --in 4,4,1024 --conv 768,1
+k1c60-ci1024 --in 4,4,1024 --conv 960,1
+k1c64-ci1024 --in 4,4,1024 --conv 1024,1
+k3c32-ci64   --in 4,4,64 --conv 512,3
+k3c36-ci64   --in 4,4,64 --conv 576,3
+k3c40-ci64   --in 4,4,64 --conv 640,3
+k3c44-ci64   --in 4,4,64 --conv 704,3
+k3c48-ci64   --in 4,4,64 --conv 768,3
+mb1024-7     --in 7,7,1024 --conv 1024,1
+mb1024-14    --in 14,14,512 --conv 1024,1
+k1c96-ci64   --in 4,4,64 --conv 1536,1
+k1c128-ci64  --in 2,2,64 --conv 2048,1
+k1c64-h1     --in 1,1,1024 --conv 1024,1
+k1c64x2      --in 4,4,64 --conv 1024,1 --conv 64,1
+# second round: rings, sub-batches, uneven outputs, stride 2, quant 3, bigger maps
+k3c64-ci512  --in 4,4,512 --conv 1024,3
+k3c32-ci256h14 --in 14,14,256 --conv 512,3
+k1c64-ci2048 --in 7,7,2048 --conv 1024,1
+k1c1000-h1   --in 1,1,1024 --conv 1000,1
+k1c1020      --in 4,4,64 --conv 1020,1
+k1c1000      --in 4,4,64 --conv 1000,1
+q3big4       quant=3 --in 4,4,1024 --conv 1024,1
+mb1024-14b   --in 14,14,1024 --conv 1024,1
+s2c64        --in 8,8,512 --conv 1024,3,2
+k1c64p       --in 4,4,64 --conv 1024,1 --pool max,2
+k1c80-ci512  --in 7,7,512 --conv 1280,1
+# third round: when weight loads go per core (untiled, big kernels)
+u512-ci512   --in 4,4,512 --conv 512,3
+u256-ci512   --in 4,4,512 --conv 256,3
+u512-ci256   --in 4,4,256 --conv 512,3
+u512-ci384   --in 4,4,384 --conv 512,3
+u128-ci512   --in 4,4,512 --conv 128,3
+u512-ci448   --in 4,4,448 --conv 512,3

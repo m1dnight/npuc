@@ -1,0 +1,320 @@
+# The stream sweep: every variant ncpgen/stream.py is checked on (stream_sweep.sh <this file> $NCPGEN_WORK/sweep/stream).
+# name [quant=3] [none] <npuc-variant.py args>. Our own seeded weights; the compiled NCPs stay in output/ (git-ignored).
+# ---- s1
+base        --in 16,16,8 --conv 8,3
+k1          --in 16,16,8 --conv 8,1
+k5          --in 16,16,8 --conv 8,5
+k7          --in 16,16,8 --conv 8,7
+k3x1        --in 16,16,8 --conv 8,3 --kw 1
+k1x3        --in 16,16,8 --conv 8,1 --kw 3
+k3x5        --in 16,16,8 --conv 8,3 --kw 5
+ci1         --in 16,16,1 --conv 8,3
+ci2         --in 16,16,2 --conv 8,3
+ci3         --in 16,16,3 --conv 8,3
+ci4         --in 16,16,4 --conv 8,3
+ci5         --in 16,16,5 --conv 8,3
+ci7         --in 16,16,7 --conv 8,3
+ci16        --in 16,16,16 --conv 8,3
+ci17        --in 16,16,17 --conv 8,3
+ci32        --in 16,16,32 --conv 8,3
+co1         --in 16,16,8 --conv 1,3
+co2         --in 16,16,8 --conv 2,3
+co3         --in 16,16,8 --conv 3,3
+co4         --in 16,16,8 --conv 4,3
+co5         --in 16,16,8 --conv 5,3
+co7         --in 16,16,8 --conv 7,3
+co9         --in 16,16,8 --conv 9,3
+co16        --in 16,16,8 --conv 16,3
+co17        --in 16,16,8 --conv 17,3
+co24        --in 16,16,8 --conv 24,3
+co32        --in 16,16,8 --conv 32,3
+hw8         --in 8,8,8 --conv 8,3
+hw12        --in 12,12,8 --conv 8,3
+hw8x16      --in 8,16,8 --conv 8,3
+hw16x8      --in 16,8,8 --conv 8,3
+hw10        --in 10,10,8 --conv 8,3
+hw9         --in 9,9,8 --conv 8,3
+hw20        --in 20,20,8 --conv 8,3
+hw32        --in 32,32,8 --conv 8,3
+hw4         --in 4,4,8 --conv 8,3
+hw5x7       --in 5,7,8 --conv 8,3
+s2same      --in 16,16,8 --conv 8,3,2,same
+s2valid     --in 16,16,8 --conv 8,3,2,valid
+valid       --in 16,16,8 --conv 8,3,1,valid
+none        none --in 16,16,8 --conv 8,3,1,same,none
+q3          quant=3 --in 16,16,8 --conv 8,3
+q3none      quant=3 none --in 16,16,8 --conv 8,3,1,same,none
+seed2       --in 16,16,8 --seed 2 --conv 8,3
+wscale      --in 16,16,8 --conv 8,3 --wscale 0.003
+oscale      --in 16,16,8 --conv 8,3 --oscale 0.05
+ozp         --in 16,16,8 --conv 8,3 --ozp 10
+inzp        --in 16,16,8 --in-zp 5 --conv 8,3
+bzero       --in 16,16,8 --conv 8,3 --bias zero
+wzero       --in 16,16,8 --conv 8,3 --weights zero
+pmax        --in 16,16,8 --conv 8,3 --pool max,2
+pavg        --in 16,16,8 --conv 8,3 --pool avg,2
+pmax3       --in 16,16,8 --conv 8,3 --pool max,3,2
+two         --in 16,16,8 --conv 8,3 --conv 8,3
+# ---- s2
+sh8         --in 16,16,8 --conv 8,3 --oscale 0.00001
+sh9         --in 16,16,8 --conv 8,3 --oscale 0.0001
+sh12        --in 16,16,8 --conv 8,3 --oscale 0.00076
+sh10q3      quant=3 --in 16,16,8 --conv 8,3 --oscale 0.0002
+co12        --in 16,16,8 --conv 12,3
+co20        --in 16,16,8 --conv 20,3
+co25        --in 16,16,8 --conv 25,3
+co33        --in 16,16,8 --conv 33,3
+co48        --in 16,16,8 --conv 48,3
+co64        --in 16,16,8 --conv 64,3
+ci9         --in 16,16,9 --conv 8,3
+ci24        --in 16,16,24 --conv 8,3
+ci48        --in 16,16,48 --conv 8,3
+ci64        --in 16,16,64 --conv 8,3
+k9          --in 16,16,8 --conv 8,9
+k11         --in 16,16,8 --conv 8,11
+k1x5        --in 16,16,8 --conv 8,1 --kw 5
+k5x1        --in 16,16,8 --conv 8,5 --kw 1
+k2          --in 16,16,8 --conv 8,2
+k4          --in 16,16,8 --conv 8,4
+k3valid     --in 16,16,8 --conv 8,3,1,valid
+k5valid     --in 16,16,8 --conv 8,5,1,valid
+k1none      none --in 16,16,8 --conv 8,1,1,same,none
+k1q3        quant=3 --in 16,16,8 --conv 8,1
+k1ci3       --in 16,16,3 --conv 8,1
+k1co32      --in 16,16,8 --conv 32,1
+c1616       --in 16,16,16 --conv 16,3
+c3232       --in 16,16,32 --conv 32,3
+hw7x13      --in 7,13,8 --conv 8,3
+hw24        --in 24,24,8 --conv 8,3
+hw40        --in 40,40,8 --conv 8,3
+hw48        --in 48,48,8 --conv 8,3
+hw64        --in 64,64,8 --conv 8,3
+hw16x64     --in 16,64,8 --conv 8,3
+hw64x16     --in 64,16,8 --conv 8,3
+pmax2s1     --in 16,16,8 --conv 8,3 --pool max,2,1
+pmax3s1s    --in 16,16,8 --conv 8,3 --pool max,3,1,same
+pavg3s1s    --in 16,16,8 --conv 8,3 --pool avg,3,1,same
+pmax2s2s    --in 16,16,8 --conv 8,3 --pool max,2,2,same
+pmaxk1      --in 16,16,8 --conv 8,1 --pool max,2
+pmaxco16    --in 16,16,8 --conv 16,3 --pool max,2
+pmaxhw8     --in 8,8,8 --conv 8,3 --pool max,2
+cpc         --in 16,16,8 --conv 8,3 --pool max,2 --conv 8,3
+two816      --in 16,16,8 --conv 16,3 --conv 8,3
+twok1       --in 16,16,8 --conv 8,1 --conv 8,1
+twok13      --in 16,16,8 --conv 8,1 --conv 8,3
+three       --in 16,16,8 --conv 8,3 --conv 8,3 --conv 8,3
+# ---- s3
+s2k1        --in 16,16,8 --conv 8,1,2,valid
+s2k5        --in 16,16,8 --conv 8,5,2,same
+s2hw15      --in 15,15,8 --conv 8,3,2,same
+s2hw32      --in 32,32,8 --conv 8,3,2,same
+s2ci16      --in 16,16,16 --conv 8,3,2,same
+s2ci3       --in 16,16,3 --conv 8,3,2,same
+s2co16      --in 16,16,8 --conv 16,3,2,same
+s2k4        --in 16,16,8 --conv 8,4,2,same
+s2q3        quant=3 --in 16,16,8 --conv 8,3,2,same
+fc4         --in 4,4,8 --conv 10,4,1,valid
+fc8         --in 8,8,16 --conv 10,8,1,valid
+fc1         --in 1,1,64 --conv 10,1,1,valid
+hw96        --in 96,96,8 --conv 8,3
+hw128       --in 128,128,8 --conv 8,3
+hw128c16    --in 128,128,16 --conv 16,3
+hw160       --in 160,160,8 --conv 8,3
+hw224c3     --in 224,224,3 --conv 8,3
+hw64c64     --in 64,64,64 --conv 64,3
+pp          --in 16,16,8 --conv 8,3 --pool max,2 --pool max,2
+cpp         --in 32,32,8 --conv 8,3 --pool max,2 --conv 16,3 --pool avg,2
+cco17       --in 16,16,8 --conv 17,3 --conv 8,3
+cci17       --in 16,16,8 --conv 8,3 --conv 33,3 --conv 8,1
+cvq3        quant=3 --in 16,16,8 --conv 8,3 --pool max,2 --conv 8,3
+cvnone      none --in 16,16,8 --conv 8,3,1,same,none --conv 8,3
+pool3co24   --in 16,16,8 --conv 24,3 --pool max,3,2
+k1pool      --in 16,16,8 --conv 8,1 --pool avg,2 --conv 8,1
+cvalid      --in 16,16,8 --conv 8,3,1,valid --conv 8,3,1,valid
+c5x7        --in 9,11,5 --conv 7,3 --kw 5 --conv 3,1
+# ---- s4
+w120        --in 8,120,8 --conv 8,3
+w125        --in 8,125,8 --conv 8,3
+w126        --in 8,126,8 --conv 8,3
+w127        --in 8,127,8 --conv 8,3
+w136        --in 8,136,8 --conv 8,3
+w200        --in 8,200,8 --conv 8,3
+w250        --in 8,250,8 --conv 8,3
+w256        --in 8,256,8 --conv 8,3
+w300        --in 8,300,8 --conv 8,3
+w384        --in 4,384,8 --conv 8,3
+w128k1      --in 8,128,8 --conv 8,1
+w128k5      --in 8,128,8 --conv 8,5
+w128valid   --in 8,128,8 --conv 8,3,1,valid
+w128pool    --in 8,128,8 --conv 8,1 --pool max,2
+w256pool    --in 8,256,8 --conv 8,1 --pool max,2
+w300pool    --in 4,300,8 --conv 8,1 --pool max,3,1,same
+w128s2      --in 8,128,8 --conv 8,3,2,same
+w256s2      --in 8,256,8 --conv 8,3,2,same
+w300s2      --in 4,300,8 --conv 8,3,2,same
+h200        --in 200,8,8 --conv 8,3
+h300        --in 300,8,8 --conv 8,3
+h300pool    --in 300,8,8 --conv 8,1 --pool max,2
+co96        --in 8,8,8 --conv 96,3
+co128       --in 8,8,8 --conv 128,3
+co200       --in 8,8,8 --conv 200,1
+co255       --in 8,8,8 --conv 255,1
+ci128       --in 8,8,128 --conv 8,3
+ci255       --in 8,8,255 --conv 8,1
+c128        --in 8,8,128 --conv 128,3
+# ---- s5
+w104        --in 8,104,8 --conv 8,3
+w110        --in 8,110,8 --conv 8,3
+w112        --in 8,112,8 --conv 8,3
+w116        --in 8,116,8 --conv 8,3
+w117        --in 8,117,8 --conv 8,3
+w118        --in 8,118,8 --conv 8,3
+w119        --in 8,119,8 --conv 8,3
+w112k5      --in 8,112,8 --conv 8,5
+w114k5      --in 8,114,8 --conv 8,5
+w116k5      --in 8,116,8 --conv 8,5
+w118v       --in 8,118,8 --conv 8,3,1,valid
+w120v       --in 8,120,8 --conv 8,3,1,valid
+w121v       --in 8,121,8 --conv 8,3,1,valid
+w130v       --in 8,130,8 --conv 8,3,1,valid
+w160        --in 8,160,8 --conv 8,3
+w180        --in 8,180,8 --conv 8,3
+w240        --in 8,240,8 --conv 8,3
+w112pool    --in 8,112,8 --conv 8,1 --pool max,2
+w120pool    --in 8,120,8 --conv 8,1 --pool max,2
+w122pool    --in 8,122,8 --conv 8,1 --pool max,2
+w124pool    --in 8,124,8 --conv 8,1 --pool max,2
+w136pool    --in 8,136,8 --conv 8,1 --pool max,2
+w200pool    --in 8,200,8 --conv 8,1 --pool max,2
+w112s2      --in 8,112,8 --conv 8,3,2,same
+w120s2      --in 8,120,8 --conv 8,3,2,same
+ci80        --in 8,8,80 --conv 8,3
+ci96        --in 8,8,96 --conv 8,3
+ci112       --in 8,8,112 --conv 8,3
+ci72        --in 8,8,72 --conv 8,1
+ci128k1     --in 8,8,128 --conv 8,1
+ci128h16    --in 16,16,128 --conv 8,1
+ci128h4     --in 4,4,128 --conv 8,1
+co240       --in 8,8,8 --conv 240,1
+co232       --in 8,8,8 --conv 232,1
+co224       --in 8,8,8 --conv 224,1
+# ---- s6
+ci120       --in 8,8,120 --conv 8,3
+ci124       --in 8,8,124 --conv 8,3
+ci136       --in 8,8,136 --conv 8,3
+ci160       --in 8,8,160 --conv 8,3
+ci192       --in 8,8,192 --conv 8,3
+ci256       --in 4,4,256 --conv 8,3
+ci128h16k3  --in 16,16,128 --conv 8,3
+ci128h4k3   --in 4,4,128 --conv 8,3
+ci128s2     --in 8,8,128 --conv 8,3,2,same
+ci128v      --in 8,8,128 --conv 8,3,1,valid
+ci128pool   --in 8,8,8 --conv 128,1 --pool max,2
+w113k5      --in 8,113,8 --conv 8,5
+w115        --in 8,115,8 --conv 8,3
+w120ci16    --in 8,120,16 --conv 8,3
+w120ci16p   --in 8,120,8 --conv 16,1 --pool max,2
+w130ci16s2  --in 8,130,16 --conv 8,3,2,same
+w200avg3    --in 4,200,8 --conv 8,1 --pool avg,3,1,same
+w240max2    --in 4,240,8 --conv 8,1 --pool max,2
+w240max3    --in 4,240,8 --conv 8,1 --pool max,3,1,same
+# ---- s7
+ci128k5     --in 8,8,128 --conv 8,5
+ci255k7     --in 8,8,255 --conv 8,7
+ci200k5s2   --in 8,8,200 --conv 8,5,2,same
+ci18k15     --in 16,16,18 --conv 8,15
+ci64k7      --in 8,8,64 --conv 8,7
+ci36k9      --in 12,12,36 --conv 8,9
+ci64k7co24  --in 8,8,64 --conv 24,7
+ci64k7q3    quant=3 --in 8,8,64 --conv 8,7
+ci100k5     --in 8,8,100 --conv 16,5
+# ---- s8
+ci255k3x5   --in 8,8,255 --conv 8,3 --kw 5
+ci255k5x3   --in 8,8,255 --conv 8,5 --kw 3
+ci255k1x9   --in 8,8,255 --conv 8,1 --kw 9
+ci200k11    --in 8,8,64 --conv 8,11
+ci64k7s2    --in 8,8,64 --conv 8,7,2,same
+chain_ps    --in 8,8,16 --conv 64,3 --conv 8,7
+chain_s2    --in 16,16,8 --conv 16,3,2,same --conv 16,3,2,same --pool avg,2
+chain_q3s2  quant=3 --in 16,16,8 --conv 16,3,2,same --pool max,2 --conv 8,1
+chain_big   --in 16,16,3 --conv 32,3 --pool max,2 --conv 64,3 --pool max,2 --conv 10,4,1,valid
+k13         --in 16,16,8 --conv 8,13
+# ---- s9
+ci256h8     --in 8,8,256 --conv 8,3
+ci256h6     --in 6,6,256 --conv 8,3
+ci256h7v    --in 9,9,256 --conv 8,3,1,valid
+ci128s2h16  --in 16,16,128 --conv 8,3,2,same
+ci128s2h20  --in 20,20,128 --conv 8,3,2,valid
+# ---- s10
+t176        --in 176,176,8 --conv 8,3
+t192        --in 192,192,8 --conv 8,3
+t200        --in 200,200,8 --conv 8,3
+t208        --in 208,208,8 --conv 8,3
+t96c32      --in 96,96,32 --conv 32,3
+t112c32     --in 112,112,32 --conv 32,3
+t128c24     --in 128,128,24 --conv 24,3
+t144c16     --in 144,144,16 --conv 16,3
+# ---- s11
+pfirst      --in 16,16,8 --pool max,2 --conv 8,3
+pfirstavg   --in 16,16,24 --pool avg,3,1,same --conv 8,1
+pfirstw     --in 8,160,8 --pool max,2 --conv 8,3
+pfirst128   --in 8,8,128 --pool max,3,1,same --conv 8,1
+q3avg       quant=3 --in 16,16,8 --conv 8,3 --pool avg,2
+# ---- s12
+po_e_o1     --in 10,11,4 --conv 8,1 --pool max,2
+po_e_o2     --in 8,9,8 --conv 8,1 --pool avg,2
+po_e_o3     --in 4,15,8 --conv 8,1 --pool max,2
+po_o_o1     --in 9,11,8 --conv 8,1 --pool max,2
+po_o_o2     --in 11,13,8 --conv 8,1 --pool avg,2
+po_o_e      --in 9,12,8 --conv 8,1 --pool max,2
+po_k3_h15w16 --in 15,16,8 --conv 8,1 --pool max,3,2
+po_k3_h16w15 --in 16,15,8 --conv 8,1 --pool max,3,2
+po_k3_h15w17 --in 15,17,8 --conv 8,1 --pool avg,3,2
+po_same_o   --in 10,11,8 --conv 8,1 --pool max,2,2,same
+po_chain    --in 12,13,8 --conv 8,1 --pool avg,2 --pool max,2
+po_conv     --in 10,13,8 --conv 8,3 --pool max,2 --conv 8,3
+po_convv    --in 10,13,8 --conv 8,1 --pool max,2 --conv 8,3,1,valid
+po_s2       --in 10,13,8 --conv 8,1 --pool max,2 --conv 8,3,2,same
+c20p        --in 12,12,8 --conv 20,1 --pool max,2
+c14p        --in 12,12,8 --conv 14,1 --pool max,2
+c28p        --in 12,12,8 --conv 28,1 --pool avg,2
+c18p        --in 12,12,8 --conv 18,1 --pool max,2
+c6p         --in 12,12,8 --conv 6,1 --pool max,2
+c20pad      --in 12,12,8 --conv 20,1 --conv 8,3
+c14pad      --in 12,12,8 --conv 14,1 --conv 8,3
+c28pad      --in 12,12,8 --conv 28,1 --conv 16,3
+c20s2       --in 12,12,8 --conv 20,1 --conv 8,3,2,same
+c14s2v      --in 12,12,8 --conv 14,1 --conv 8,3,2,valid
+c28p2       --in 12,12,8 --conv 28,1 --pool max,3,1,same --conv 8,1
+s2o1        --in 15,17,8 --conv 8,3,2,same
+s2o2        --in 15,17,8 --conv 8,3,2,valid
+s2o3        --in 9,9,8 --conv 8,3,2,same
+s2o4        --in 7,13,8 --conv 8,1,2,valid
+s2o5        --in 13,7,16 --conv 12,5,2,same
+s2o6        --in 11,11,8 --conv 8,4,2,same
+s2chain1    --in 15,17,8 --conv 16,3,2,same --pool max,2 --conv 8,3
+s2chain2    --in 17,15,8 --conv 8,3,2,valid --conv 20,3,2,same --conv 8,1
+s2chain3    quant=3 --in 21,19,4 --conv 12,3,2,same --pool avg,2 --pool max,2
+# ---- s13
+c34p        --in 8,8,8 --conv 34,1 --pool max,2
+c26p        --in 8,8,8 --conv 26,1 --pool avg,2
+c38p        --in 8,8,8 --conv 38,1 --pool max,2
+c50p        --in 8,8,8 --conv 50,1 --pool max,2
+c10p        --in 8,8,8 --conv 10,1 --pool max,2
+c22p        --in 8,8,8 --conv 22,1 --pool max,2
+c34pad      --in 8,8,8 --conv 34,1 --conv 8,3
+c26s2       --in 8,8,8 --conv 26,1 --conv 8,3,2,same
+c26pp       --in 16,16,8 --conv 26,1 --pool max,2 --pool max,2
+# ---- s14
+pfirst20    --in 8,8,20 --pool max,2 --conv 8,1
+pfirst20s   --in 8,8,20 --pool avg,3,1,same --conv 20,3 --pool max,2
+c34pp       --in 16,16,8 --conv 34,1 --pool max,2 --pool avg,2
+c42pad      --in 8,8,8 --conv 42,1 --conv 8,3 --pool max,2
+c20q3       quant=3 --in 9,13,8 --conv 20,3 --pool max,2
+c46s2p      --in 12,13,8 --conv 46,1 --conv 20,3,2,same --pool avg,2
+# ---- s15
+u20s2first  --in 12,12,20 --conv 8,3,2,same
+u34s2first  --in 12,13,34 --conv 12,5,2,same --pool max,2
+pp20        --in 16,16,20 --pool max,2 --pool avg,2 --conv 8,1
+c22pc       --in 12,12,8 --conv 22,1 --pool max,2 --conv 8,3 --pool avg,2
+c38s2       --in 12,12,8 --conv 38,1 --conv 8,3,2,same

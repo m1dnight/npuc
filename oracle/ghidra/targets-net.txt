@@ -1,0 +1,14 @@
+# npuc-net (multi-layer networks): pooling layers, depthwise conv, the activations, the scale rule
+str:Not supported Pool type
+str:options->padTop
+sym:getPoolLayer
+sym:loadPoolAttr
+sym:PoolAttr
+sym:NNPoolLayer
+sym:addPoolingGraphNode
+sym:setKernelInfo
+sym:getDepthwise
+sym:ScaleONFiller.*setScale
+sym:FusedActivationFiller.*setFusedActivation
+sym:addConvolutionGraphNode
+sym:SplitBigKernelPool

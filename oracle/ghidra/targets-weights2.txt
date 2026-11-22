@@ -1,0 +1,6 @@
+# IDP assignment for the planner's MF buffer (weights part)
+sym:NPUIDPAllocator28assignForChannelCountCompact
+sym:NPUIDPAllocator16assignForFeature
+sym:NPUIDPAllocator
+sym:DynamicBuffer19setChannelTableSize
+sym:DynamicBuffer10getGranule

@@ -1,0 +1,83 @@
+# trigger batches of groups with 15+ weight loads (stream.py emit_group): k1 vs padded k3, one or four input loads,
+# rings or not, Cout around 240..512 (compile: stream_sweep.sh stream_variants_trig.txt $NCPGEN_WORK/sweep/trig)
+k1-228       --in 8,8,8 --conv 228,1
+k3-228       --in 8,8,8 --conv 228,3
+k1-232       --in 8,8,8 --conv 232,1
+k3-232       --in 8,8,8 --conv 232,3
+k1-236       --in 8,8,8 --conv 236,1
+k3-236       --in 8,8,8 --conv 236,3
+k1-240       --in 8,8,8 --conv 240,1
+k3-240       --in 8,8,8 --conv 240,3
+k1-244       --in 8,8,8 --conv 244,1
+k3-244       --in 8,8,8 --conv 244,3
+k1-248       --in 8,8,8 --conv 248,1
+k3-248       --in 8,8,8 --conv 248,3
+k1-252       --in 8,8,8 --conv 252,1
+k3-252       --in 8,8,8 --conv 252,3
+k1-255       --in 8,8,8 --conv 255,1
+k3-255       --in 8,8,8 --conv 255,3
+k1-256       --in 8,8,8 --conv 256,1
+k3-256       --in 8,8,8 --conv 256,3
+k1-260       --in 8,8,8 --conv 260,1
+k3-260       --in 8,8,8 --conv 260,3
+k1-272       --in 8,8,8 --conv 272,1
+k3-272       --in 8,8,8 --conv 272,3
+k1-320       --in 8,8,8 --conv 320,1
+k3-320       --in 8,8,8 --conv 320,3
+k1-384       --in 8,8,8 --conv 384,1
+k3-384       --in 8,8,8 --conv 384,3
+p1-228       --in 1,1,112 --conv 228,3
+v3-228       --in 8,8,8 --conv 228,3,1,valid
+pl-228       --in 8,8,8 --pool max,2 --conv 228,1
+p1-240       --in 1,1,112 --conv 240,3
+v3-240       --in 8,8,8 --conv 240,3,1,valid
+pl-240       --in 8,8,8 --pool max,2 --conv 240,1
+p1-256       --in 1,1,112 --conv 256,3
+v3-256       --in 8,8,8 --conv 256,3,1,valid
+pl-256       --in 8,8,8 --pool max,2 --conv 256,1
+p1-272       --in 1,1,112 --conv 272,3
+v3-272       --in 8,8,8 --conv 272,3,1,valid
+pl-272       --in 8,8,8 --pool max,2 --conv 272,1
+s4-240       --in 8,8,128 --conv 240,3
+s1-240       --in 8,8,128 --conv 240,1
+s4-256       --in 8,8,128 --conv 256,3
+s1-256       --in 8,8,128 --conv 256,1
+s4-320       --in 8,8,128 --conv 320,3
+s1-320       --in 8,8,128 --conv 320,1
+s4-512       --in 8,8,128 --conv 512,3
+s1-512       --in 8,8,128 --conv 512,1
+rg-320       --in 16,16,64 --conv 320,5
+rg1-320      --in 24,24,32 --conv 320,1
+rg-384       --in 16,16,64 --conv 384,5
+rg1-384      --in 24,24,32 --conv 384,1
+rg-448       --in 16,16,64 --conv 448,5
+rg1-448      --in 24,24,32 --conv 448,1
+rg-512       --in 16,16,64 --conv 512,5
+rg1-512      --in 24,24,32 --conv 512,1
+q3k1-240     quant=3 --in 8,8,8 --conv 240,1
+q3k3-240     quant=3 --in 8,8,8 --conv 240,3
+q3k1-228     quant=3 --in 8,8,8 --conv 228,1
+q3k3-228     quant=3 --in 8,8,8 --conv 228,3
+q3k1-256     quant=3 --in 8,8,8 --conv 256,1
+q3k3-256     quant=3 --in 8,8,8 --conv 256,3
+k1-225       --in 8,8,8 --conv 225,1
+k1-226       --in 8,8,8 --conv 226,1
+k1-230       --in 8,8,8 --conv 230,1
+k1-234       --in 8,8,8 --conv 234,1
+k1-238       --in 8,8,8 --conv 238,1
+k1-218       --in 8,8,8 --conv 218,1
+k1-220       --in 8,8,8 --conv 220,1
+k1-210       --in 8,8,8 --conv 210,1
+k1-212       --in 8,8,8 --conv 212,1
+s4-228       --in 8,8,128 --conv 228,3
+ci20-228     --in 8,8,20 --conv 228,1
+s4-236       --in 8,8,128 --conv 236,3
+ci20-236     --in 8,8,20 --conv 236,1
+s4-232       --in 8,8,128 --conv 232,3
+ci20-232     --in 8,8,20 --conv 232,1
+s4-244       --in 8,8,128 --conv 244,3
+s4-252       --in 8,8,128 --conv 252,3
+k1-228p     --in 8,8,8 --conv 228,1 --pool max,2
+k1-228c     --in 8,8,8 --conv 228,1 --conv 8,1
+k1-240c     --in 8,8,8 --conv 240,1 --conv 8,1
+k1x2-228    --in 8,8,8 --conv 16,1 --conv 228,1

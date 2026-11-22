@@ -1,0 +1,56 @@
+# npuc.h reconstruction targets (DecompileTargets.java). Our own list: names and log strings only.
+# nn-eden-drv (stripped): the network builder and the compile call, found by their log strings
+str:Call convertToNNNetwork
+str:Call npuCompiler_->compile
+str:operator type is conv2d
+str:NNConvLayer is nullptr
+str:loadConvAttrForConvolutionLayer
+str:ConvAttr is null.
+str:convolutionLayer->computeOutputShape
+str:Make input layers of
+str:inputLayerName :
+str:the first input operand name
+str:Conv_2D inputZP size
+str:kernel name:
+str:bias name:
+str:FusedActivation:
+str:Fail to append layer becuase
+str:ManipulateNetwork
+str:Fail to generate NN network
+str:getPtr) op_id=
+str:operand.scale:
+str:options->padTop
+# libnpuc_*: the inline methods exported weak, and the options singleton
+sym:^_ZN4NPUC7NNLayerC[12]E
+sym:^_ZN4NPUC7NNLayerD[012]Ev
+sym:^_ZN4NPUC11NNConvLayerC[12]E
+sym:^_ZN4NPUC11NNConvLayerD[012]Ev
+sym:^_ZN4NPUC11NNConvLayer18computeOutputShape
+sym:^_ZN4NPUC7NNLayer18computeOutputShape
+sym:^_ZN4NPUC8ConvAttr
+sym:^_ZN4NPUC9LayerAttr
+sym:^_ZN4NPUC7NNLayer9printInfo
+sym:^_ZN4NPUC9NNNetwork12setUpNetwork
+sym:^_ZN4NPUC9NNNetwork12topologySort
+sym:^_ZN4NPUC9NNNetwork13setKernelInfo
+sym:^_ZN4NPUC9NNNetwork18computeLayersShape
+sym:^_ZN4NPUC9NNNetwork13getInputShape
+sym:^_ZN4NPUC9NNNetwork12printNetwork
+sym:^_ZN4NPUC9NNNetworkD[12]Ev
+sym:^_ZN4NPUC14CompileOptions
+sym:^_ZN4NPUC14NPUCController
+sym:^_ZN4NPUC11NPUCompiler
+sym:AddDummyConvFilter
+sym:SliceToConvFilter
+sym:NNGraphNodeKernelFiller
+sym:NNGraphNodeBiasFiller
+sym:NNGraphNodeFractionalLengthFiller
+sym:NNGraphNodeZeroPointFiller
+sym:NNGraphNodeShiftFiller
+sym:_ZN4NPUC17SetupQuantization
+sym:_ZN4NPUC7NNGraph9construct
+sym:_ZN4NPUC11NNGraphNodeC[12]E
+sym:_ZN4NPUC16NNGraphAttributeC[12]E
+sym:NNGraph15prepareRawNodes
+str:Chosen SoC type
+str:npuc version

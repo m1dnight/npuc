@@ -1,0 +1,9 @@
+# second pass, nn-eden-drv: the kernel/bias data getters of loadConvAttrForConvolutionLayer and the helpers it calls
+addr:0x173400
+addr:0x173658
+addr:0x176508
+sym:configConv2d
+sym:getMatchedEdenOperandName
+sym:createConvolutionLayer
+sym:NNNetworkBuilder
+sym:CompilerManager

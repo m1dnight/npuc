@@ -1,0 +1,16 @@
+# fourth pass: the input layer (inline in nn-eden-drv), shape propagation and the graph attribute reader
+sym:NNInputLayer
+sym:InputAttr
+sym:_ZN4NPUC9NNNetwork18computeLayersShape
+sym:_ZN4NPUC9NNNetwork13getInputShape
+sym:_ZN4NPUC9NNNetwork12topologySort
+sym:_ZN4NPUC7NNLayer13getInputShape
+sym:_ZN4NPUC7NNLayer14getOutputShape
+sym:_ZN4NPUC16NNGraphAttributeC
+sym:_ZN4NPUC7NNGraph15prepareRawNodes
+sym:_ZN4NPUC7NNGraph9construct
+sym:_ZN4NPUC11Compilation3run
+sym:_ZN4NPUC17SetupQuantization
+sym:_ZN4NPUC23NNGraphNodeKernelFiller9setKernel
+sym:_ZN4NPUC21NNGraphNodeBiasFiller7setBias
+sym:_ZN4NPUC26NNGraphNodeZeroPointFiller12setZeroPoint

@@ -1,0 +1,7 @@
+# where ConvAttr kernel/bias data enter the graph
+sym:addConvolutionGraphNode
+sym:NNGraphDataNodeC
+sym:NNGraphCgConvolutionParamC
+sym:NNGraph15prepareRawNodes
+sym:_ZN4NPUC7NNGraph13prepareNodes
+sym:NNGraphCgObject.*Conv

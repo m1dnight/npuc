@@ -1,0 +1,13 @@
+# third pass: the NNNetwork/NNLayer helpers inlined in nn-eden-drv, and the options/controller side
+sym:appendLayers
+sym:NNLayer13getInputShape
+sym:NNLayer11removeInput
+sym:createDummyInputLayer
+sym:getConvolutionLayer
+sym:NpucIrConverter
+sym:_ZN4NPUC14NPUCController
+sym:_ZN4NPUC11NPUCompiler
+sym:_ZN4NPUC14CompileOptions
+str:Chosen SoC type
+str:SOC_TYPE
+str:soc type

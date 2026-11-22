@@ -1,0 +1,9 @@
+# the output read-back's tile count between 2 and 3 tiles (stream.unflatten_tiles; per 2-tile node 270..330 KB)
+rb136   --in 136,64,16 --conv 128,1
+rb144   --in 144,64,16 --conv 128,1
+rb148   --in 148,64,16 --conv 128,1
+rb152   --in 152,64,16 --conv 128,1
+rb154   --in 154,64,16 --conv 128,1
+rb120w72 --in 120,72,16 --conv 128,1
+rb128w72 --in 128,72,16 --conv 128,1
+rb136w72 --in 136,72,16 --conv 128,1

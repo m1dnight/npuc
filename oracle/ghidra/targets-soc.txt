@@ -1,0 +1,6 @@
+# SoC type: the enum NPUC::SOCType and who reads CompileOptions' SoC field
+sym:DeviceFactory12createDevice
+str:Unsupported SOC type
+str:G2
+str:SRR
+sym:_ZN4NPUC11Compilation3run

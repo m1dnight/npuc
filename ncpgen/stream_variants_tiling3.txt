@@ -1,0 +1,37 @@
+# tiled strata from NPUC's policy (frame.md 6.10) and their trigger batches (cmdq.md 7b); compile with
+#   ncpgen/stream_sweep.sh ncpgen/stream_variants_tiling3.txt $NCPGEN_WORK/sweep/tiling3
+# tr-*: a tiled first group with a TRIM and 13..20 weight loads, one-layer strata vs chains (conv + pool, conv + 1x1)
+tr-s1        --in 48,160,16 --conv 256,5
+tr-s1p       --in 48,160,16 --conv 256,5 --pool max,2
+tr-s1a       --in 48,160,16 --conv 256,5 --pool avg,2
+tr-s1c       --in 48,160,16 --conv 256,5 --conv 16,1
+tr-s2        --in 112,96,24 --conv 256,7,2
+tr-s2p       --in 112,96,24 --conv 256,7,2 --pool max,2
+tr-c8        --in 48,160,8 --conv 256,5
+tr-c8p       --in 48,160,8 --conv 256,5 --pool max,2
+tr-2nd       --in 40,160,16 --conv 32,3 --conv 256,3
+tr-320       --in 48,160,16 --conv 320,5
+tr-320p      --in 48,160,16 --conv 320,5 --pool max,2
+tr-240       --in 48,160,16 --conv 240,5
+tr-240p      --in 48,160,16 --conv 240,5 --pool max,2
+tr-200       --in 48,160,16 --conv 200,5
+tr-200p      --in 48,160,16 --conv 200,5 --pool max,2
+# sr-*: short weight rings (4 slots or fewer) of stride-2 convs with sub-batches, around final-chains f043
+sr-f043      --in 96,24,24 --conv 96,1 --conv 128,3 --conv 128,5,2
+sr-k7        --in 96,24,24 --conv 96,1 --conv 128,3 --conv 128,7,2
+sr-k3        --in 96,24,24 --conv 96,1 --conv 128,3 --conv 128,3,2
+sr-2l        --in 96,24,24 --conv 128,3 --conv 128,5,2
+sr-1l        --in 96,24,128 --conv 128,5,2
+sr-1lc       --in 96,24,128 --conv 128,5,2 --conv 16,1
+sr-c96       --in 96,24,96 --conv 128,5,2
+sr-s7        --in 96,24,24 --conv 96,1 --conv 128,3 --conv 128,5,2 --seed 7
+# sx-*: what keeps the first ring round apart: rings over the DMA-loaded input read by reformats (VALID stride 2) or
+# by pads, over a conv output read by pads or by reformats, over the PAD read by reformats
+sx-v5        --in 96,24,128 --conv 128,5,2,valid
+sx-v7        --in 96,24,128 --conv 128,7,2,valid
+sx-c2        --in 21,21,64 --conv 512,1 --conv 512,3
+sx-c2r2      --in 23,23,64 --conv 512,1 --conv 512,3
+sx-c2v       --in 96,24,24 --conv 128,3 --conv 128,5,2,valid
+sx-512       --in 21,21,512 --conv 512,3
+sx-p100      --in 100,24,128 --conv 128,5,2
+sx-w28       --in 96,28,128 --conv 128,5,2
