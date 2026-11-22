@@ -38,6 +38,9 @@ The format (V: byte-exact on the sweep; docs/format/weights.md has the evidence)
   header (bitmap bytes << 9 | non-zero count), the bitmap (bit p, LSB first, set when the stored byte is not the
   zero) and the non-zero bytes in p order. Block = ncores x nloads x 2 x R x 64 bytes, core-major.
 """
+import collections
+import copy
+import hashlib
 import json
 import os
 import struct
@@ -319,16 +322,46 @@ def conv_groups(L, quant_mode=1, strict=True, planner=False):
     return geo, out
 
 
+_PACKED = collections.OrderedDict()     # conv_block's recent results by _pack_key (the packing is pure)
+
+
+def _pack_key(L, quant_mode, strict, planner):
+    """everything conv_block's result depends on (the weights by digest)"""
+    w = L["weights_oihw_u8"]
+    try:
+        wk = hashlib.sha256(bytes(w)).digest()
+    except (TypeError, ValueError):
+        wk = tuple(w)
+    return (L["cout"], L["in_chw"][0], tuple(L["k"]), tuple(L.get("stride", [1, 1])), L.get("_cpc"), L.get("_ncores"),
+            L.get("w_zp", 128), quant_mode, bool(strict), bool(planner), len(w), wk)
+
+
 def conv_block(L, quant_mode=1, strict=True, planner=False):
-    geo, groups = conv_groups(L, quant_mode, strict, planner)
-    R = _ceil(max(len(x) for core in groups for load in core for x in load), ROW)
-    blk = bytearray()
-    for core in groups:
-        for load in core:
-            for x in load:
-                blk += x + bytes(R * ROW - len(x))
-    geo["rows_per_batch"] = R
-    return geo, bytes(blk)
+    """-> (geometry, the conv's WEIGHT block): conv_groups' batches padded to R rows each, R = the largest. The
+    planner, the generator and the checks ask for the same convs many times: the result is memoised by content."""
+    key = _pack_key(L, quant_mode, strict, planner)
+    hit = _PACKED.get(key)
+    if hit is None:
+        try:
+            geo, groups = conv_groups(L, quant_mode, strict, planner)
+            R = _ceil(max(len(x) for core in groups for load in core for x in load), ROW)
+            blk = bytearray()
+            for core in groups:
+                for load in core:
+                    for x in load:
+                        blk += x + bytes(R * ROW - len(x))
+            geo["rows_per_batch"] = R
+            hit = (geo, bytes(blk), None)
+        except Exception as e:      # NPUC's aborts (ValueError) are as reproducible as the blocks
+            hit = (None, None, (type(e), e.args))
+        _PACKED[key] = hit
+        while len(_PACKED) > 64:
+            _PACKED.popitem(last=False)
+    else:
+        _PACKED.move_to_end(key)
+    if hit[2] is not None:
+        raise hit[2][0](*hit[2][1])
+    return copy.deepcopy(hit[0]), hit[1]
 
 
 def weight_blocks(low, strict=True):
