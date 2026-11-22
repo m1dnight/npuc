@@ -1,4 +1,4 @@
-# name | npuc-variant.py arguments | lowering options | sha256 of the NCP Samsung's NPUC 1.36.1.a compiled for it
+# name | npuc-variant.py arguments, or zoo:<model> (models/zoo.py) | lowering options | sha256 of the NCP Samsung's NPUC 1.36.1.a compiled for it
 # (our own seeded networks; ncpgen gen --grelu npuc must write the same bytes). Made by tests/make-golden.sh.
 f1-k1|--in 16,16,8 --conv 8,1||b43b51c4ec06af15b7b692ec32015ef35f797654aa3ca959e7d23e71db142671
 f1-k3|--in 16,16,8 --conv 8,3||b8dc7fb3a9d60ec00dd5390a71c3dabba1aa1af266a14fbafed02f7c83c4d5d8
@@ -109,3 +109,18 @@ final-f075|--in 48,24,3 --seed 824262 --conv 24,7,1,same,relu --conv 8,5,2,same,
 final-f076|--in 112,96,24 --seed 396853 --conv 256,7,2,same,relu --pool max,2 --conv 48,5,2,valid,relu --pool max,3,2||e2297f1f59fc0f927821e7509854f22433f00c35c339f2e52492755d0125a0c1
 final-f077|--in 17,96,64 --seed 76211 --conv 64,3,1,valid,relu --pool max,3,2||f1b331b6b5374ef70c068898dbb8c572a960b538824e9adbd6961f7d588fa45b
 final-f079|--in 24,32,24 --seed 319480 --conv 16,7,1,same,relu --conv 256,1,2,valid,none --oscale 0.0108537 --ozp 14 --conv 16,1,1,same,relu|--allow-none|e9f8681d40219c8ad01a3a0764849a659c358582490ea9a94c89c6b45940126d
+zoo-lenet5|zoo:lenet5|--allow-none|6f559d205543a0c36647d6e83213e40a9ba6a070cb8d2cdcd8e1d9f2a1931939
+zoo-keras-mnist-cnn|zoo:keras-mnist-cnn|--allow-none|04c1fcd4a8696f0bd668e2c6cbf25821555568e7fadc6a4c544433147249a09d
+zoo-mnist-mlp|zoo:mnist-mlp|--allow-none|6df4e736eb89ee536dd779f108181b70f7faa8687f0655b3e14561db1652feff
+zoo-tf-cifar-cnn|zoo:tf-cifar-cnn|--allow-none|bf2830264607ed1ab5bfa81769f253c9ed9fb7a70a6bf9590160f7b6b3e314c9
+zoo-vgg-cifar|zoo:vgg-cifar|--allow-none|86ea5e943b581e8801786498754ffe1c2b141f979c2600786e2eeb3560448583
+zoo-ad-autoencoder|zoo:ad-autoencoder|--allow-none|9a7e9f10c28c007b143abe281c6520f5ea0e23031c58e5ddf07e5862bacfb20d
+zoo-kws-cnn-npu|zoo:kws-cnn-npu|--allow-none|31cc2eb2b852c5cb24336fadcb72dfa000a6de3f79fdcd0032a81d310ccd9b93
+zoo-magic-wand-npu|zoo:magic-wand-npu|--allow-none|4ea01a0020cd1b2c36d8913fdab6989879c5eb9a7b632a168f5c7ac1bc0c28fa
+zoo-hello-world|zoo:hello-world|--allow-none|5f69e8bc53828a6a67a0e70642d91af8acd7356cb5290f5ca68d3204632c6210
+zoo-squeezenet11-96|zoo:squeezenet11-96||5a9694211af75a9c568de0f9e7a23e3e7130e50465cbae976b1c06af00512074
+zoo-alexnet-96-npu|zoo:alexnet-96-npu|--allow-none|dbb85cfb46a51958c5228e4ee1e1f297824cc1aff87bed08a287a9c6ad382f6c
+zoo-vgg11-64|zoo:vgg11-64|--allow-none|c912ada5d9a8ac97bbd724434afdae902a8677c222a3de356f5b4f0be2c2c80b
+zoo-yolov2-tiny-128|zoo:yolov2-tiny-128|--allow-none|43210e9516d32f0c743d14f95ffb34982b1bd07fc44faa3f04f1b38376da1826
+zoo-mobilenet-v1-025-dense|zoo:mobilenet-v1-025-dense|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0
+zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
