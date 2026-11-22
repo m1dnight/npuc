@@ -814,7 +814,8 @@ def plan_graph(low, weight_sizes=None):
             cons.setdefault(x, []).append(L["name"])
     out = low.get("npu_output") or layers[-1]["name"]
     order = exec_order(out, ins, cons, src)
-    gl = P.group_layers[:-1]                    # the layer of each group but the unflatten (frame.md 6.8, 6.9)
+    nu = len(P.group_layers) - len(list(itertools.takewhile(lambda x: x is not None, P.group_layers)))
+    gl = P.group_layers[:-nu]                   # the layer of each group but the unflatten's (frame.md 6.8, 6.9)
     inner = getattr(P, "graph_inner", set())    # a tiled stratum's layers after its head (6.11)
     if list(dict.fromkeys(gl)) != [n for n in order if by[n]["kind"] != "concat" and n not in inner]:
         raise ValueError("the stream's groups do not follow the layer order")
@@ -904,8 +905,22 @@ def plan_graph(low, weight_sizes=None):
             continue
         if what == "dram":
             c_, h_, w_ = chw[out]
-            un = _read_back(rows, g, cell(c_, h_, w_), c_, tvec(out), False)
-            k += 1
+            if nu == 1:
+                un = _read_back(rows, g, cell(c_, h_, w_), c_, tvec(out), False)
+                k += 1
+                continue
+            # a row tile of a tiled read-back (6.5, plan_tiled's): its rows per IDP from the output's IM
+            uc, uh, uw = P.out_chw
+            u0, u1 = _tile_ranges(uh, nu, 4)[g - (len(P.groups) - nu)]
+            got = []
+            _tile_dma(got, cell(uc, uh, uw), (u0, u1, 0, uw - 1), tvec(out), 0, True, g, ns0=True)
+            j = k + 1
+            while j < len(dmas) and dmas[j][2] == g and getattr(dmas[j][0], "what", None) == "dram":
+                j += 1
+            if len(got) != j - k:
+                raise NotImplementedError("a read-back tile's %d DMAs, %d in the stream" % (len(got), j - k))
+            rows += got
+            k = j
             continue
         if getattr(op, "tile", None) is not None:
             # a tile of a stratum NPUC tiles inside the graph (frame.md 6.11): its input region loaded from the DRAM
@@ -1006,13 +1021,22 @@ def plan_graph(low, weight_sizes=None):
         io.append([n_ + 1, getattr(op, "bid", 0) or 0, g, 0, flag, 2, 0, 1, 0] + sb + db)
     G = len(P.groups)
     ol = cell(Co, Ho, Wo)
-    groups = [{"index": g, "kind": "output" if g == G - 1 else ("dma" if any(x[2] == g for x in io) else "plain")}
+    groups = [{"index": g, "kind": "output" if g >= G - nu else ("dma" if any(x[2] == g for x in io) else "plain")}
               for g in range(G)]
-    return {"graph": True, "av": av, "mv": mv, "io": io, "groups": groups, "v_out": v_out,
+    outs = [{"n": un[0], "c": un[1], "C": Co, "H": Ho, "W": Wo, "Hi": Ho, "Wi": Wo, "Hp": ol["Hp"], "Wp": ol["Wp"],
+             "sram_off": 0, "group": G - 1}]
+    if nu > 1:
+        uc, uh, uw = P.out_chw
+        lu = cell(uc, uh, uw)
+        outs = []
+        for u, (u0, u1) in enumerate(_tile_ranges(uh, nu, 4)):
+            r_ = u1 - u0 + 1
+            outs.append({"n": lu["n"], "c": lu["cpi"], "C": Co, "H": r_, "W": Wo, "Hi": r_, "Wi": uw, "Hp": rup(r_, 4),
+                         "Wp": lu["Wp"], "sram_off": 0, "group": G - nu + u, "dst_off": u0 * Wo,
+                         "dst_cs": (Ho - r_) * Wo})
+    return {"graph": True, "keep_bids": True, "av": av, "mv": mv, "io": io, "groups": groups, "v_out": v_out,
             "v_w": [wvec[n] for n in wl], "wlayers": wl,
-            "chunks": [], "layers": [L["kind"] for L in layers],
-            "unflatten": {"n": un[0], "c": un[1], "C": Co, "H": Ho, "W": Wo, "Hi": Ho, "Wi": Wo, "Hp": ol["Hp"],
-                          "Wp": ol["Wp"], "sram_off": 0, "group": G - 1}}
+            "chunks": [], "layers": [L["kind"] for L in layers], "unflatten": outs[0], "outputs": outs}
 
 
 # ---- tiled plans (NPUC's stratum tiling) ------------------------------------------------------------------------------
@@ -1710,7 +1734,9 @@ def forwarding(low, pol=None):
     the predecessor is the head (input sharing, full forwarding), the output not counted when a concat reads it
     (concat in SRAM, full forwarding); less than one byte left: "is too fat", no test. A node passes when it stays
     whole. Each test sets the node's weight lifetime (_pol_whole), so the last test wins (V: large random t1004,
-    t1013: the branch convs' weights live on their conv only). Returns {node: extended} for the nodes tested."""
+    t1013: the branch convs' weights live on their conv only). A block succeeds in a mode when every input of its
+    concat passed (or is the head: tryProcessLayerBlockEnd). Returns {"life": {node: extended} for the nodes tested,
+    "ok": {mode: {head: succeeded}}, "nbuf": {mode: {node: weight buffers it passed with}}, "heads": {head: concat}}."""
     ins, cons, by, src = topology(low)
     pol = pol or graph_policy(low)
     nds, shp = pol["nodes"], pol["shapes"]
@@ -1746,11 +1772,14 @@ def forwarding(low, pol=None):
                 t = ins[t][0]
         if all(x in branch or x == kn for x in cons.get(r, [])):
             heads[r] = kn
-    life = {}
+    life, res, nbuf = {}, {}, {}
     for mode in ("is", "cs", "ff"):
         cur, mem0, ok = None, 0, set()
+        res[mode], nbuf[mode] = {}, {}
         for n in [src] + order:
             if n != src and by[n]["kind"] == "concat" and cur is not None:
+                if heads.get(cur) == n:
+                    res[mode][cur] = all(i in ok for i in ins[n])
                 cur = None
             if n in heads:
                 kn = heads[n]
@@ -1774,7 +1803,8 @@ def forwarding(low, pol=None):
             life[n] = r["extended"]
             if r["whole"]:
                 ok.add(n)
-    return life
+                nbuf[mode][n] = r["nbuf"]
+    return {"life": life, "ok": res, "nbuf": nbuf, "heads": heads}
 
 
 def node_whole(nd, limit):

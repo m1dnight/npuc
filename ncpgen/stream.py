@@ -1426,21 +1426,24 @@ class Plan:
                     t = ins[t][0]
             return out_
 
-        def bulb_fits(kn, mem):
-            # NPUC's layer-block forwarding (LayerBlockFMSharingCalculator::tryProcessInternalNode): no node of the
-            # block tiled, and each kept whole with the SRAM the block holds (mem: the head's output for input
-            # sharing, the concat for concat in SRAM) left over (frame.node_whole)
+        fwd = frame.forwarding(low, pol)
+
+        def bulb_fits(kn, mode):
+            # NPUC's layer-block forwarding (frame.forwarding: LayerBlockFMSharingCalculator, mode "is" input
+            # sharing, "cs" concat in SRAM): no node of the block tiled, each kept whole with the SRAM the block holds
+            # left over (V: t1038, its 96-channel branch conv counted without the shared input or the concat)
             nodes = bulb_nodes(kn)
             if any(x in tst for x in nodes):
                 return False
-            for x in nodes:
-                if x in pol["nodes"] and not frame.node_whole(pol["nodes"][x], SRAM_LIMIT - mem):
-                    raise Unsupported("a layer-block NPUC's forwarding may refuse on memory (%s): not modelled" % x)
-            return True
+            heads = [h for h, k in fwd["heads"].items() if k == kn]
+            ok = bool(heads) and fwd["ok"][mode].get(heads[0], False)
+            if ok and any(fwd["nbuf"][mode].get(x) for x in nodes):
+                raise Unsupported("a layer-block whose node only fits with a weight ring: not modelled")
+            return ok
         for kn in scats:
-            bulb_fits(kn, frame._pol_blk(*pol["shapes"][kn]["out"]))
-        shared = any(all(bulb_root(i) == src for i in ins[kn]) and bulb_fits(kn, frame._pol_blk(c0, h0, w0))
-                     for kn in cats)
+            if not bulb_fits(kn, "cs"):
+                raise Unsupported("a concat in SRAM NPUC's forwarding refuses (%s): not modelled" % kn)
+        shared = any(all(bulb_root(i) == src for i in ins[kn]) and bulb_fits(kn, "is") for kn in cats)
         # a concat whose branches all start at one computed tensor ("Input sharing" from a layer): when that layer
         # is a single node (a pool, a ReLU, a conv without pad or stride), NPUC stores it to DRAM, its first reader
         # loads it back and the other branches share it in SRAM (V: g005, g008, g009, g030, g047); after a padded
@@ -1450,8 +1453,10 @@ class Plan:
             rs = {bulb_root(i) for i in ins[kn]}
             r = min(rs)
             if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r]:
-                if r in tst or any(x in tst for x in bulb_nodes(kn)):
-                    raise Unsupported("tiling in a graph: a concat's branches from a computed tensor, tiled")
+                if r in tst:
+                    raise Unsupported("tiling in a graph: a concat's branches from a tiled stratum's output")
+                if any(x in tst for x in bulb_nodes(kn)):
+                    continue                # a tiled branch: no input sharing (6.11), the root an ordinary tensor
                 roots |= rs
         for r in roots:
             stored.setdefault(r, ("im", r))
@@ -1474,7 +1479,7 @@ class Plan:
                 # conv and an eltwise); heading a concat's branches, one first citizen from the vConcat to the last
                 # reader, loaded by the first and shared (input sharing; V: large random t1016)
                 if not any(all(bulb_root(i) == t for i in ins[kn]) and
-                           bulb_fits(kn, frame._pol_blk(*pol["shapes"][t]["out"])) for kn in cats):
+                           bulb_fits(kn, "is") for kn in cats):
                     for j, r in enumerate(rs):
                         rch[t, r] = chunk("WCONCAT", size, [head[r], head[r]], (2, oidx[tst[t]["layers"][0]], 2, j))
                 else:
@@ -1603,7 +1608,7 @@ class Plan:
                 full[n] = True
             tens[n] = d["out"]
             info[n] = d
-        life = frame.forwarding(low, pol)
+        life = fwd["life"]
         for n, d in info.items():
             if "weight" in d:
                 # the WEIGHT chunk as NPUC's planner sizes it: its own pack of the kernel (planning rows; for a conv
@@ -1678,12 +1683,21 @@ class Plan:
                 d["in"], d["full"] = ck, True
             else:
                 raise Unsupported("trim and spill: a spilled tensor read as a second input (not modelled)")
+        # a trimmed tensor: every reader reads the copy, made by its own group right after the producer's (V: t1038,
+        # a copy of an eltwise output before its two readers; chains: frame.md 6.7)
+        copies = {}
         for X, T in ts.get("trims", []):
-            r = T.layer
-            if r not in info or "in" not in info[r] or info[r]["in"] is not X:
-                raise Unsupported("trim and spill: a copy of a chunk its node does not read (not modelled)")
-            info[r]["copy"] = {"src": X.off, "dst": T.off, "size": X.size}
-            info[r]["in"] = T
+            t = X.tensor
+            for r in cons.get(t, []):
+                d = info[r]
+                if by[r]["kind"] == "eltwise":
+                    d["ins"] = [T if i == t else c for i, c in zip(ins[r], d["ins"])]
+                elif d.get("in") is X:
+                    d["in"] = T
+                else:
+                    raise Unsupported("trim and spill: a copy of a chunk its reader does not read (not modelled)")
+            r0 = next(x for x in [L["name"] for L in order] if x in cons[t])
+            copies[t] = dict(info[r0], copy={"src": X.off, "dst": T.off, "size": X.size})
         self.spilled = spilled
         for tg in tgeo.values():            # the strata's chunk offsets, as frame.plan_tiled lists them
             tg["chunks"] = [{"kind": kind, "layer": li, "off": ck.off, "size": ck.size} for kind, li, ck in tg["req"]]
@@ -1760,9 +1774,6 @@ class Plan:
                 even = dl.planes - (dl.cores - 1) * dl.ppc == dl.ppc
                 d["parts"] = 1 if even or load_kind(L, d) == "core" else 2
             last = n in stored
-            if "copy" in d:                 # a trim-and-spill copy of the input: its own group first (frame.md 6.12)
-                self.groups.append(self.copy_group(d))
-                self.group_layers.append(n)
             ev0 = self.ev
             if k in ("conv", "pool"):
                 self.info.append(d)
@@ -1777,18 +1788,27 @@ class Plan:
                 elif op.kind == "store":
                     op.tensor = stored[n][1]
             self.groups += self.cut(ops, ev0) if k != "eltwise" else [ops]
+            if n in copies:                 # a trim-and-spill copy of its output (frame.md 6.12)
+                self.groups.append(self.copy_group(copies[n]))
             self.group_layers += [n] * (len(self.groups) - len(self.group_layers))
         if by[out]["kind"] == "concat":
             o = {"dout": Dist(chs[out]), "ho": hw[out][0], "wo": hw[out][1]}
         else:
             o = info[out]
         nu = unflatten_tiles(o, o["ho"], o["wo"])
-        if nu > 1:
-            raise Unsupported("tiling in a graph (the unflatten of %d x %d)" % (o["ho"], o["wo"]))
         self.out_chw = (o["dout"].c, o["ho"], o["wo"])
-        self.groups.append([Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out),
-                            Op("nopop", deps=[0]), Op("unflatten")])
-        self.group_layers.append(None)
+        if nu == 1:
+            self.groups.append([Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out),
+                                Op("nopop", deps=[0]), Op("unflatten")])
+            self.group_layers.append(None)
+        # a tiled read-back, as a chain's (frame.md 6.5: row tiles by NPUC's policy, each its own output group,
+        # loaded per core with several planes per core; V: large random t1039)
+        for u in range(nu if nu > 1 else 0):
+            nl = o["dout"].cores if o["dout"].ppc > 1 else 1
+            ops = [Op("load", what="dram", flag=self.event(), utile=u, core=k if nl > 1 else None, tensor=out)
+                   for k in range(nl)]
+            self.groups.append(ops + [Op("nopop", deps=list(range(nl))), Op("unflatten")])
+            self.group_layers.append(None)
 
     def relu_group(self, L, d, first, last):
         """a standalone ReLU: NPUC's 1x1 dummy conv, one pass per pair of plane slots (V: res, relu-c4..c64)"""

@@ -479,10 +479,20 @@ forwarding); under one byte: "too fat", no call. The last call's lifetime stands
 weights fit so, or a ring of 5+ buffers does): t1004's three branch convs of 112 x 112 keep their weights on their
 conv only (WEIGHT live [conv, conv]), which the trim and spill of 6.12 then depends on.
 
-**Not yet**: a CMDQ cut in a tiled plan's single block and a chain's spill (mobilenet-v1-100-224), a tiled read-back
-in a graph, strata joined to each other, a tiled layer whose input heads a concat's branches; the io batch id of a
-clustered load's last part (t1016: NPUC keeps all 16 loads in one batch). Rate on the large random graphs: 36 of 40
-(31 before the trim and spill of 6.12 and the forwarding lifetimes; 22 before the clustered loads, the shared WCONCAT
+**Also modelled** (V: large random t1016, t1018, t1038, t1039):
+- a layer-block's forwarding decided by `frame.forwarding` (the tests above with their prealloc flags; t1038's
+  96-channel branch conv fits once the shared input or the concat is not counted: concat in SRAM), so the old refusal
+  "may refuse on memory" is gone; a block whose node would pass only with a weight ring is still refused;
+- a concat whose branches start at a single-node layer but one of whose branch layers is tiled: no input sharing (the
+  tiled node is not tested, the block fails), the root an ordinary tensor kept in SRAM for its untiled readers and
+  stored for the tiled ones (t1018);
+- a tiled read-back in a graph: the chain's row tiles of 6.5, one output group each (t1039: 160 x 160);
+- the io batch ids of a graph: the stream part's (NPUC's SetBatchTransferInGroup, cmdq.md 7b), not re-derived from the
+  ev2set masks (t1016: a clustered load's 16 parts in one batch, which the masks cannot tell).
+
+**Not yet**: a CMDQ cut in a tiled plan's single block and a chain's spill (mobilenet-v1-100-224), strata joined to each
+other, a tiled stratum's output heading a concat's branches. Rate on the large random graphs: 40 of 40 (31 before the
+trim and spill of 6.12, the forwarding model and the items above; 22 before the clustered loads, the shared WCONCAT
 and the chain rule).
 
 ### 6.12 Trim and spill (`stream.allocate(ts=...)`, `_trim_spill`; V: decompiled GlobalMemoryAllocator, `oracle/ghidra/targets-spill*.txt`; mobilenet-v2-100-224, resnet18-96, resnet18-224, large random t1004, t1013, t1021, t1033, t1036)
