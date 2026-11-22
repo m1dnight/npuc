@@ -124,5 +124,7 @@ zoo-alexnet-96-npu|zoo:alexnet-96-npu|--allow-none|dbb85cfb46a51958c5228e4ee1e1f
 zoo-vgg11-64|zoo:vgg11-64|--allow-none|c912ada5d9a8ac97bbd724434afdae902a8677c222a3de356f5b4f0be2c2c80b
 zoo-yolov2-tiny-128|zoo:yolov2-tiny-128|--allow-none|43210e9516d32f0c743d14f95ffb34982b1bd07fc44faa3f04f1b38376da1826
 zoo-mobilenet-v1-025-dense|zoo:mobilenet-v1-025-dense|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0
+zoo-mobilenet-v2-035-dense|zoo:mobilenet-v2-035-dense|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590
 zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
 zoo-mobilenet-v1-025|zoo:mobilenet-v1-025|--allow-none|3d12f8af72a2c9c270bb897e193ef33741bc0bc022d7bd7f41e6f3b45452bbb0
+zoo-mobilenet-v2-035|zoo:mobilenet-v2-035|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590

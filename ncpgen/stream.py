@@ -782,7 +782,8 @@ class Plan:
                 newl = {}
                 for j in range(0, len(sl), part):
                     lo = Op("load", what="ifm", flag=0, sram=base + sl[j] * (hw or 0) * 64,
-                            slots=(sl[j], sl[min(j + part, len(sl)) - 1] + 1))
+                            slots=(sl[j], sl[min(j + part, len(sl)) - 1] + 1),
+                            **{k: getattr(ops[ifm[0]], k) for k in ("tensor",) if hasattr(ops[ifm[0]], k)})
                     ops.append(lo)
                     for x in sl[j:j + part]:
                         newl[x] = len(ops) - 1
@@ -810,7 +811,7 @@ class Plan:
                 cnt = [min(2 * (p1 - p0), max(0, min(dout.ppc, dout.planes - k * dout.ppc) - 2 * p0))
                        for k in range(dout.cores)]
                 new.append(Op("store", flags=[0] * len(set(cnt) - {0}), sram=st[0].sram + 2 * p0 * oc * 64, cnt=cnt,
-                              **{k: getattr(st[0], k) for k in ("tensor",) if hasattr(st[0], k)}))
+                              passes=(p0, p1), **{k: getattr(st[0], k) for k in ("tensor",) if hasattr(st[0], k)}))
             out.append(new)
         self.ev = ev0                       # the events again, in the new order
         for new in out:
@@ -899,9 +900,10 @@ class Plan:
             # pass by pass stores: the last conv with a weight ring, Cout not a multiple of 16, no sub-batches
             # stores each pass's two plane slots after its conv (frame.md 6.7; V: rc-167-488..510, rc-200-500)
             pbp = last and d["ring"] < d["passes"] and dout.c % 16 and d["nsub"] == 1
-            # not in a layer NPUC cuts for its CMDQ size: that one stores chunk by chunk (V: k1c1000-h1)
+            # not in a layer NPUC cuts for its CMDQ size: that one stores chunk by chunk (V: k1c1000-h1); not in a
+            # graph: one store after the last pass (V: graph-split ring-pbp-16, 16 of 32 passes, 500 channels)
             est = 16350 + 1020 * d["passes"] + din.ppc * (60 * d["haspad"] + 102 * (d["s2d"] == 2))
-            pbp = pbp and est <= self.CMDQ_LIMIT
+            pbp = pbp and est <= self.CMDQ_LIMIT and not is_graph(self.low)
             # a kernel over 4 MiB in all is loaded core by core, 4 DMAs a pass (V: k3c64-ci512, s2c64; one up to
             # 2.6 MB: u512-ci512)
             npc = 4 if 2 * d["wunits"] * 64 * d["passes"] * 4 > 4 << 20 else 1
@@ -960,11 +962,13 @@ class Plan:
     # ---- graphs: eltwise add, concat, standalone ReLU (npuc-net 2) ---------------------------------------------------
     def graph(self):
         """a network with graph ops, untiled (dossier cmdq.md 7c). NPUC runs the layers in its own order (exec_order),
-        one group per layer (none for a concat), and keeps every tensor in SRAM until its last reader, except where it
-        goes through DRAM: the network output, the inputs of an eltwise that reads the network input (that eltwise
-        loads both operands back), the inputs of a concat (each producer stores into the concat's buffer; its reader
-        loads it). The network input is loaded by its first reader, and again by a later reader unless the layer run
-        just before also read it or a concat shares it (one INPUT chunk then)."""
+        one group per layer (none for a concat; several for a layer NPUC cuts for its CMDQ size: self.group_layers
+        names each group's layer, None for the unflatten), and keeps every tensor in SRAM until its last reader, except
+        where it goes through DRAM: the network output, the inputs of an eltwise that reads the network input (that
+        eltwise loads both operands back), the inputs of a concat (each producer stores into the concat's buffer; its
+        reader loads it). The network input is loaded by its first reader, and again by a later reader unless the layer
+        run just before also read it or a concat shares it (one INPUT chunk then)."""
+        self.group_layers = []
         low = self.low
         layers = low["layers"]
         src = low["input"]["name"]
@@ -1176,7 +1180,8 @@ class Plan:
                 R = {"kind": "conv", "name": n, "cout": c, "in_chw": [c, 1, 1], "k": [1, 1], "stride": [1, 1],
                      "w_zp": 128, "weights_oihw_u8": [128] * (c * c)}
                 d["passes"] = cdiv(d["dout"].ppc, 2)
-                d["wunits"], d["nsub"], d["cpb"] = weight_rows(R, self.q)
+                _, d["nsub"], d["cpb"] = weight_rows(R, self.q)
+                d["wunits"] = weights.relu_rows(L, by, self.q)      # its block's rows: the identity's, or R's
                 d["out"] = chunk("CONV", cdiv(cdiv(cout, 16) * 16, 8) * cells(ho, wo) * 64, [at, end_of(n)], bt)
                 d["weight"] = chunk("WEIGHT", 0, [at, at], bt)
                 d["ps"] = None
@@ -1188,8 +1193,8 @@ class Plan:
                                     chunk("SHIFT_OUTPUT2", 32, [at, at + 1], bt),
                                     chunk("CU_BIN", 128, [at, at + 1], bt)]
                 d["out"] = chunk("ELTWISE", d["dout"].ppc * cells(ho, wo) * 64, [at, end_of(n)], bt)
-                # META_DATA: 64 B past 4 planes per core (the eltwise in two halves?), else 32 (V: res40, res64)
-                d["meta"] = chunk("META_DATA", 64 if d["din"].ppc > 4 else 32, [at, at + 1], bt)
+                # META_DATA: one core's region of the block (32 B up to 32 channels, 64 to 64, 192 for 256...)
+                d["meta"] = chunk("META_DATA", weights.eltwise_meta_size(c), [at, at + 1], bt)
                 d["ins"] = [rch[i, n] if (i, n) in rch else tens[i] for i in ins[n]]
                 full[n] = True
             else:
@@ -1211,6 +1216,11 @@ class Plan:
                 pr = d.get("prows", d["wunits"])
                 d["ring"] = weight_ring(dict(d, wunits=pr))
                 d["weight"].size = d["ring"] * 2 * pr * 64
+                if d["ring"] < d["passes"] and by[n]["kind"] == "conv" and d["dout"].c % 16:
+                    # a ring's slot from the bytes per output channel, as in a chain (frame.md 6.6, frame._ring_chunk;
+                    # V: mobilenet-v2-035-dense's 1280 -> 1000 FC, 32 of 63 passes)
+                    e = 16 * cdiv(d["passes"] * 2 * pr * 64, d["dout"].c)
+                    d["weight"].size, d["wstep"] = d["ring"] * e, cdiv(e, 64) * 64
                 if d["ring"] < d["passes"] and d["ring"] <= 4:      # a short ring lives on its conv only
                     d["weight"].live = [d["out"].live[0], d["out"].live[0]]
                 if by[n]["kind"] == "relu" and not d["whole"]:  # NPUC sizes the per-pass dummy conv's chunk as 4
@@ -1288,6 +1298,7 @@ class Plan:
                 elif op.kind == "store":
                     op.tensor = stored[n][1]
             self.groups += self.cut(ops, ev0) if k != "eltwise" else [ops]
+            self.group_layers += [n] * (len(self.groups) - len(self.group_layers))
         if by[out]["kind"] == "concat":
             o = {"dout": Dist(chs[out]), "ho": hw[out][0], "wo": hw[out][1]}
         else:
@@ -1298,6 +1309,7 @@ class Plan:
         self.out_chw = (o["dout"].c, o["ho"], o["wo"])
         self.groups.append([Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out),
                             Op("nopop", deps=[0]), Op("unflatten")])
+        self.group_layers.append(None)
 
     def relu_group(self, L, d, first, last):
         """a standalone ReLU: NPUC's 1x1 dummy conv, one pass per pair of plane slots (V: res, relu-c4..c64)"""

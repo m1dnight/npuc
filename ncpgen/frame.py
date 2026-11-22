@@ -654,10 +654,10 @@ def _cmdq_estimate(L, shp):
     return 0
 
 
-def _range_store(dmas, g, lay, sram_off, v_dst, p0, p1):
+def _range_store(dmas, g, lay, sram_off, v_dst, p0, p1, base=0):
     """the store of passes p0 .. p1 of a conv output (planes 2 p0 .. 2 p1 of each IDP; V: k1c64-ci64, k3c64-ci512):
     the IDPs holding as many as IDP 0 in one blob (h = planes x Hp rows of 2Wp), an IDP holding fewer on its own
-    through its SRAM vector, 64 B wide"""
+    through its SRAM vector, 64 B wide. base: the tensor's offset in the DRAM vector (a graph's concat buffer)"""
     k = [max(0, min(2 * (p1 - p0), cdiv(min(lay["cpi"], lay["C"] - i * lay["cpi"]), 2) - 2 * p0))
          for i in range(lay["n"])]
     full = 0
@@ -668,12 +668,12 @@ def _range_store(dmas, g, lay, sram_off, v_dst, p0, p1):
     if k[0]:
         h, w = k[0] * lay["Hp"], 2 * lay["Wp"]
         out.append((g, 1, _blob(0, sram_off + off, 1, full, h, w, cs=IDP_STRIDE - h * w if full > 1 else 0),
-                    _blob(v_dst, off, 1, full, h, w, cs=lay["per_idp"] - h * w if full > 1 else 0)))
+                    _blob(v_dst, base + off, 1, full, h, w, cs=lay["per_idp"] - h * w if full > 1 else 0)))
     for i in range(full, lay["n"]):
         if k[i]:
             sz = k[i] * lay["plane"]
             out.append((g, 1, _blob(i, sram_off + off, 1, 1, sz // 64, 64),
-                        _blob(v_dst, i * lay["per_idp"] + off, 1, 1, sz // 64, 64)))
+                        _blob(v_dst, base + i * lay["per_idp"] + off, 1, 1, sz // 64, 64)))
     return out
 
 
@@ -784,11 +784,12 @@ def _cut_plan(low, layers, shapes, placed, ops, dmas, wsize, v_in, v_im, v_w, av
 # ---- graph networks (eltwise, concat, standalone ReLU; docs/format/cmdq.md 7c) -------------------------------
 def plan_graph(low, weight_sizes=None):
     """the container of a graph network (docs/format/cmdq.md 7c; frame.md 6.8): the groups and DMAs are the
-    stream part's (stream.Plan: NPUC's layer order, one group per layer but concats, the unflatten last; each DMA op
-    with its tensor and SRAM offset); this builds their descriptors and the vectors: IN, OT, an IM per tensor stored
-    to DRAM (in the order of their first store), one more IM per concat, a WEIGHT per conv and ReLU layer and a
-    META_DATA per eltwise in execution order, IM 8x8x2. weight_sizes: the sizes of the WEIGHT blocks in that vector
-    order (weights.py's weight_blocks, META_DATA included: weights.eltwise_block)."""
+    stream part's (stream.Plan: NPUC's layer order, one group per layer but concats, several for a layer NPUC cuts
+    for its CMDQ size, the unflatten last; each DMA op with its tensor and SRAM offset); this builds their descriptors
+    and the vectors: IN, OT, an IM per tensor stored to DRAM (in the order of their first store), one more IM per
+    concat, a WEIGHT per conv and ReLU layer and a META_DATA per eltwise in execution order, IM 8x8x2. weight_sizes:
+    the sizes of the WEIGHT blocks in that vector order (weights.py's weight_blocks, META_DATA included:
+    weights.eltwise_block)."""
     layers = low["layers"]
     by = {L["name"]: L for L in layers}
     src = low["input"]["name"]
@@ -802,10 +803,10 @@ def plan_graph(low, weight_sizes=None):
             cons.setdefault(x, []).append(L["name"])
     out = low.get("npu_output") or layers[-1]["name"]
     order = stream.exec_order(out, ins, cons, src)
-    gl = [n for n in order if by[n]["kind"] != "concat"]          # the layer of each group (the unflatten last)
-    if len(gl) + 1 != len(P.groups):
-        raise ValueError("%d layer groups, %d stream groups" % (len(gl) + 1, len(P.groups)))
-    wl = [n for n in gl if by[n]["kind"] in ("conv", "relu", "eltwise")]     # the WEIGHT vectors, in order
+    gl = P.group_layers[:-1]                    # the layer of each group but the unflatten (frame.md 6.8, 6.9)
+    if list(dict.fromkeys(gl)) != [n for n in order if by[n]["kind"] != "concat"]:
+        raise ValueError("the stream's groups do not follow the layer order")
+    wl = [n for n in order if by[n]["kind"] in ("conv", "relu", "eltwise")]     # the WEIGHT vectors, in order
     if weight_sizes is None:
         weight_sizes = _weight_sizes(low)
     if len(weight_sizes) != len(wl):
@@ -865,15 +866,18 @@ def plan_graph(low, weight_sizes=None):
         op, i, g = dmas[k]
         what = op.what if op.kind == "load" else "store"
         if what == "weight":
-            L = by[op.layer]
             nin = cell(*chw[ins[op.layer][0]])["n"]
             per = wsz[op.layer] // nin
             nl = cdiv(chw[op.layer][0], 16)
             part = per // nl
-            idps, h, w, cs = _sram_dma(nin, part // 64, 64)
-            rows.append((g, 0, _blob(wvec[op.layer], op.p * part, 1, idps, h, w,
-                                     cs=(per - part) if nl > 1 and nin > 1 else 0),
-                         _blob(0, op.sram, 1, idps, h, w, cs=cs)))
+            if getattr(op, "core", None) is not None:       # a kernel over 4 MiB: core by core (section 6.9)
+                rows.append((g, 0, _blob(wvec[op.layer], op.core * per + op.p * part, 1, 1, part // 64, 64),
+                             _blob(op.core, op.sram, 1, 1, part // 64, 64)))
+            else:
+                idps, h, w, cs = _sram_dma(nin, part // 64, 64)
+                rows.append((g, 0, _blob(wvec[op.layer], op.p * part, 1, idps, h, w,
+                                         cs=(per - part) if nl > 1 and nin > 1 else 0),
+                             _blob(0, op.sram, 1, idps, h, w, cs=cs)))
             k += 1
             continue
         if what == "eltwise_meta":
@@ -925,11 +929,31 @@ def plan_graph(low, weight_sizes=None):
             prod = gl[g]
             lay = cell(*chw[prod])
             base = coff(prod, t) if by.get(t, {}).get("kind") == "concat" and t != prod else 0
-            parts = _spread_dmas(lay, True, by[prod]["kind"] == "pool")
-            for q, (op_, i_, _) in enumerate(run):
-                vec_, idps, h, w, cs, doff = parts[min(q, len(parts) - 1)]
-                sram = op_.srams[i_] if hasattr(op_, "srams") else op_.sram
-                rows.append((g, 1, _blob(vec_, sram, 1, idps, h, w, cs=cs), _blob(vim[t], base + doff, 1, idps, h, w)))
+            if hasattr(op, "passes"):
+                # the planes of the passes of a chunk of a layer NPUC cuts, as in a chain (section 6.9)
+                p0, p1 = op.passes
+                got = _range_store([], g, lay, op.sram - 2 * p0 * lay["plane"], vim[t], p0, p1, base)
+                if len(got) != len(run):
+                    raise NotImplementedError("a store of passes %d..%d in %d DMAs, %d in the stream"
+                                              % (p0, p1, len(got), len(run)))
+                rows += got
+            else:
+                parts = _spread_dmas(lay, True, by[prod]["kind"] == "pool")
+                for q, (op_, i_, _) in enumerate(run):
+                    vec_, idps, h, w, cs, doff = parts[min(q, len(parts) - 1)]
+                    sram = op_.srams[i_] if hasattr(op_, "srams") else op_.sram
+                    rows.append((g, 1, _blob(vec_, sram, 1, idps, h, w, cs=cs),
+                                 _blob(vim[t], base + doff, 1, idps, h, w)))
+        elif hasattr(op, "slots"):
+            # an input read slot by slot (its first op an NFU one, 16 plane slots per core or more; or a cut layer's
+            # chunks): each load its slots of every IDP, as in a chain (section 6.9)
+            lay = cell(*chw[t])
+            for op_, _, _ in run:
+                s0, s1 = op_.slots
+                sz = (s1 - s0) * lay["plane"]
+                idps, h, w, cs = _sram_dma(lay["n"], sz // (2 * lay["Wp"]), 2 * lay["Wp"])
+                rows.append((g, 0, _blob(tvec(t), s0 * lay["plane"], 1, idps, h, w, cs=lay["per_idp"] - sz),
+                             _blob(0, op_.sram, 1, idps, h, w, cs=cs)))
         else:
             lay = cell(*chw[t])
             parts = _spread_dmas(lay, len(run) > 1)

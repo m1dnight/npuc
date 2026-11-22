@@ -4,8 +4,10 @@ layers (ncpgen/npunet.py lowers them, npuc-net 2; docs/harness-ops.md), compiled
 harness run directory that supports them. Our own seeded weights; quant 3, zero points 0, power-of-two scales (what
 NPUC's Eltwise needs).
 
-  stream_graphs.py write <dir>       <dir>/<name>.json for every variant
-  stream_graphs.py compile <dir> [name...]   write, then npuc-local.sh each into <dir>/<name>/ (NPU_ROOT below)
+  stream_graphs.py write <dir> [--set split]      <dir>/<name>.json for every variant
+  stream_graphs.py compile <dir> [name...] [--set split]   write, then npuc-local.sh each into <dir>/<name>/ (NPU_ROOT
+                                                           below)
+  --set split: graphs with layers NPUC splits over several groups (its CMDQ cut, cmdq.md 7d) or tiles
 """
 import argparse
 import json
@@ -246,6 +248,112 @@ def variants():
     return V
 
 
+def split_variants():
+    """{name: Net}: graphs with layers NPUC splits over several groups: its CMDQ cut (cmdq.md 7d; a conv or ReLU of 45
+    passes or more, or fewer behind a pad or reformat of many plane slots) in each place a graph puts a layer (in
+    SRAM, the output, an eltwise operand stored to DRAM, a producer of a concat's DRAM buffer, a reader of the network
+    input through a pad or a reformat), a kernel over 4 MiB, and residual and concat blocks at 96..160 px whose
+    feature maps pass the SRAM (NPUC tiles them)"""
+    V = {}
+
+    def mk(name, h, w, c, seed):
+        n = Net(name, h, w, c, seed)
+        V[name] = n
+        return n
+
+    def res(n, t, c, tag=""):
+        return n.add("a" + tag, n.conv("cb" + tag, n.conv("ca" + tag, t, c), c, act="none", out=1 / 256), t,
+                     act="relu", out=1 / 128)
+
+    # MobileNet v2's tail: a residual block, a 1x1 conv NPUC cuts, an average pool, the classifier it cuts too
+    n = mk("cut-tail", 4, 4, 32, 101)
+    n.conv("fc", n.pool("p1", n.conv("c3", res(n, "image", 32), 768, k=1), kind="avg", k=4, s=4), 1000, k=1,
+           act="none")
+    n = mk("cut-out", 4, 4, 32, 102)                 # the cut layer is the output
+    n.conv("c3", res(n, "image", 32), 1000, k=1, act="none")
+    n = mk("cut-mid", 4, 4, 32, 103)                 # in SRAM between two layers
+    n.conv("c4", n.conv("c3", res(n, "image", 32), 736, k=1), 32, k=1, act="none")
+    n = mk("cut-mid-s2", 8, 8, 16, 104)              # a pad and a reformat on its own output, cut too
+    t = n.conv("c3", res(n, "image", 16), 720, k=1)
+    n.conv("c5", n.conv("c4", t, 64, k=3, stride=2), 64, k=1, act="none")
+    n = mk("cut-elt", 4, 4, 720, 105)                # an eltwise operand: stored chunk by chunk to DRAM
+    n.add("a1", n.conv("c1", "image", 720, k=1, act="none", out=1 / 256), "image", act="relu")
+    n = mk("cut-cat", 4, 4, 32, 106)                 # a producer of a concat in DRAM, after the other input
+    n.conv("c3", n.concat("k1", [n.conv("c1", "image", 8, k=1), n.conv("c2", "image", 720, k=1)]), 32, k=1)
+    n = mk("cut-cat-first", 4, 4, 32, 107)           # ... before it
+    n.conv("c3", n.concat("k1", [n.conv("c2", "image", 720, k=1), n.conv("c1", "image", 8, k=1)]), 32, k=1)
+    n = mk("cut-cat-out", 4, 4, 32, 108)             # a concat as the output
+    n.concat("k1", [n.conv("c1", "image", 24, k=1), n.conv("c2", "image", 752, k=1)])
+    n = mk("cut-in-pad", 4, 4, 256, 109)             # reads the network input through a pad: slot loads per chunk
+    n.add("a1", n.conv("c2", n.conv("c1", "image", 720, k=3), 256, k=1, act="none", out=1 / 256), "image")
+    n = mk("cut-in-s2", 8, 8, 256, 110)              # ... through a pad and a reformat
+    t = n.conv("c1", "image", 704, k=3, stride=2)
+    n.add("a1", n.conv("c2", t, 64, k=1, out=1 / 128), n.conv("c3", t, 64, k=3, out=1 / 128))
+    n = mk("cut-relu", 4, 4, 32, 111)                # a standalone ReLU NPUC cuts
+    n.relu("r1", n.pool("p1", n.conv("c1", res(n, "image", 32), 768, k=1, act="none")))
+    n = mk("in128-res", 8, 8, 128, 112)              # 16 plane slots per core read through a pad (not cut)
+    res(n, "image", 128)
+    n = mk("in256-cat", 8, 8, 256, 113)
+    n.conv("c3", n.concat("k1", [n.conv("c1", "image", 8), n.pool("p1", "image", k=3, s=1, pad="same")]), 32, k=1)
+    n = mk("big-kernel", 3, 3, 512, 114)             # 4.7 MB of weights: loaded core by core, and cut
+    n.add("a1", n.conv("c2", n.conv("c1", "image", 1024, k=3), 512, k=1, act="none", out=1 / 256), "image")
+    for h, c in ((8, 224), (16, 192)):               # the output conv: a weight ring, Cout not a multiple of 16
+        n = mk("ring-pbp-%d" % h, h, h, c, 115 + h)
+        n.conv("c2", res(n, "image", c), 500, k=3, act="none")
+    # residual and concat blocks whose feature maps pass 256 KiB per core
+    for h, c in ((96, 64), (128, 64), (160, 64), (96, 128), (96, 256)):
+        n = mk("res%d-%d" % (h, c), h, h, c, 120 + h + c)
+        res(n, "image", c)
+    for h, c in ((96, 64), (128, 128), (160, 64)):
+        n = mk("cat%d-%d" % (h, c), h, h, 16, 130 + h + c)
+        n.conv("c3", n.concat("k1", [n.conv("c1", "image", c), n.conv("c2", "image", c)]), 16)
+    return V
+
+
+def random_split_net(name, seed):
+    """a seeded random graph with wide layers (the unseen test of the graph-split rules): a 3..8 px map, 1 to 3
+    blocks (a residual, an add of two wide branches, a concat, a standalone ReLU after a pool, a wide 1x1 conv NPUC
+    cuts), then often a global average pool and a classifier of 500 or 1000 outputs"""
+    r = random.Random(seed)
+    h = r.choice([3, 4, 4, 6, 8])
+    n = Net(name, h, h, r.choice([16, 32, 64, 128, 256]), seed)
+    k = [0]
+    wide = [96, 128, 192, 256, 384, 720, 768]
+
+    def nm(p):
+        k[0] += 1
+        return "%s%d" % (p, k[0])
+
+    def conv(t, c, act="relu", out=1 / 128, k1=False):
+        k3 = not k1 and n.ch[t] * c <= 65536 and r.random() < 0.5      # 3x3 kernels up to 0.6 M weights
+        return n.conv(nm("c"), t, c, k=3 if k3 else 1, act=act, out=out)
+
+    t = "image"
+    for _ in range(r.randint(1, 3)):
+        kind = r.choice(["res", "res", "add", "cat", "relu", "cut"])
+        if kind == "res":
+            c = n.ch[t]
+            b = conv(t, c)
+            if r.random() < 0.5:
+                b = conv(b, c, act="none", out=1 / 256)
+            t = n.add(nm("a"), b, t, act=r.choice(["relu", "none"]), out=1 / 128)
+        elif kind == "add":
+            cc = r.choice(wide)
+            t = n.add(nm("a"), conv(t, cc), conv(t, cc), act=r.choice(["relu", "none"]), out=1 / 64)
+        elif kind == "cat":
+            t = n.concat(nm("k"), [conv(t, r.choice([8, 16, 32, 64, 128, 720])) for _ in range(r.choice([2, 2, 3]))])
+        elif kind == "relu":
+            p = n.pool(nm("p"), conv(t, r.choice(wide), act="none"), kind=r.choice(["max", "avg"]), k=2,
+                       s=r.choice([1, 2]))
+            t = n.relu(nm("r"), p)
+        else:
+            t = conv(t, r.choice([720, 768, 1000]), k1=True)
+    if r.random() < 0.6:
+        ht = n.hw[t][0]
+        t = n.conv(nm("fc"), n.pool(nm("p"), t, kind="avg", k=ht, s=ht), r.choice([500, 1000]), k=1, act="none")
+    return n
+
+
 def random_net(name, seed):
     """a seeded random graph: a stem, then 1 to 4 blocks (residual from the input or a computed tensor, add of two
     branches, concat of 2 or 3 branches, a standalone ReLU or ReLU6 after a pool, add or concat, pools between)"""
@@ -313,16 +421,19 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument("dir")
         p.add_argument("names", nargs="*")
-    p = sub.add_parser("random", help="random graph networks g<seed>, compiled")
+        p.add_argument("--set", choices=("main", "split"), default="main")
+    p = sub.add_parser("random", help="random graph networks g<seed> (--set split: wide ones, s<seed>), compiled")
     p.add_argument("dir")
     p.add_argument("seed", type=int)
     p.add_argument("count", type=int, nargs="?", default=40)
+    p.add_argument("--set", choices=("main", "split"), default="main")
     a = ap.parse_args(argv)
     if a.cmd == "random":
-        V = {"g%03d" % s: random_net("g%03d" % s, s) for s in range(a.seed, a.seed + a.count)}
+        f, pre = (random_split_net, "s") if a.set == "split" else (random_net, "g")
+        V = {"%s%03d" % (pre, s): f("%s%03d" % (pre, s), s) for s in range(a.seed, a.seed + a.count)}
         names = list(V)
     else:
-        V = variants()
+        V = split_variants() if a.set == "split" else variants()
         names = a.names or list(V)
     d = a.dir
     os.makedirs(d, exist_ok=True)

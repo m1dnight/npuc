@@ -480,8 +480,10 @@ takes one DMA per segment per core, or one per core when the segments are alike 
 top one live with it (V: cat16, g021, g141, g169): the shared INPUT, stored branch roots, a concat buffer read by one
 layer (from the concat atom), CONCAT_STORAGE. Then the per-reader chunks of DRAM tensors read by several layers (one
 each, live at its reader only: NPUC's "Hack on LA"; INPUT before the layers, a concat's at the concat's place), then
-per layer. Eltwise: SHIFT_OUTPUT1/2 32 B, CU_BIN 128 B, ELTWISE ppc x cells x 64, META_DATA 32 B (64 B past 4 planes per
-core). ReLU: CONV as a conv's (16-channel rounded) and WEIGHT.
+per layer. Eltwise: SHIFT_OUTPUT1/2 32 B, CU_BIN 128 B, ELTWISE ppc x cells x 64, META_DATA one core's region of its
+block (`weights.eltwise_meta_size`: 3 arrays of ceil(C / cores) bytes, each padded to 4, the whole to 32; V: 32 B up to
+32 channels, 64 for 40..64, 96 for 128, 192 for 256, 384 for 512, 544 for 720: graph-split). ReLU: CONV as a conv's
+(16-channel rounded) and WEIGHT.
 
 **Eltwise group (an ARM intrinsic).** IR: the ARM's loads (operands first if any: those read from DRAM first, two
 loads per operand when the cores hold different plane counts or for exactly 4 channels; then META_DATA), one element
@@ -500,13 +502,19 @@ weights.py's relu conv (all at the zero point). Reading a tensor a conv wrote (a
 buffer, or a ReLU that read so (g555): every pass reads all planes (kin = 2 ppc, src fixed); else (after a pool, an
 eltwise, a per-pass ReLU) pass p reads its
 two plane slots (kin = 4, src + 2p cells). The per-pass WEIGHT chunk is ceil(4 x passes x 2 x rows x 64 / cores) and
-pass slots are its rows over the passes (V: relu-c1..c24; 3 cores: 171 B a pass, 3 rows apart).
+pass slots are its rows over the passes (V: relu-c1..c24; 3 cores: 171 B a pass, 3 rows apart). The rows, in the chunk
+and the 0x300 registers, are those of the block weights.py writes for the ReLU (`weights.relu_rows`): the identity's
+1 after a pool or an eltwise, where the zero-point conv has 4 (V: 720 and 768 channels, graph-split cut-elt,
+cut-relu; the same 1 up to 128 channels).
 
 **Weights of a graph conv** (V: `$NCPGEN_WORK/sweep/weights/cat`, 86/86): the WEIGHT chunk is R x 2 x the planning
 rows x 64 (NPUC's planner packs the kernel itself, in the unpermuted channel order for a conv reading a concat in
 SRAM), while the loads, the 0x300 registers and the ring step use the emitted block's rows, sub-batches and
 sub-channels (`weights.weight_layer_info`); a ring's slots sit 2 x planning rows apart, each slot's second half at the
-emitted rows (V: g103, g167). **Misses (unseen set).** none left (g103, g161, g167 fixed with weights.py's planning
+emitted rows (V: g103, g167). A ring with Cout not a multiple of 16 takes the chain's slot, 16 x ceil(bytes per IDP /
+Cout) (frame.md 6.6; V: mobilenet-v2-035-dense's 1280 -> 1000 classifier, 32 of 63 passes), and a graph never stores
+pass by pass: one store after the last pass (V: graph-split ring-pbp-16, a 500-channel output with 16 of 32 passes).
+**Misses (unseen set).** none left (g103, g161, g167 fixed with weights.py's planning
 rows; g134: a 4-channel eltwise's
 second operand load skips a flag: fixed since (that load, the second plane slot of a 4-channel operand, takes the
 network's next flag the group does not use, like META_DATA; V: g134, rc4-*, g120).
@@ -536,6 +544,13 @@ its triggers come in sub-batches (once read as NPUC's CODEGEN_MINIMAL_LOADS_NUM_
 SetBatchTransferInGroup: no load of that group has a wait, 7b, and the tiling3 ra rings loaded core by core, 112..128
 loads, get one id per trigger); the weight-only batch count (7b, gone) needed the ring's input read first by an NFU op
 (a 1x1 conv's ring: 15 in all, k1c64-ci2048, mb1024-14b).
+
+**In a graph** (V: mobilenet-v2-035-dense, the 112 -> 1280 conv and the 1280 -> 1000 classifier in 3 groups each;
+`$NCPGEN_WORK/sweep/graph-split`, `stream_graphs.py compile <dir> --set split`): the same cut, a cut conv or
+standalone ReLU anywhere a graph puts it: in SRAM, the output, an eltwise operand stored to DRAM, a producer of a
+concat's DRAM buffer (its chunk stores at its offset there), a reader of the network input through a pad or a
+reformat (its chunks' slot loads; their tensor is the layer's input), a kernel over 4 MiB loaded core by core.
+`Plan.group_layers` names each group's layer for frame.py (frame.md 6.8).
 
 Not modelled: a cut tile group (none seen: c512's tiles estimate 58590), a cut layer with pools or eltwise (NPUC would
 need more than 300 pooled plane slots).

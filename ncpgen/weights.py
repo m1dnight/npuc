@@ -412,6 +412,22 @@ def _permuted_conv(L, segs):
     return dict(L, in_chw=[len(order)] + list(L["in_chw"][1:]), weights_oihw_u8=w2, _cpc=cpc, _ncores=ncores)
 
 
+def _eltwise_regions(C):
+    """(cores, channels per core, bytes per array, bytes per core region) of a C-channel eltwise's META_DATA"""
+    planes = cdiv(C, 2)
+    ppc = cdiv(planes, MAX_CORES)
+    cores = cdiv(planes, ppc)
+    n = cdiv(C, cores)
+    arr = cdiv(n, 4) * 4
+    return cores, n, arr, cdiv(3 * arr, 32) * 32
+
+
+def eltwise_meta_size(C):
+    """NPUC's META_DATA chunk of a C-channel eltwise, SRAM bytes per core: one core's region of its block (V: 32 up to
+    32 channels, 64 for 40..64 (res40, res64), 96 for 128, 192 for 256, 384 for 512, 544 for 720: graph-split)"""
+    return _eltwise_regions(C)[3]
+
+
 def eltwise_block(L, dram=False):
     """An eltwise add's WEIGHT block (NPUC's CU_BIN / META_DATA, V on every graph compile): per core of the input's
     layout (ceil(C/2) planes, ceil(planes/4) per core; 4 regions for exactly 4 channels when an operand is loaded
@@ -419,13 +435,8 @@ def eltwise_block(L, dram=False):
     lengths of input 1, input 2 and the output (lowered "fl"), one byte per channel of the core (C split evenly:
     ceil(C / cores) each, the rest on the last), each array padded to 4 bytes, the core's region to 32."""
     C = L["in_chw"][0]
-    planes = cdiv(C, 2)
-    ppc = cdiv(planes, MAX_CORES)
-    cores = cdiv(planes, ppc)
-    n = cdiv(C, cores)
+    cores, n, arr, reg = _eltwise_regions(C)
     regions = MAX_CORES if C == 4 and dram else cores
-    arr = cdiv(n, 4) * 4
-    reg = cdiv(3 * arr, 32) * 32
     out = bytearray()
     for c in range(regions):
         cnt = max(0, min(n, C - c * n))
@@ -504,15 +515,8 @@ def layer_blocks(low):
             dram = any(i == src or (i in by and by[i]["kind"] == "concat") for i in ins[L["name"]])
             res.append((L["name"], k, eltwise_block(L, dram)))
         elif k == "relu":
-            p = _relu_source(L, by)
-            # a ReLU reading what a conv wrote (a conv, a concat): every weight at the zero point (V: grelu r6c8/16,
-            # rlc8, cat-relu, cat16-relu, g008, g029, g147, g161); reading a pool or an eltwise: the identity through
-            # the depthwise path; a ReLU of a ReLU takes the inner one's form (V: relu<concat zero, g555;
-            # relu<eltwise, relu<pool identity, g002, g016); the network input: G (taken as the identity)
-            if p is not None and p["kind"] in ("conv", "concat"):
-                res.append((L["name"], k, conv_block(_relu_zero_conv(L), q)[1]))
-            else:
-                res.append((L["name"], k, relu_identity_block(L["cout"], q)))
+            res.append((L["name"], k, relu_identity_block(L["cout"], q) if _relu_identity(L, by)
+                        else conv_block(_relu_zero_conv(L), q)[1]))
     return res
 
 
@@ -522,6 +526,27 @@ def _relu_source(L, by):
     while p is not None and p["kind"] == "relu":
         p = by.get(p["input"])
     return p
+
+
+def _relu_identity(L, by):
+    """a standalone ReLU's block in a graph: the identity (relu_identity_block) or every weight at the zero point. A
+    ReLU reading what a conv wrote (a conv, a concat): the zero point (V: grelu r6c8/16, rlc8, cat-relu, cat16-relu,
+    g008, g029, g147, g161); reading a pool or an eltwise: the identity through the depthwise path; a ReLU of a ReLU
+    takes the inner one's form (V: relu<concat zero, g555; relu<eltwise, relu<pool identity, g002, g016); the network
+    input: G (taken as the identity)"""
+    p = _relu_source(L, by)
+    return not (p is not None and p["kind"] in ("conv", "concat"))
+
+
+def relu_rows(L, by, quant_mode=1):
+    """rows of 64 B per weight batch of the block a graph's standalone ReLU L gets (layer_blocks): the rows its
+    conv ops and its WEIGHT chunk count (V: the identity's 1 where the zero-point conv has 4: 720 and 768 channels,
+    graph-split cut-elt and cut-relu; the same 1 up to 128 channels)"""
+    if not _relu_identity(L, by):
+        return conv_block(_relu_zero_conv(L), quant_mode)[0]["rows_per_batch"]
+    C = L["cout"]
+    geo = conv_geometry({"cout": C, "in_chw": [C, 1, 1], "k": [1, 1], "stride": [1, 1]})
+    return len(relu_identity_block(C, quant_mode)) // (geo["ncores"] * geo["nloads"] * 2 * ROW)
 
 
 def _mf_conv(L, chans):

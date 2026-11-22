@@ -222,11 +222,13 @@ then starts a new io batch, section 5).
   per output channel, e = 16 x ceil(per / Cout) (per = the conv's block per IDP), which is the load size when Cout
   is a multiple of 16 and slightly more otherwise (it counts the last pass as full). The WEIGHT chunk is R x e; slot
   k starts at k x round_up(e, 64) (r3-095: the third slot passes the chunk's end by 48 B). R itself uses the load size.
+  A graph's ring too (the stream part sizes it; V: mobilenet-v2-035-dense's 1000-channel classifier).
 - **The ring's live range** (V: the wlive sweep and r3-*: R 1..4 in 9 compiles, R 5..16 in 30): a ring of at most 4
   slots lives on its CONV only; a larger ring, like resident weights, from the layer's first op (its PAD): NPUC's
   short and extended weight lifetimes (`weights_have_extended_lifetime`, 6.10: an extended ring needs 5 slots or more).
-- **Pass-by-pass stores** (V: rc-167-488/500/504/510, rc-200-500; G for the condition): when the last conv's weights
-  ring, Cout is not a multiple of 16 and its weights have no sub-batches, its output is stored pass by pass: the io
+- **Pass-by-pass stores** (V: rc-167-488/500/504/510, rc-200-500; G for the condition): when the last conv of a chain
+  (not of a graph: graph-split ring-pbp-16 stores once) has a weight ring, Cout is not a multiple of 16 and its weights
+  have no sub-batches, its output is stored pass by pass: the io
   descriptors alternate weight load p, store of pass p (planes 2p and 2p + 1 of every IDP: the IDPs holding as many as
   IDP 0 in one blob of h = planes x Hp, w = 2Wp, SRAM c_stride 0x40000 - h x w, DRAM c_stride = the IDP's block - h x
   w; an IDP holding fewer on its own through its SRAM vector, 64 B wide). With sub-batches (rc-272-*, rc-512-*) or a
@@ -283,8 +285,9 @@ follows the rule above.
 ### 6.8 Graph networks: eltwise add, concat, standalone ReLU (`plan_graph`; V on the graph, graph-random and graph-random2 compiles unless marked)
 
 The groups and DMAs are the stream part's (`stream.Plan`: NPUC's layer order `exec_order`, one group per layer
-except concats, the unflatten last; every DMA op carries its tensor and SRAM offset; cmdq.md 7c); `plan_graph()`
-builds the descriptors and vectors from them.
+except concats, several for a layer NPUC cuts for its CMDQ size (6.9), the unflatten last; `Plan.group_layers` names
+each group's layer; every DMA op carries its tensor and SRAM offset; cmdq.md 7c); `plan_graph()` builds the
+descriptors and vectors from them.
 
 - **Groups.** A group with DMAs has the 32-byte intrinsic (the eltwise's too), one without none (a pool between two
   layers in SRAM), the unflatten its output intrinsic.
@@ -303,6 +306,11 @@ builds the descriptors and vectors from them.
   (V: cat2, g030, and the weights part's cat sweep with uneven splits 1+7, 3+5, 5+3, 20+12: 86/86). A tensor holding an SRAM
   concat's segments (a pool of it) stores each segment as a tensor of its own after the earlier ones: per core and
   segment, 64 B wide, or per core with one plane per segment when they are alike (g141, g169).
+- **A layer NPUC cuts** (6.9; V: mobilenet-v2-035-dense's 112 -> 1280 conv and 1280 -> 1000 classifier, three groups
+  each, and the graph-split sweep, cmdq.md 7d): the chain's descriptors in each chunk group: each pass's weight load at
+  the stream's slot (core by core for a kernel over 4 MiB), the slot loads of an input an NFU op reads first, and per
+  chunk one store of its passes' planes (`_range_store`), at the producer's offset when it fills a concat's DRAM
+  buffer. The same slot loads serve an uncut layer whose NFU-first input has 16 plane slots per core or more.
 - **Not reproducible:** a 4-channel eltwise (rc4-*, g120, g134) loads each operand in two parts whose second
   descriptor holds uninitialised words in NPUC's output (format fields that are heap addresses, an offset of -128):
   no generator can match those bytes. g103, g167: the stream part's SRAM offsets (a conv reading a concat, cmdq.md

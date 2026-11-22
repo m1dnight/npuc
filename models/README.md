@@ -39,10 +39,10 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
 
 ## Status (2026-11-22, NPUC root-314e61a6)
 
-**24 models: 17 exact, 2 compile but differ, 4 fail in NPUC, 1 refused by npunet.** Every model npunet lowers has its
+**24 models: 19 exact, 4 fail in NPUC, 1 refused by npunet.** Every model npunet lowers has its
 CPU reference (`npunet.py ref`, 0.1 to 18 s). The three `-npu` rewrites give byte for byte the reference of the
 published model, and the depthwise models the reference of their `-dense` form. Every NCP NPUC compiled is regression
-data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: 17 of 19, the known misses below), and the 17 exact ones are
+data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: 19 of 19), and the 19 exact ones are
 rows of `tests/golden.txt`, so `tests/run.sh` regenerates them with no vendor file. The NPUC column's time includes
 npunet's lowering and was measured under a parallel load.
 
@@ -68,8 +68,8 @@ npunet's lowering and was measured under a parallel load.
 | yolov2-tiny-128 | 128x128x3 | --allow-none | ok, 15 NPU layers | PASS, 4607 KB, 99.8 s | **EXACT** (20 s) | b4805006f2b0, 2000 B, 9.0 s |
 | mobilenet-v1-025 | 96x96x1 | --allow-none | ok, 29 NPU layers | PASS, 797 KB, 45.6 s | **EXACT** (1 s) | 5af11588254e, 2 B, 5.1 s |
 | mobilenet-v1-025-dense | 96x96x1 | --allow-none | ok, 29 NPU layers | PASS, 797 KB, 6.3 s | **EXACT** (1 s) | 5af11588254e, 2 B, 4.9 s |
-| mobilenet-v2-035 | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 67.1 s | **differs**: NPUC's NCP is the `-dense` one byte for byte, so the same frame gap (need 4) | 0cc597e5b755, 1000 B, 10.3 s |
-| mobilenet-v2-035-dense | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 211.2 s | **differs**: 69 groups for 65 layers in a graph; frame.py raises (need 4) | 0cc597e5b755, 1000 B, 17.6 s |
+| mobilenet-v2-035 | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 67.1 s | **EXACT** (4 s) | 0cc597e5b755, 1000 B, 10.3 s |
+| mobilenet-v2-035-dense | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 211.2 s | **EXACT** (4 s) | 0cc597e5b755, 1000 B, 17.6 s |
 | ds-cnn | 49x10x1 | --allow-none | refused: pool1: a global average pool over 25x5: NPUC's pooling takes strides up to 3, and as a conv its kernel may be up to 14x14 (V); pool in steps first | - | - | - |
 | ds-cnn-dense | 49x10x1 | --allow-none | ok, 11 NPU layers | PASS, 209 KB, 22.2 s | **EXACT** (3 s) | ad2c9fdec999, 12 B, 2.0 s |
 
@@ -79,7 +79,7 @@ published** (with the generic adaptations above; ResNet-8's shortcuts SAME -> VA
 KWS CNN, magic wand and AlexNet are **exact after an exact rewrite** (`-npu`). MobileNet v1 is **exact as published**
 (DEPTHWISE_CONV_2D and TFLite's ReLU6 quantisation: npunet lowers each depthwise layer to the dense block-diagonal
 conv, and NPUC's NCP for the depthwise form is the `-dense` form's byte for byte); MobileNet v2 lowers and compiles the
-same way, but for the frame gap below; DS-CNN is **exact with depthwise written as dense** (`-dense`; the published form
+same way and is exact too (with its adaptations); DS-CNN is **exact with depthwise written as dense** (`-dense`; the published form
 waits for a global average pool over 25x5). micro_speech **fails in NPUC**.
 
 ## What ncpgen and npunet need, ranked
@@ -131,12 +131,16 @@ What unblocks the most models for the least work comes first. Items marked done 
    a `depthwise_conv2d` op in npu-net/1 (the zoo writes it as TFLite stores it: layout 1HWO, `depth_multiplier` 1), the
    op in `tflite_to_graph`, and per-channel weight scales, which TFLite uses by default for depthwise weights. **Effort:
    half a day** without per-channel scales (folding them is lossy; see 9).
-4. **frame.py: graphs whose large layers NPUC splits into several groups** (mobilenet-v2-035-dense). NPUC gives the
-   112->1280 conv and the 1280->1000 FC three groups each. ncpgen's stream part already makes the same 69 groups, with
-   the same sizes (`stream.Plan`), but `frame.intrinsics` in graph mode raises "65 layer groups, 69 stream groups", and
-   streams g65-g67 (the FC) differ at offsets 0x120/0x1f2 (likely its DMA addresses, which the frame plan supplies).
-   Chains with layers as large as these are exact (vgg11-64, yolov2-tiny-128, alexnet-96-npu). **Effort: a day**
-   (port the chain plan's multi-group layers to the graph plan).
+4. **Done (2026-11-22): frame.py: graphs whose large layers NPUC splits into several groups** (mobilenet-v2-035-dense:
+   NPUC cuts the 112->1280 conv and the 1280->1000 FC into three groups each, cmdq.md 7d). `plan_graph` follows the
+   stream part's groups (`stream.Plan.group_layers`) with the chain's cut descriptors (frame.md 6.8), and the stream
+   part's graph planner took four more of NPUC's rules: the FC's weight ring slot when Cout is not a multiple of 16
+   (what g65-g67 missed), META_DATA's chunk, a wide standalone ReLU's weight rows, no pass-by-pass store in a graph.
+   Checked on `$NCPGEN_WORK/sweep/graph-split` (`stream_graphs.py --set split`: a cut layer in each place a graph puts
+   one, a kernel over 4 MiB, 128..720-channel eltwise and ReLU layers; concat blocks at 96..160 px, which NPUC tiles
+   and ncpgen refuses, and residual blocks there, which NPUC cannot compile: 15 of 18 compiled, the 3 tiled refused)
+   and on unseen random wide graphs (`stream_graphs.py random <dir> 1 30 --set split`: 25 of 25 compiled exact; 5 more
+   stop at npunet's limit on a wide global pool).
 5. **npunet: a global average pool larger than 14** (ds-cnn). `_global_avg_as_conv` refuses kernels over 14, but NPUC
    compiles the 25x5 identity conv over 64 channels and ncpgen is exact on it (ds-cnn-dense writes that conv itself;
    probes: 25x5, 25x8, 25x10, 8x25, 10x25, 12x20, 14x18, 18x14, 15x15 over 8 channels, 25x20 over 1 are exact too).
@@ -364,7 +368,7 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Ops**: conv2d 3x3/2, depthwise 3x3 x17, conv2d 1x1 x34, add x10, average_pool2d, reshape, fully_connected, softmax; 1.66 M weights; output 1x1x1000; `--quant 3 --allow-none`
 - **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); global average pool as AVERAGE_POOL_2D 3x3 (Keras writes MEAN, which npunet does not take); the linear bottlenecks and the classifier: --allow-none
 - **Missing for the published form**: MEAN (Keras' GlobalAveragePooling2D) is not taken by npunet's TFLite reader: lower MEAN over H, W like a global AVERAGE_POOL_2D
-- **Status**: differs (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 67.1 s; ncpgen check: strea g65@0x1f2 g66@0x120 g67@0x120 | intri - | weigh ok | file - (4 s))
+- **Status**: exact (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 67.1 s; ncpgen check: EXACT (4 s))
 
 ### mobilenet-v2-035-dense
 
@@ -372,7 +376,7 @@ The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outp
 - **Task / input**: 96x96x3 images, 1000 classes; input 96x96x3 int8 (scale 0.0078125, zero point 0)
 - **Ops**: conv2d 3x3/2 x5, conv2d 3x3 x13, conv2d 1x1 x34, add x10, average_pool2d, reshape, fully_connected, softmax; 6.74 M weights; output 1x1x1000; `--quant 3 --allow-none`
 - **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); global average pool as AVERAGE_POOL_2D 3x3 (Keras writes MEAN, which npunet does not take); the linear bottlenecks and the classifier: --allow-none; each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function; 1.66 M -> 6.74 M weights counted dense, but NPUC's weight format skips the zeros with bitmaps)
-- **Status**: differs (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 211.2 s; ncpgen check: streams equal in number and size, frame.py's graph plan takes one group per layer: need 4)
+- **Status**: exact (lowering: ok, 64 NPU layers; NPUC: PASS, 3537 KB, 211.2 s; ncpgen check: EXACT (4 s))
 
 ### ds-cnn
 
