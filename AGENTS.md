@@ -48,9 +48,10 @@ Python: `python3 -I`, standard library only. The host has docker (arm64 containe
 Byte-exact with NPUC on every compiled network (`tests/regress.sh`) except NPUC's 7 uninitialised-byte eltwises and the
 listed misses of the zoo's standard-resolution models and of graph-large (NPUC's trim and spill inside a graph, not
 modelled: docs/format/frame.md 6.11). Tiling inside a graph follows NPUC's policy (frame.graph_policy). Common models:
-`models/` (models/README.md). Depthwise is lowered
+`models/` (26 of 32 zoo entries exact; models/README.md lists what the rest need). Depthwise is lowered
 to the dense block-diagonal conv NPUC itself compiles (docs/format/depthwise.md; NPUC's own depthwise-optimised path is
-off on the device and unproven on the NPU). Not supported yet: trim and spill inside a graph, channel split/slice, other
+off on the device and unproven on the NPU). Not supported yet: trim and spill and weight rings inside a graph, a CMDQ cut in a tiled
+plan's single blocks, channel split/slice, other
 activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling (NPUC's deconvolution crashed in the
 harness), several outputs. Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the
 nervesinator porting kit).
