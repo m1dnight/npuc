@@ -1422,6 +1422,7 @@ class Plan:
                 if i in stored:
                     raise Unsupported("%s goes to DRAM twice" % i)
                 stored[i] = ("cat", kn)
+        reloads = set()                                     # (tensor, reader) loading a stratum's input back
         for st in pol["strata"]:
             t_in, t_out = ins[st["layers"][0]][0], st["layers"][-1]
             if t_in != src and t_in not in dsrc:
@@ -1430,6 +1431,9 @@ class Plan:
                 if t_in in tst:
                     raise Unsupported("tiling in a graph: two strata joined")
                 stored.setdefault(t_in, ("im", t_in))       # its producer stores it for the tiles
+                # its other readers load it back from DRAM, into its own chunk, which stays live to them (V: outputs
+                # o-big-readback: a pool beside a tiled head)
+                reloads |= {(t_in, r) for r in cons.get(t_in, []) if r not in tst and by[r]["kind"] in ("conv", "pool")}
             stored.setdefault(t_out, ("im", t_out))
 
         def end_of(t):
@@ -1776,9 +1780,6 @@ class Plan:
             else:
                 o = info[out]
             nu = unflatten_tiles(o, o["ho"], o["wo"])
-            if nu > 1 and multi:
-                raise Unsupported("tiling in a graph (the unflatten of %d x %d, one of several outputs)"
-                                  % (o["ho"], o["wo"]))
             self.out_chw = (o["dout"].c, o["ho"], o["wo"])
             self.out_chws.append(self.out_chw)
             self.out_internal[out] = self.out_chw   # NPUC's shape of the output (a widened pool: one more column)
@@ -1790,10 +1791,14 @@ class Plan:
                 self.group_layers.append(None)
             # a tiled read-back, as a chain's (frame.md 6.5: row tiles by NPUC's policy, each its own output group,
             # loaded per core with several planes per core; V: large random t1039)
+            # (several outputs: each output's row tiles in a row, V: outputs o-tiled-head, o-big-readback)
             for u in range(nu if nu > 1 else 0):
                 nl = o["dout"].cores if o["dout"].ppc > 1 else 1
                 ops = [Op("load", what="dram", flag=self.event(), utile=u, core=k if nl > 1 else None, tensor=out)
                        for k in range(nl)]
+                if multi:
+                    for op in ops:          # the read-back's profile: this output's tiles (npuc_profile)
+                        op.out_chw, op.nu, op.u = self.out_chw, nu, u
                 self.groups.append(ops + [Op("nopop", deps=list(range(nl))), Op("unflatten")])
                 self.group_layers.append(None)
 
@@ -1808,9 +1813,11 @@ class Plan:
             # (the same tensor, the same way, into the same SRAM chunk, which the layer just before did not overwrite
             # with its output: V outputs-unseen2 m2028 loads again; its partial sums do not count, V: graph-split-random
             # s001 skips the load over them, G for its PAD and REFORMAT chunks, which no case has overlapped)
-            ld = (i0, load_kind(L, d), d["in"].off) if (i0 in dsrc or (i0, n) in spilled) and k != "eltwise" else None
-            if (i0, n) in spilled:
-                first = True                # a spilled tensor's reader past the spill (frame.md 6.12)
+            ld = (i0, load_kind(L, d), d["in"].off) if (i0 in dsrc or (i0, n) in spilled or (i0, n) in reloads) \
+                and k != "eltwise" else None
+            if (i0, n) in spilled or (i0, n) in reloads:
+                first = True                # a spilled tensor's reader past the spill (frame.md 6.12), a stratum
+                #                             input's other reader
             elif (i0 == src and shared) or i0 in wshared:
                 first = n == firstr
             elif ld is not None:
@@ -2548,8 +2555,8 @@ def npuc_profile(ops, plan):
                 C, H, W = getattr(op, "out_chw", None) or getattr(plan, "out_chw", None) or plan.low["npu_out_chw"]
                 nu = sum(1 for g in plan.groups if any(o.kind == "unflatten" for o in g))
                 u = getattr(plan, "_uf_done", 0)
-                if getattr(op, "out_chw", None):    # one of several outputs, each read back whole
-                    nu, u = 1, 0
+                if getattr(op, "out_chw", None):    # one of several outputs: its own read-back (row tiles)
+                    nu, u = getattr(op, "nu", 1), getattr(op, "u", 0)
                 th = cdiv(cdiv(H, nu), 4) * 4
                 rows = min(H, (u + 1) * th) - u * th
                 dd = Dist(C)

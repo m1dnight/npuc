@@ -778,7 +778,8 @@ frontend makes it an output ("outputOrder" lists it), then the policy maker cras
 PolicyMaker::PBuilder::IDram::build2ndStage, libnpuc_template 0x3920a0) on a chain c0 -> c1 -> c2 with c1 also an
 output and on the same with a second head (`$NCPGEN_WORK/sweep/outputs-inter`, V). npunet refuses such a model.
 
-**Rates.** The probes: 13/15 (the 12 small ones, o-tiled-stem; the two refusals above). A development set of 40 random detector-like graphs (`stream_graphs.py random <dir> 1
+**Rates.** The probes: 15/15 (the 12 small ones, o-tiled-stem, and the two tiled read-backs since the merge with main's
+tiled read-back). A development set of 40 random detector-like graphs (`stream_graphs.py random <dir> 1
 40 --set outputs`: a stem, 1 to 3 feature maps, 1 to 3 heads each of 1..40 channels, sometimes a residual block or a
 concat in the backbone, pools, adds and concats as outputs; 2 to 8 outputs): 32/40 before the policy groups, the concat
 and the bulb rules, then 40/40. **Unseen** (seeds 1000..1039, `$NCPGEN_WORK/sweep/outputs-unseen`): **33/40** whole
@@ -798,6 +799,9 @@ or npu-net/1 model at those tensors (`tflite_cut`, `graph_cut`: only the ops the
 the outputs and its reshapes, concatenations and post-process stay on the CPU (one `--output`: the single-output
 path). Tiling inside the graph (6.11) works unchanged under heads
 (o-tiled-stem: a tiled stride-2 stem under two heads; the SSD model at 300 px: its first conv in 2 row tiles; both
-exact). Refused: an output whose read-back NPUC cuts in rows (o-tiled-head, a 96x96x64 head NPUC tiles;
-o-big-readback, a 128x128x40 1x1 head: a tiled read-back in a graph, as for one output; `tests/regress.sh` knows these
-2), an output a layer also reads, a CPU tail (RESHAPE, SOFTMAX) after several outputs.
+exact). An output whose read-back NPUC cuts in rows (6.5, 6.11's tiled read-back) gets its row tiles as consecutive
+output groups where its single group would be, each writing its rows of the output's OT_FMAP (V: o-tiled-head, a
+96x96x64 head NPUC tiles; o-big-readback, a 128x128x40 1x1 head, a stratum of 2 tiles). A stratum's input that another
+layer also reads is stored for the tiles and that reader loads it back from DRAM into the tensor's own chunk, which
+stays live to it (V: o-big-readback's pool beside the tiled head; no single-output compile had the case). Refused: an
+output a layer also reads, a CPU tail (RESHAPE, SOFTMAX) after several outputs.

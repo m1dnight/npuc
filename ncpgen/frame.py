@@ -891,10 +891,14 @@ def plan_graph(low, weight_sizes=None):
     #                                             group each, each ending its policy group, 12)
     nu = gl.count(None)                         # the output groups
     out = outs[0]
+    ogroups = {}                                # output -> its output groups (several: row tiles of its read-back)
+    for g_, ops_ in enumerate(P.groups):
+        if gl[g_] is None:
+            ogroups.setdefault(next(o_.tensor for o_ in ops_ if o_.kind == "load"), []).append(g_)
     inner = getattr(P, "graph_inner", set())    # a tiled stratum's layers after its head (6.11)
     if list(dict.fromkeys(x for x in gl if x is not None)) != \
             [n for n in getattr(P, "emit_order", order) if by[n]["kind"] != "concat" and n not in inner] or \
-            (len(outs) > 1 and nu != len(outs)) or nu < 1:
+            (len(outs) > 1 and list(ogroups) != outs) or nu < 1:
         raise ValueError("the stream's groups do not follow the layer order")
     # the WEIGHT vectors, in the NCP's group order (NPUC's layer order for one output; frame.md 12)
     wl = [n for n in getattr(P, "emit_order", order) if by[n]["kind"] in ("conv", "relu", "eltwise")]
@@ -999,22 +1003,18 @@ def plan_graph(low, weight_sizes=None):
             k += 1
             continue
         if what == "dram":
-            if len(outs) > 1:
-                o = op.tensor
-                c_, h_, w_ = oint.get(o, chw[o])
+            o = op.tensor if len(outs) > 1 else out
+            tiles = ogroups[o]
+            c_, h_, w_ = oint.get(o, chw[o])
+            if len(tiles) == 1:
                 un[o] = _read_back(rows, g, cell(chw[o][0], h_, w_), chw[o][0], tvec(o), False)
                 k += 1
                 continue
-            c_, h_, w_ = oint.get(out, chw[out])
-            if nu == 1:
-                un[out] = _read_back(rows, g, cell(chw[out][0], h_, w_), chw[out][0], tvec(out), False)
-                k += 1
-                continue
             # a row tile of a tiled read-back (6.5, plan_tiled's): its rows per IDP from the output's IM
-            uc, uh, uw = P.out_chw
-            u0, u1 = _tile_ranges(uh, nu, 4)[g - (len(P.groups) - nu)]
+            uc, uh, uw = oint.get(o, P.out_chw)
+            u0, u1 = _tile_ranges(uh, len(tiles), 4)[tiles.index(g)]
             got = []
-            _tile_dma(got, cell(uc, uh, uw), (u0, u1, 0, uw - 1), tvec(out), 0, True, g, ns0=True)
+            _tile_dma(got, cell(uc, uh, uw), (u0, u1, 0, uw - 1), tvec(o), 0, True, g, ns0=True)
             j = k + 1
             while j < len(dmas) and dmas[j][2] == g and getattr(dmas[j][0], "what", None) == "dram":
                 j += 1
@@ -1127,15 +1127,24 @@ def plan_graph(low, weight_sizes=None):
     groups = [{"index": g, "kind": "output" if gl[g] is None else ("dma" if any(x[2] == g for x in io) else "plain")}
               for g in range(G)]
     if len(outs) > 1:
-        # one output group per output, in NPUC's order, each its own OT_FMAP (frame.md 12)
-        ogs = [g for g in range(G) if gl[g] is None]
+        # one output group per output (or per row tile of its read-back), in NPUC's order, each writing the output's
+        # own OT_FMAP (frame.md 12)
         ufs = []
-        for j, o in enumerate(outs):
+        for o in outs:
             Co, Ho, Wo = chw[o]
             _, Hi, Wi = oint.get(o, chw[o])
             ol = cell(Co, Hi, Wi)
-            ufs.append({"n": un[o][0], "c": un[o][1], "C": Co, "H": Ho, "W": Wo, "Hi": Hi, "Wi": Wi, "Hp": ol["Hp"],
-                        "Wp": ol["Wp"], "sram_off": 0, "group": ogs[j], "v_out": v_outs[o], "layer": o})
+            tiles = ogroups[o]
+            if len(tiles) == 1:
+                ufs.append({"n": un[o][0], "c": un[o][1], "C": Co, "H": Ho, "W": Wo, "Hi": Hi, "Wi": Wi,
+                            "Hp": ol["Hp"], "Wp": ol["Wp"], "sram_off": 0, "group": tiles[0], "v_out": v_outs[o],
+                            "layer": o})
+                continue
+            for u, (u0, u1) in enumerate(_tile_ranges(Hi, len(tiles), 4)):
+                r_ = u1 - u0 + 1
+                ufs.append({"n": ol["n"], "c": ol["cpi"], "C": Co, "H": r_, "W": Wo, "Hi": r_, "Wi": Wi,
+                            "Hp": rup(r_, 4), "Wp": ol["Wp"], "sram_off": 0, "group": tiles[u], "dst_off": u0 * Wo,
+                            "dst_cs": (Ho - r_) * Wo, "v_out": v_outs[o], "layer": o})
         return {"graph": True, "keep_bids": True, "av": av, "mv": mv, "io": io, "groups": groups,
                 "v_out": v_outs[out], "v_w": [wvec[n] for n in wl], "wlayers": wl,
                 "chunks": [], "layers": [L["kind"] for L in layers], "unflatten": ufs[0], "outputs": ufs}
