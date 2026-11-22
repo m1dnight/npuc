@@ -1,0 +1,19 @@
+# Trim and spill inside a graph: GlobalMemoryAllocator's fallback after every allocation order failed ("rely on trim
+# and spill"), the spill of active chunks to DRAM, the re-allocation of the "splitted" chunks, the PNodeSpill the
+# graph gets, and how the backend turns a spill into DMAs
+sym:GlobalMemoryAllocator
+sym:spillAllInputChunks
+sym:PNodeSpill
+sym:toNodeSpill
+str:trying to spill
+str:Allocating splitted chunk
+str:reallocating spilled chunks
+str:Unable to trim, rely on spill
+str:Creating new TRIM chunk
+str:Defragmentation and spilling failed
+str:Only Spill node is expected in the chain
+str:There's a Spill above but it spills something wrong
+str:FMAP_SPILL_DRAM
+str:tagSpillDram
+str:We cannot share ConcatStorage if we spill it in DRAM
+str:needs_trimming

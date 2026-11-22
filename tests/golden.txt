@@ -139,7 +139,10 @@ zoo-mobilenet-v2-035-dense|zoo:mobilenet-v2-035-dense|--quant 3 --allow-none|63f
 zoo-ds-cnn|zoo:ds-cnn|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
 zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
 zoo-mobilenet-v1-050-224|zoo:mobilenet-v1-050-224|--allow-none|5fd12f486586d06f3a145e67248c24df6245dd42454b0435f52bd423b8baed82
+zoo-mobilenet-v2-100-224|zoo:mobilenet-v2-100-224|--quant 3 --allow-none|6d33fc43fd54944706bcbdef5e6a773d3c82afe32ab20b8b40b44d6cbf8685fb
 zoo-mobilenet-v2-035-224|zoo:mobilenet-v2-035-224|--quant 3 --allow-none|5e85515a63d6f07c7ce4ca15d3c1e2bfc7c591d2fd76922f5cdc4dc5d16b15cc
+zoo-resnet18-224|zoo:resnet18-224|--quant 3 --allow-none|9be7e2c2342854ecd1ee063a42323940edf70680c95312458fe7bd476f093b20
+zoo-resnet18-96|zoo:resnet18-96|--quant 3 --allow-none|46d6c9a342317c911c80596a29d95cd57728799269a0fa8d7333c12f8232d00f
 zoo-squeezenet11-224-npu|zoo:squeezenet11-224-npu||bd99ab41ec3d242b784b1773a329fd1434226d3610b35e6adc007dd34700f461
 restride-s-conv2x1-fc|restride:s-conv2x1-fc|--allow-none|5d3a8bda7bc46578996776bd6e151cef3df381ecf89e06f1868e2b57e1dd191e
 restride-s-conv1x3-fc|restride:s-conv1x3-fc|--allow-none|dd96df281f1fb8bae7f7d7700cbc0e2a6ec012df30ed92bb3e6cda54d68eae14

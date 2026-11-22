@@ -525,6 +525,14 @@ with 16 plane slots per core or more and a pad or pool first loads them in 4 par
 right before the NFU ops of its slots (as an untiled input's chunked load, section 3; frame.md 6.11). Unequal pool
 strides are refused (`pool_strides`; npunet refuses them too).
 
+**Trim and spill in a graph** (frame.md 6.12; V: mobilenet-v2-100-224, resnet18-96/224, large random t1004, t1013,
+t1021, t1033, t1036): when no allocation order fits a layer's chunks, `allocate(ts=...)` runs NPUC's fallback. A trim
+gives the layer the chain's copy group (7b) before its own; a spill makes the spilled tensor a DRAM tensor for the
+readers past the spill: its producer's group stores it, each such reader's group loads it (whole or per core as any
+loaded intermediate, in 4 parts of ceil(ppc / 4) slots, the last the rest, when an NFU op reads it first with 16 slots
+per core or more: mobilenet-v2-100-224's 18-slot expansion, 5 + 5 + 5 + 3), into a chunk of its own; an eltwise that
+reads it loads both operands from DRAM, the spilled one first, and the other operand's producer stores it.
+
 **Misses (unseen set).** none left (g103, g161, g167 fixed with weights.py's planning
 rows; g134: a 4-channel eltwise's
 second operand load skips a flag: fixed since (that load, the second plane slot of a 4-channel operand, takes the

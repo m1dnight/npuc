@@ -1301,9 +1301,14 @@ def _pol_blocks(nd, ins, outs, nbuf=0):
     return b
 
 
-def _pol_full(nd, nbuf=0, extended=True):
-    """estimateFullMemoryRequirements (0x34481c): the whole node; extended = its weights live from its first op"""
+def _pol_full(nd, nbuf=0, extended=True, ifm_pre=False, ofm_pre=False):
+    """estimateFullMemoryRequirements (0x34481c): the whole node; extended = its weights live from its first op;
+    ifm_pre, ofm_pre: its input (output) is held elsewhere and not counted (the layer-block forwarding's test)"""
     b = _pol_blocks(nd, nd["in"], nd["out"], nbuf)
+    if ifm_pre:
+        b["ifm"] = 0
+    if ofm_pre:
+        b["ofm"] = 0
     wk, x = b["wk"], b["ps"]
     if not wk:
         return b["ifm"] + b["ofm"] + b["w"] + x
@@ -1401,6 +1406,41 @@ def _pol_fit_h(nd, nw, nbuf):
     return None
 
 
+def _pol_whole(nd, limit, ifm_pre=False, ofm_pre=False):
+    """getBestProcessingParams' whole-node part (0x3adc8c) within limit: {"whole", "nbuf", "extended"}. All weights
+    with an extended lifetime when they fit; else tryAllocateWeightsPartially's ring (FUN_003b0e2c: the largest
+    ceil(P / k), k = 2.., that fits), kept with 5 or more buffers when extended, else retried with a short lifetime;
+    all weights with a short lifetime when they fit and no ring of more than 4 buffers does. The weights' lifetime is
+    a tag the call sets on the node ("weights_have_extended_lifetime"): cleared whenever the extended forms fail,
+    also when the node is not kept whole (V: decompiled; the layer-block forwarding's side effect, forwarding())"""
+    L = nd["L"]
+    conv = L["kind"] == "conv"
+    P = nd.get("P", 0)
+
+    def ring(extended):
+        prev = 0
+        for k in range(2, P + 1):
+            nb = cdiv(P, k)
+            if nb != prev:
+                if _pol_full(nd, nb, extended, ifm_pre, ofm_pre) <= limit:
+                    return nb
+                prev = nb
+        return 0
+
+    if _pol_full(nd, 0, True, ifm_pre, ofm_pre) <= limit:
+        return {"whole": True, "nbuf": 0, "extended": True}
+    all_short = _pol_full(nd, 0, False, ifm_pre, ofm_pre) <= limit
+    nb1 = ring(True) if conv else 0
+    if not all_short:
+        if nb1 >= 5:
+            return {"whole": True, "nbuf": nb1, "extended": True}
+        nb2 = ring(False) if conv else 0
+        return {"whole": bool(nb2), "nbuf": nb2, "extended": False}
+    if nb1 > 4:
+        return {"whole": True, "nbuf": nb1, "extended": True}
+    return {"whole": True, "nbuf": 0, "extended": False}
+
+
 def _pol_best(nd):
     """getBestProcessingParams (0x3adc8c) for one node: {"tiles": (nh, nw), "nbuf": weight buffers (0 = all),
     "extended": the weights' lifetime}. Whole when it fits (all weights with an extended lifetime; else a ring of
@@ -1413,31 +1453,10 @@ def _pol_best(nd):
     conv = L["kind"] == "conv"
     P = nd.get("P", 0)
 
-    def ring(extended):         # tryAllocateWeightsPartially (FUN_003b0e2c): the largest ceil(P / k), k = 2.., that fits
-        prev = 0
-        for k in range(2, P + 1):
-            nb = cdiv(P, k)
-            if nb != prev:
-                if _pol_full(nd, nb, extended) <= SRAM_LIMIT:
-                    return nb
-                prev = nb
-        return 0
-
     if H < mh and W < mw:
-        if _pol_full(nd, 0, True) <= SRAM_LIMIT:
-            return {"tiles": (1, 1), "nbuf": 0, "extended": True}
-        all_short = _pol_full(nd, 0, False) <= SRAM_LIMIT
-        nb1 = ring(True) if conv else 0
-        if not all_short:
-            if nb1 >= 5:
-                return {"tiles": (1, 1), "nbuf": nb1, "extended": True}
-            nb2 = ring(False) if conv else 0
-            if nb2:
-                return {"tiles": (1, 1), "nbuf": nb2, "extended": False}
-        else:
-            if nb1 > 4:
-                return {"tiles": (1, 1), "nbuf": nb1, "extended": True}
-            return {"tiles": (1, 1), "nbuf": 0, "extended": False}
+        r = _pol_whole(nd, SRAM_LIMIT)
+        if r["whole"]:
+            return {"tiles": (1, 1), "nbuf": r["nbuf"], "extended": r["extended"]}
     Ho, Wo = nd["out"][1], nd["out"][2]
     for nw in range(1, cdiv(Wo, 8) + 1):
         if _pol_lengths(Wo, nw, 8) is None:
@@ -1680,6 +1699,84 @@ def _graph_policy(low, wsize=None):
     return {"order": order, "shapes": shp, "nodes": nds, "best": best, "strata": strata, "wsize": wsize}
 
 
+def forwarding(low, pol=None):
+    """NPUC's layer-block forwarding tests (LayerBlockFMSharingCalculator::calculateOptimizationParameters, one pass
+    per mode: input sharing, concat in SRAM, full forwarding; V: decompiled, oracle/ghidra/targets-graphtile2.txt):
+    a block is a fork whose readers all lead, through layers of one input and one reader, to one concat that reads
+    nothing else. Over the nodes in order, each mode holds its block's initial memory (input sharing: the head's
+    output; concat in SRAM: the concat's ("ahead_concat_size"); full forwarding: both) and tests every untiled node
+    of the block whose predecessor passed (or is the head) with getBestProcessingParams(node, 256 KiB - that - its
+    predecessor's output when the predecessor is not the head and has several readers), the input not counted when
+    the predecessor is the head (input sharing, full forwarding), the output not counted when a concat reads it
+    (concat in SRAM, full forwarding); less than one byte left: "is too fat", no test. A node passes when it stays
+    whole. Each test sets the node's weight lifetime (_pol_whole), so the last test wins (V: large random t1004,
+    t1013: the branch convs' weights live on their conv only). Returns {node: extended} for the nodes tested."""
+    ins, cons, by, src = topology(low)
+    pol = pol or graph_policy(low)
+    nds, shp = pol["nodes"], pol["shapes"]
+    tiled = {x for st in pol["strata"] for x in st["layers"]}
+    order = pol["order"]
+
+    def out_mem(n):
+        if n == src:
+            return _pol_blk(*low["input"]["chw"])
+        C, H, W = shp[n]["out"]
+        return _pol_blk(rup(C, 16) if by[n]["kind"] == "conv" else C, H, W)
+
+    def root(t):
+        while t != src and by[t]["kind"] in ("conv", "pool", "relu") and len(cons[t]) == 1 and len(ins[t]) == 1:
+            t = ins[t][0]
+        return t
+    heads = {}                              # block head -> its concat
+    for kn in order:
+        if by[kn]["kind"] != "concat":
+            continue
+        rs = {root(i) for i in ins[kn]}
+        if len(rs) != 1:
+            continue
+        r = rs.pop()
+        if r != src and by[r]["kind"] == "concat" and r in ins[kn]:
+            continue
+        # every reader of the head on a branch to this concat
+        branch = set()
+        for i in ins[kn]:
+            t = i
+            while t != r:
+                branch.add(t)
+                t = ins[t][0]
+        if all(x in branch or x == kn for x in cons.get(r, [])):
+            heads[r] = kn
+    life = {}
+    for mode in ("is", "cs", "ff"):
+        cur, mem0, ok = None, 0, set()
+        for n in [src] + order:
+            if n != src and by[n]["kind"] == "concat" and cur is not None:
+                cur = None
+            if n in heads:
+                kn = heads[n]
+                C, H, W = shp[kn]["out"]
+                cat = _pol_blk(C, H, W)
+                mem0 = {"is": out_mem(n), "cs": cat, "ff": out_mem(n) + cat}[mode]
+                cur, ok = n, {n}
+                continue
+            if cur is None or n == src or by[n]["kind"] == "concat" or n not in nds or n in tiled:
+                continue
+            if len(ins[n]) != 1 or ins[n][0] not in ok:
+                continue
+            p = ins[n][0]
+            more = out_mem(p) if p != cur and len(cons.get(p, [])) >= 2 else 0
+            mem = SRAM_LIMIT - mem0 - more
+            if mem < 1:
+                continue
+            rd = cons.get(n, [])
+            r = _pol_whole(nds[n], mem, ifm_pre=mode != "cs" and p == cur,
+                           ofm_pre=mode != "is" and bool(rd) and by[rd[0]]["kind"] == "concat")
+            life[n] = r["extended"]
+            if r["whole"]:
+                ok.add(n)
+    return life
+
+
 def node_whole(nd, limit):
     """getBestProcessingParams(node, limit) keeps the node whole with all its weights (the test NPUC's layer-block
     forwarding makes of a block's nodes with the SRAM the block leaves, LayerBlockFMSharingCalculator::
@@ -1740,7 +1837,7 @@ def _tile_dma(dmas, lay, rng, dram_vec, sram_off, load, g, ns0=False, pool=False
                 if pool and pl_ < pp:
                     pl_ = pp - pp % 2
             sdram = _blob(dram_vec, i * lay["per_idp"] + doff, 1, pl_, h, w, ws=ws, cs=lay["plane"] - dspan)
-            ssram = _blob(i, sram_off, 1, pl_, h, w, ns=0 if ns0 or pl_ == 1 else IDP_STRIDE - pl_ * h * w)
+            ssram = _blob(i, sram_off, 1, pl_, h, w, ns=0 if pl_ == 1 or sram_off == 0 else IDP_STRIDE - pl_ * h * w)
             dmas.append((g, 0, sdram, ssram) if load else (g, 1, ssram, sdram))
 
 

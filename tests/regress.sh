@@ -5,11 +5,10 @@
 #   tests/regress.sh [set...]       (default: every set under $NCPGEN_WORK/sweep)
 # Prints "<set>: <exact> of <n>" per set and a total. Known misses: graph 93/98 and graph-random2 64/66 (NPUC's own
 # uninitialised bytes, docs/oracle.md); grelu/r 1/5 (hand-edited net.npuc files whose lowered.json does not describe the
-# compiled network: ncpgen refuses them); zoo 4 (mobilenet-v1-100-224: a CMDQ cut in a tiled plan's single block;
-# mobilenet-v2-100-224, resnet18-96, resnet18-224: NPUC's trim and spill inside a graph, weight rings in a graph: not
-# modelled, models/README.md); graph-large 9 (5 trim and spill or graph rings, a tiled read-back in a graph, a tiled
-# layer whose input heads a concat's branches, a layer-block only a weight ring fits, t1016's io batch id: frame.md
-# 6.11). Every other set must be exact. Exit 0 when only those known misses remain.
+# compiled network: ncpgen refuses them); zoo 1 (mobilenet-v1-100-224: a CMDQ cut and a spill in a tiled plan's single
+# blocks: not modelled, models/README.md); graph-large 4 (t1039 a tiled read-back in a graph, t1018 a tiled layer whose
+# input heads a concat's branches, t1038 a layer-block only a weight ring fits, t1016's io batch id: frame.md 6.11).
+# Every other set must be exact. Exit 0 when only those known misses remain.
 # The sets are checked in parallel: REGRESS_JOBS (default: the CPU count).
 set -uo pipefail
 . "$(dirname "$0")/../oracle/env.sh"
@@ -19,7 +18,7 @@ if [ $# -gt 0 ]; then sets=("$@"); else
   mapfile -t sets < <(find . -mindepth 3 -name lowered.json -path '*/*/lowered.json' | sed 's|^\./||; s|/[^/]*/lowered.json$||' | sort -u)
 fi
 tot=0; ok=0; bad=0
-declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=4 [graph-large]=9)
+declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=1 [graph-large]=4)
 J=${REGRESS_JOBS:-$(sysctl -n hw.ncpu 2> /dev/null || nproc 2> /dev/null || echo 4)}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # one check per set, J at a time; the results are printed in the sets' order
