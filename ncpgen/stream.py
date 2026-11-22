@@ -38,8 +38,8 @@ if not __package__:     # run as a script: the package is this file's directory
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ncpgen import frame, grelu, weights  # noqa: E402
-from ncpgen.common import (CMDQ, INTC, MTC, NFU, cdiv, concat_in_sram, decode_isa, encode_isa,  # noqa: E402
-                           exec_order, is_graph, multiplier, ncp_parts, requant, scale_value, set_reg_addr,
+from ncpgen.common import (CMDQ, INTC, MTC, NFU, Memo, cdiv, concat_in_sram, decode_isa, encode_isa,  # noqa: E402
+                           exec_order, is_graph, multiplier, ncp_parts, network_key, requant, scale_value, set_reg_addr,
                            set_reg_op, GRAPH_KINDS)
 
 
@@ -114,9 +114,23 @@ def layer_shift(layer):
     return requant(multiplier(*(scale_value(layer[k]) for k in ("in_scale", "w_scale", "out_scale"))))[2]
 
 
-def grelu_writes(layer, quant_mode, p, fixed=False):
+def grelu_writes(layer, quant_mode, p, fixed=False, cache=None):
     """the activation table's writes for pass p of a conv, CMDQ 0x401e0050 = 1 ... = 0 included: grelu.grelu_regs
-    (every pass's block), split here at the 0x401e0050 brackets"""
+    (every pass's block), split here at the 0x401e0050 brackets. cache: a dict kept while one plan is emitted (the
+    layer's blocks are made once, not once per pass)"""
+    hit = cache.get((id(layer), quant_mode, fixed)) if cache is not None else None
+    if hit is not None and hit[0] is layer:
+        blocks = hit[1]
+    else:
+        blocks = _grelu_blocks(layer, quant_mode, fixed)
+        if cache is not None:
+            cache[(id(layer), quant_mode, fixed)] = (layer, blocks)
+    if p >= len(blocks):
+        raise Unsupported("grelu.py gave %d blocks, pass %d wanted" % (len(blocks), p))
+    return blocks[p]
+
+
+def _grelu_blocks(layer, quant_mode, fixed):
     regs = list(grelu.grelu_regs(layer, quant_mode, fixed=fixed))
     blocks, cur = [], None
     guard = any(a == GRELU_GUARD for a, v in regs)
@@ -129,9 +143,7 @@ def grelu_writes(layer, quant_mode, p, fixed=False):
         if (a, v) == end:
             blocks.append(cur if guard else [(GRELU_GUARD, 1)] + cur + [(GRELU_GUARD, 0)])
             cur = None
-    if p >= len(blocks):
-        raise Unsupported("grelu.py gave %d blocks, pass %d wanted" % (len(blocks), p))
-    return blocks[p]
+    return blocks
 
 
 # ---- the weight blocks' geometry -------------------------------------------------------------------------------------
@@ -334,6 +346,7 @@ class Plan:
             raise Unsupported("no layer")
         self.ev = 0
         self.groups = []
+        self.grelu_cache = {}       # grelu_writes' blocks while this plan is emitted
         if is_graph(low):
             self.graph()
             return
@@ -1512,7 +1525,7 @@ def shift_code(s):
     return s << 11 | s << 6
 
 
-def emit_conv(c, op, q, fixed, tail):
+def emit_conv(c, op, q, fixed, tail, cache=None):
     L, din, dout, p = op.L, op.din, op.dout, op.p
     kh, kw = op.k
     c.w(MTC + 0x004, 0x420)
@@ -1553,7 +1566,7 @@ def emit_conv(c, op, q, fixed, tail):
     c.w(MTC + 0x580, 0xFFFFFF)
     c.w(MTC + 0x048, 0xFFFF)
     c.w(MTC + 0x04C, 0xFFFF)
-    for a, v in (grelu_writes(L, q, p, fixed) if table else []):
+    for a, v in (grelu_writes(L, q, p, fixed, cache) if table else []):
         c.w(a, v)
     c.w(MTC + 0x200, op.nsub << 16 | op.cpb)    # weight sub-batches x channels each (V: ci128s2, ci256)
     c.w(MTC + 0x0B0, cdiv(op.wo, 8) << 16)
@@ -1676,7 +1689,7 @@ def emit_group(gi, ops, plan, last, fixed):
         if op.kind == "pad":
             emit_pad(c, op, q, tail)
         elif op.kind == "conv":
-            emit_conv(c, op, q, fixed, tail)
+            emit_conv(c, op, q, fixed, tail, plan.grelu_cache)
         elif op.kind == "pool":
             emit_pool(c, op, q, tail)
         elif op.kind == "reformat":
@@ -1763,7 +1776,15 @@ def plan_dmas(low, fixed=False):
     dicts with n, flag (trig_flag), bid (the io batch id, 1-based: NPUC's SetBatchTransferInGroup on the group's event
     schedule, npuc_batch_ids; V), sgid (= the NCP group), kind (ifm / weight / store / dram), sram (byte offset
     in each core's SRAM), and for tiles: tile, core (per-core DMA) and region (rows y0..y1, columns x0..x1 of the
-    tensor: the loaded input region, or the stored output region); weight loads: layer, p (pass)."""
+    tensor: the loaded input region, or the stored output region); weight loads: layer, p (pass). Memoised by the network's
+    content (frame.py asks for it from each plan)."""
+    return _DMAS.get((network_key(low), fixed, frame._IN_STREAM), lambda: _plan_dmas(low, fixed))
+
+
+_DMAS = Memo(8)
+
+
+def _plan_dmas(low, fixed):
     plan = Plan(low)
     for gi, ops in enumerate(plan.groups):
         emit_group(gi, ops, plan, gi == len(plan.groups) - 1, fixed)

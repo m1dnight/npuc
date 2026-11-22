@@ -38,9 +38,6 @@ The format (V: byte-exact on the sweep; docs/format/weights.md has the evidence)
   zero) and the non-zero bytes in p order. Block = ncores x nloads x 2 x R x 64 bytes, core-major.
 """
 import argparse
-import collections
-import copy
-import hashlib
 import json
 import os
 import struct
@@ -49,7 +46,8 @@ import sys
 if not __package__:     # run as a script: the package is this file's directory
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ncpgen.common import cdiv, concat_in_sram, exec_order as _exec_names, has_graph_ops, ncp_parts, topology  # noqa
+from ncpgen.common import (Memo, cdiv, concat_in_sram, exec_order as _exec_names, has_graph_ops, ncp_parts,  # noqa
+                           topology, weights_digest)
 
 ROW = 64            # bytes per row of a batch (the io descriptor's w)
 SLOTS = 8           # chunks per batch
@@ -96,18 +94,18 @@ def _positions(geo):
 
 def _chunk(vals, zero):
     """vals: one stored byte (or None = absent) per position -> header + bitmap + non-zero values"""
-    bits = 0
+    bm_bytes = cdiv(len(vals), 8)
+    bm = bytearray(bm_bytes)            # bit p (LSB first) set for a stored byte that is not the zero
     nz = bytearray()
     for p, v in enumerate(vals):
         if v is not None and v != zero:
-            bits |= 1 << p
+            bm[p >> 3] |= 1 << (p & 7)
             nz.append(v)
-    bm_bytes = cdiv(len(vals), 8)
     if bm_bytes >= 0x80 or len(nz) > MAX_NZV:
         # NPUC asserts here ("(nzvSize & 0xFE00) == 0", "(bmSize & 0x80) == 0") and aborts the compile
         raise ValueError("chunk of %d positions with %d non-zero values: NPUC aborts (max %d)"
                          % (len(vals), len(nz), MAX_NZV))
-    return struct.pack(">H", bm_bytes << 9 | len(nz)) + bits.to_bytes(bm_bytes, "little") + bytes(nz)
+    return struct.pack(">H", bm_bytes << 9 | len(nz)) + bytes(bm) + bytes(nz)
 
 
 def _stored(L, quant_mode):
@@ -323,46 +321,30 @@ def conv_groups(L, quant_mode=1, planner=False):
     return geo, out
 
 
-_PACKED = collections.OrderedDict()     # conv_block's recent results by _pack_key (the packing is pure)
+_PACKED = Memo(64)      # conv_block's results by _pack_key (the packing is pure)
 
 
 def _pack_key(L, quant_mode, planner):
-    """everything conv_block's result depends on (the weights by digest)"""
+    """everything conv_block's result depends on"""
     w = L["weights_oihw_u8"]
-    try:
-        wk = hashlib.sha256(bytes(w)).digest()
-    except (TypeError, ValueError):
-        wk = tuple(w)
     return (L["cout"], L["in_chw"][0], tuple(L["k"]), tuple(L.get("stride", [1, 1])), L.get("_cpc"), L.get("_ncores"),
-            L.get("w_zp", 128), quant_mode, bool(planner), len(w), wk)
+            L.get("w_zp", 128), quant_mode, bool(planner), len(w), weights_digest(w))
 
 
 def conv_block(L, quant_mode=1, planner=False):
-    """-> (geometry, the conv's WEIGHT block): conv_groups' batches padded to R rows each, R = the largest. The
-    planner, the generator and the checks ask for the same convs many times: the result is memoised by content."""
-    key = _pack_key(L, quant_mode, planner)
-    hit = _PACKED.get(key)
-    if hit is None:
-        try:
-            geo, groups = conv_groups(L, quant_mode, planner)
-            R = cdiv(max(len(x) for core in groups for load in core for x in load), ROW)
-            blk = bytearray()
-            for core in groups:
-                for load in core:
-                    for x in load:
-                        blk += x + bytes(R * ROW - len(x))
-            geo["rows_per_batch"] = R
-            hit = (geo, bytes(blk), None)
-        except Exception as e:      # NPUC's aborts (ValueError) are as reproducible as the blocks
-            hit = (None, None, (type(e), e.args))
-        _PACKED[key] = hit
-        while len(_PACKED) > 64:
-            _PACKED.popitem(last=False)
-    else:
-        _PACKED.move_to_end(key)
-    if hit[2] is not None:
-        raise hit[2][0](*hit[2][1])
-    return copy.deepcopy(hit[0]), hit[1]
+    """-> (geometry, the conv's WEIGHT block): conv_groups' batches padded to R rows each, R = the largest (memoised:
+    the planner, the stream generator and the checks ask for the same convs many times)"""
+    def pack():
+        geo, groups = conv_groups(L, quant_mode, planner)
+        R = cdiv(max(len(x) for core in groups for load in core for x in load), ROW)
+        blk = bytearray()
+        for core in groups:
+            for load in core:
+                for x in load:
+                    blk += x + bytes(R * ROW - len(x))
+        geo["rows_per_batch"] = R
+        return geo, bytes(blk)
+    return _PACKED.get(_pack_key(L, quant_mode, planner), pack)
 
 
 def weight_blocks(low):

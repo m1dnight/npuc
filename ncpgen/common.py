@@ -1,5 +1,9 @@
 """What the parts of ncpgen share: NPUC's integer and float32 arithmetic, a network's topology as NPUC reads it, the
-CMDQ instruction encoding, and the sections of an NCP (docs/format/)."""
+CMDQ instruction encoding, the sections of an NCP (docs/format/), and memoisation of the pure planners."""
+import collections
+import copy
+import hashlib
+import json
 import struct
 
 
@@ -191,3 +195,51 @@ def first_diff(a, b):
         if a[i] != b[i]:
             return i
     return min(len(a), len(b)) if len(a) != len(b) else None
+
+
+# ---- memoisation --------------------------------------------------------------------------------------------------
+class Memo:
+    """the latest `size` results of a pure computation by a hashable key, handed out as deep copies (callers may change
+    them); an exception it raised is raised again, same type and arguments. The planners, the stream generator and the
+    container ask each other for the same plans and weight blocks many times per network."""
+
+    def __init__(self, size):
+        self.size = size
+        self.d = collections.OrderedDict()
+
+    def get(self, key, compute):
+        hit = self.d.get(key)
+        if hit is None:
+            try:
+                hit = (compute(), None)
+            except Exception as e:
+                hit = (None, (type(e), e.args))
+            self.d[key] = hit
+            while len(self.d) > self.size:
+                self.d.popitem(last=False)
+        else:
+            self.d.move_to_end(key)
+        if hit[1] is not None:
+            raise hit[1][0](*hit[1][1])
+        return copy.deepcopy(hit[0])
+
+
+def weights_digest(w):
+    """a hashable digest of a weight list (uint8 values: through bytes; anything else as a tuple)"""
+    try:
+        return hashlib.sha256(bytes(w)).digest()
+    except (TypeError, ValueError):
+        return tuple(w)
+
+
+def network_key(low):
+    """a hashable digest of everything in a lowered network (weights by weights_digest)"""
+    def weightless(L):
+        L = dict(L)
+        if "weights_oihw_u8" in L:
+            d = weights_digest(L["weights_oihw_u8"])
+            L["weights_oihw_u8"] = d.hex() if isinstance(d, bytes) else repr(d)
+        return L
+    rest = {k: v for k, v in low.items() if k != "layers"}
+    text = json.dumps([rest, [weightless(L) for L in low.get("layers", [])]], sort_keys=True, default=repr)
+    return hashlib.sha256(text.encode()).digest()

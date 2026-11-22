@@ -44,8 +44,8 @@ if not __package__:     # run as a script: the package is this file's directory
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ncpgen import stream, weights  # noqa: E402
-from ncpgen.common import (MV_IM, MV_IN, MV_OT, MV_P0, MV_WT, cdiv, decode_isa, first_diff, is_graph,  # noqa: E402
-                           ncp_header, ncp_parts, ncp_vectors, rup)
+from ncpgen.common import (MV_IM, MV_IN, MV_OT, MV_P0, MV_WT, Memo, cdiv, decode_isa, first_diff, is_graph,  # noqa
+                           ncp_header, ncp_parts, ncp_vectors, network_key, rup)
 
 # ---- constants of the format (V: NCPObjectGenerator2020::PackingHeader, dossier/npu-compiler.md 1.2) ----------------
 MAGIC1, MAGIC2 = 0x0C0FFEE0, 0xC0DEC0DE
@@ -547,7 +547,19 @@ def plan(low, weight_sizes=None, strict=True, fix_npuc=False):
     tell (for callers that only need the structure).
     fix_npuc=True writes the two DMA strides NPUC gets wrong (G until run on the NPU, docs/format/frame.md
     'NPUC defects'): the gathered read-back of one-plane-per-IDP outputs (c_stride 0, not -2*plane) and the store of
-    a conv whose input was widened (DRAM c_stride 0); default False = NPUC's bytes."""
+    a conv whose input was widened (DRAM c_stride 0); default False = NPUC's bytes.
+    Memoised by the network's content (stream.py and this module ask for the same plan many times)."""
+    if _POL_TRACE is not None:     # frame_sweep.py's trace of the policy's estimates: computed, not remembered
+        return _plan(low, weight_sizes, strict, fix_npuc)
+    key = (network_key(low), None if weight_sizes is None else tuple(weight_sizes), bool(strict), bool(fix_npuc),
+           _IN_STREAM)
+    return _PLANS.get(key, lambda: _plan(low, weight_sizes, strict, fix_npuc))
+
+
+_PLANS = Memo(16)
+
+
+def _plan(low, weight_sizes, strict, fix_npuc):
     if is_graph(low):
         return plan_graph(low, weight_sizes)
     layers = low["layers"]
