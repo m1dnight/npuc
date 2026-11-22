@@ -138,6 +138,9 @@ zoo-mobilenet-v2-035|zoo:mobilenet-v2-035|--quant 3 --allow-none|63fa4fb0928d750
 zoo-mobilenet-v2-035-dense|zoo:mobilenet-v2-035-dense|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590
 zoo-ds-cnn|zoo:ds-cnn|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
 zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
+zoo-mobilenet-v1-050-224|zoo:mobilenet-v1-050-224|--allow-none|5fd12f486586d06f3a145e67248c24df6245dd42454b0435f52bd423b8baed82
+zoo-mobilenet-v2-035-224|zoo:mobilenet-v2-035-224|--quant 3 --allow-none|5e85515a63d6f07c7ce4ca15d3c1e2bfc7c591d2fd76922f5cdc4dc5d16b15cc
+zoo-squeezenet11-224-npu|zoo:squeezenet11-224-npu||bd99ab41ec3d242b784b1773a329fd1434226d3610b35e6adc007dd34700f461
 restride-s-conv2x1-fc|restride:s-conv2x1-fc|--allow-none|5d3a8bda7bc46578996776bd6e151cef3df381ecf89e06f1868e2b57e1dd191e
 restride-s-conv1x3-fc|restride:s-conv1x3-fc|--allow-none|dd96df281f1fb8bae7f7d7700cbc0e2a6ec012df30ed92bb3e6cda54d68eae14
 restride-s-conv3-fc|restride:s-conv3-fc|--allow-none|cbd3e6dbdc0be6b81461a918ec2afc11350e9fd1dffe2e1a916e8f552ae3565e

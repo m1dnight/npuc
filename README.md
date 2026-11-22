@@ -12,8 +12,8 @@ gets wrong (its activation table, below).
 
 | | |
 |---|---|
-| Byte-exact with NPUC | every compiled network of every developed set (about 3450 networks, `tests/regress.sh`) except 7 whose NCPs NPUC fills with uninitialised bytes (it differs from itself) and 3 graph blocks NPUC tiles inside a graph (ncpgen refuses them) |
-| Common models | `models/`: 20 of 24 generated exactly, among them LeNet-5, CIFAR CNNs, ResNet-8, SqueezeNet, VGG-11, a YOLOv2-tiny, MobileNet v1 0.25 and v2 0.35, DS-CNN, the MLPerf Tiny autoencoder; 3 more after a named rewrite (NPUC refuses strides above 2), 1 that NPUC itself fails on (`models/README.md`) |
+| Byte-exact with NPUC | every compiled network of every developed set (about 3450 networks, `tests/regress.sh`) except 7 whose NCPs NPUC fills with uninitialised bytes (it differs from itself); layers NPUC tiles inside a graph included (graph-split 18/18, unseen large random graphs 31/40) |
+| Common models | `models/`: 20 of 24 generated exactly, among them LeNet-5, CIFAR CNNs, ResNet-8, SqueezeNet, VGG-11, a YOLOv2-tiny, MobileNet v1 0.25 and v2 0.35, DS-CNN, the MLPerf Tiny autoencoder; 3 more after a named rewrite (NPUC refuses strides above 2), 1 that NPUC itself fails on; at standard resolutions (224 px) MobileNet v1 0.5, MobileNet v2 0.35 and SqueezeNet 1.1 exact, MobileNet v1 1.0, v2 1.0 and ResNet-18 not yet (NPUC's trim and spill inside a graph, `models/README.md`) |
 | Without any vendor file | `tests/run.sh`: our own networks (the corpus, a final unseen set, the zoo) regenerated, each NCP equal by sha256 to NPUC's, and the zoo's TFLite forms checked |
 | On the NPU | the example network (`ncpgen gen` of npunet's example writes the exact NCP of a bit-exact NPU run); the rest is predicted, with a run plan in the porting kit |
 
@@ -23,8 +23,8 @@ MAX/AVERAGE_POOL_2D (strides up to 2-3, as NPUC allows), global average pooling 
 packing limits), FULLY_CONNECTED (as a conv), ADD (quant mode 3, power-of-two scales), CONCATENATION (channels),
 standalone RELU; RESHAPE and SOFTMAX after the NPU part run on the CPU. Quant modes 1 (uint8) and 3 (int8), one weight
 scale per layer (per-channel scales folded with `--fold-per-channel`, lossy). Large layers: NPUC's tiling policy (read
-from its code), weight rings, its command-queue split, its batch scheduling. Not yet: other activations (leaky ReLU,
-SiLU), upsampling, channel split, several outputs, tiling inside a graph.
+from its code), inside graphs too, weight rings, its command-queue split, its batch scheduling. Not yet: other
+activations (leaky ReLU, SiLU), upsampling, channel split, several outputs, NPUC's trim and spill inside a graph.
 
 NPUC's defects ncpgen knows (`docs/format/grelu.md`, `docs/format/frame.md` section 9): its activation (GReLU) table is
 the DRUs' slope and zero-point slots read as one piece table, right only when ceil(Cout/8) is even; ncpgen writes the

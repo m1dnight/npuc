@@ -262,6 +262,14 @@ class Net:
         H, W, _ = self.T[inp or self.cur]["hwc"]
         return self.pool("avg", (H, W), (H, W), "valid", inp, name)
 
+    def gap1(self, inp=None, name=None):
+        """a global average pool as an AVERAGE_POOL_2D of the map's size at stride 1, VALID: one output, the same
+        function as kernel = stride = the map (NPUC's NFU pooling takes strides up to 3 and kernels up to 8, V:
+        $NCPGEN_WORK/zoo-evidence/probe-gap7; npunet lowers a larger stride as an identity conv, too big over 1024
+        channels)"""
+        H, W, _ = self.T[inp or self.cur]["hwc"]
+        return self.pool("avg", (H, W), 1, "valid", inp, name)
+
     def mean(self, name=None):
         """a global average pool as Keras' GlobalAveragePooling2D converts: MEAN over H and W, keep_dims false (an
         [1, C] output), the input's quantisation"""
@@ -571,7 +579,7 @@ def _fire(n, s, e):
        adapt=COMMON[1:] + ["the two expand convs of a fire module share one output quantisation (NPUC's concat copies "
                            "bytes; TFLite's converter does the same for CONCATENATION)",
                            "1000 ImageNet classes -> 10"])
-def _squeeze(n):
+def _squeeze(n, classes=10, npu_tail=False):
     n.conv(64, 3, s=2, pad="valid")
     n.pool("max", 3, 2)
     _fire(n, 16, 64)
@@ -584,7 +592,9 @@ def _squeeze(n):
     _fire(n, 48, 192)
     _fire(n, 64, 256)
     _fire(n, 64, 256)
-    n.conv(10, 1, name="classifier")
+    n.conv(classes, 1, name="classifier")
+    if npu_tail:
+        return                  # the 13x13 global average pool and the softmax on the CPU
     n.mean()
     n.softmax()
 
@@ -696,12 +706,19 @@ def _mnv1_dense(n):
     _mnv1(n)
 
 
-def _mnv2(n):
-    n.conv(16, 3, s=2, act="relu6")
+# MobileNet v2 widths per alpha (keras.applications: _make_divisible by 8): first conv, first block, then the
+# inverted residual stages (expansion t, channels c, repeats, stride of the first)
+MNV2_035 = (16, 8, ((6, 8, 2, 2), (6, 16, 3, 2), (6, 24, 4, 2), (6, 32, 3, 1), (6, 56, 3, 2), (6, 112, 1, 1)))
+MNV2_100 = (32, 16, ((6, 24, 2, 2), (6, 32, 3, 2), (6, 64, 4, 2), (6, 96, 3, 1), (6, 160, 3, 2), (6, 320, 1, 1)))
+
+
+def _mnv2(n, widths=MNV2_035, gap1=False):
+    first, b0, blocks = widths
+    n.conv(first, 3, s=2, act="relu6")
     n.dw(3, 1, act="relu6")
-    n.conv(8, 1, act="none")
-    cin = 8
-    for t, c, rep, s in ((6, 8, 2, 2), (6, 16, 3, 2), (6, 24, 4, 2), (6, 32, 3, 1), (6, 56, 3, 2), (6, 112, 1, 1)):
+    n.conv(b0, 1, act="none")
+    cin = b0
+    for t, c, rep, s in blocks:
         for i in range(rep):
             x = n.cur
             n.conv(cin * t, 1, act="relu6", inp=x)
@@ -711,7 +728,11 @@ def _mnv2(n):
                 n.add(x, y)
             cin = c
     n.conv(1280, 1, act="relu6")
-    n.mean()
+    if gap1:
+        n.gap1()
+        n.flatten()
+    else:
+        n.mean()
     n.fc(1000, act="none")
     n.softmax()
 
@@ -767,6 +788,108 @@ def _dscnn_dense(n):
     _dscnn(n)
 
 
+# ---- standard resolutions: the common ImageNet models at the input sizes they are published at ----------------------
+def _mnv1_std(n, alpha):
+    n.conv(int(32 * alpha), 3, s=2, act="relu6")
+    for c, s in ((64, 1), (128, 2), (128, 1), (256, 2), (256, 1), (512, 2)) + ((512, 1),) * 5 + ((1024, 2), (1024, 1)):
+        n.dw(3, s, act="relu6")
+        n.conv(int(c * alpha), 1, act="relu6")
+    n.gap1()
+    n.conv(1000, 1, act="none", name="logits")
+    n.flatten()
+    n.softmax()
+
+
+MNV1_STD_SRC = ("MobileNet v1 %s (Howard et al. 2017; keras.applications MobileNet alpha %s at 224x224: conv 3x3/2, 13 "
+                "depthwise-separable blocks, %d..%d channels, global average pool, 1x1 conv to 1000 classes)")
+GAP1_AD = ("the 7x7 global average pool as a 7x7 stride-1 VALID average pool (one output: the same function; NPUC's "
+           "NFU pools take strides up to 3, and npunet's identity-conv form of a stride-7 pool is %d x %d x 7 x 7 "
+           "weights)")
+MNV1_STD_AD = COMMON + ["ReLU6 at TFLite's 6/255 (zp -128)", GAP1_AD % (1024, 1024), "the logits conv: --allow-none"]
+
+
+@model("mobilenet-v1-100-224", "mobilenet-v1-100-224", MNV1_STD_SRC % ("1.0", "1.0", 32, 1024),
+       "ImageNet 224x224x3, 1000 classes", adapt=MNV1_STD_AD)
+def _mnv1_100_224(n):
+    _mnv1_std(n, 1.0)
+
+
+@model("mobilenet-v1-050-224", "mobilenet-v1-050-224", MNV1_STD_SRC % ("0.5", "0.5", 16, 512),
+       "ImageNet 224x224x3, 1000 classes", adapt=MNV1_STD_AD[:3] + [GAP1_AD % (512, 512)] + MNV1_STD_AD[4:])
+def _mnv1_050_224(n):
+    _mnv1_std(n, 0.5)
+
+
+MNV2_STD_SRC = ("MobileNet v2 %s (Sandler et al. 2018; keras.applications MobileNetV2 alpha %s at 224x224: 17 inverted "
+                "residual blocks, %s channels, conv 1280, 1000 classes)")
+
+
+@model("mobilenet-v2-100-224", "mobilenet-v2-100-224", MNV2_STD_SRC % ("1.0", "1.0", "16..320"),
+       "ImageNet 224x224x3, 1000 classes", adapt=MNV2_AD[:3] + [GAP1_AD % (1280, 1280)] + MNV2_AD[3:])
+def _mnv2_100_224(n):
+    _mnv2(n, MNV2_100, gap1=True)
+
+
+@model("mobilenet-v2-035-224", "mobilenet-v2-035-224", MNV2_STD_SRC % ("0.35", "0.35", "8..112"),
+       "ImageNet 224x224x3, 1000 classes", adapt=MNV2_AD[:3] + [GAP1_AD % (1280, 1280)] + MNV2_AD[3:])
+def _mnv2_035_224(n):
+    _mnv2(n, MNV2_035, gap1=True)
+
+
+def _resnet18(n):
+    n.conv(64, 7, s=2)
+    x = n.pool("max", 3, 2, pad="same")
+    for c, s in ((64, 1), (128, 2), (256, 2), (512, 2)):
+        for i in range(2):
+            st = s if i == 0 else 1
+            y = n.conv(c, 3, s=st, inp=x)
+            y = n.conv(c, 3, act="none", inp=y)
+            sc = n.conv(c, 1, s=st, pad="same", act="none", inp=x) if st != 1 else x   # TFLite: VALID (negative pad)
+            x = n.add(sc, y, act="relu")
+    n.gap(inp=x)
+    n.flatten()
+    n.fc(1000, act="none")
+    n.softmax()
+
+
+RESNET18_SRC = ("ResNet-18 (He et al. 2016; torchvision resnet18: conv 7x7/2 64, max pool 3x3/2, 4 stages of 2 basic "
+                "blocks, 64..512 channels, 1x1 stride-2 projection shortcuts, global average pool, FC 1000)")
+RESNET18_AD = COMMON[:1] + ["every activation scale a power of two and every zero point 0 (quant 3): NPUC's Eltwise add "
+                            "aligns by shifts only and has no zero-point term",
+                            "explicit padding -> TFLite SAME (pad bottom/right for the stride-2 layers)",
+                            "no activation on the second conv of each block and on the shortcuts: --allow-none"]
+
+
+@model("resnet18-224", "resnet18-224", RESNET18_SRC, "ImageNet 224x224x3, 1000 classes", adapt=RESNET18_AD)
+def _resnet18_224(n):
+    _resnet18(n)
+
+
+@model("resnet18-96", "resnet18-96", RESNET18_SRC, "96x96x3 images, 1000 classes", adapt=RESNET18_AD)
+def _resnet18_96(n):
+    _resnet18(n)
+
+
+@model("squeezenet11-224", "squeezenet11-224", "SqueezeNet 1.1 (Iandola et al. 2016; the v1.1 reference: conv1 3x3/2 64, "
+       "fire2-9, conv10 1000, global average pool)", "ImageNet 224x224x3, 1000 classes",
+       adapt=COMMON[1:] + ["the two expand convs of a fire module share one output quantisation (NPUC's concat copies "
+                           "bytes; TFLite's converter does the same for CONCATENATION)"])
+def _squeeze224(n):
+    _squeeze(n, 1000)
+
+
+@model("squeezenet11-224-npu", "squeezenet11-224", "SqueezeNet 1.1 (Iandola et al. 2016; the v1.1 reference: conv1 3x3/2 "
+       "64, fire2-9, conv10 1000, global average pool)", "ImageNet 224x224x3, 1000 classes",
+       adapt=COMMON[1:] + ["the two expand convs of a fire module share one output quantisation (NPUC's concat copies "
+                           "bytes; TFLite's converter does the same for CONCATENATION)",
+                           "the NPU part ends at conv10 (13x13x1000); the global average pool and the softmax run on "
+                           "the CPU: NPUC's NFU pools take kernels up to 8 (V: 8x8 compiles, 9..13 'ncp_nfu_pooling: "
+                           "Invalid parameters!') and the identity-conv form is 1000 x 1000 x 13 x 13 weights"],
+       expect="exact")
+def _squeeze224_npu(n):
+    _squeeze(n, 1000, npu_tail=True)
+
+
 # the input of each family: shape, quantisation (scale, zero point), quant mode, power-of-two activations
 INPUTS = {
     "lenet5": ((28, 28, 1), 1 / 255, -128, 1, False), "keras-mnist-cnn": ((28, 28, 1), 1 / 255, -128, 1, False),
@@ -779,6 +902,12 @@ INPUTS = {
     "vgg11-64": ((64, 64, 3), 1 / 255, -128, 1, False), "yolov2-tiny-128": ((128, 128, 3), 1 / 255, -128, 1, False),
     "mobilenet-v1-025": ((96, 96, 1), 1 / 255, -128, 1, False), "mobilenet-v2-035": ((96, 96, 3), 1 / 128, 0, 3, True),
     "ds-cnn": ((49, 10, 1), 0.6, 80, 1, False),
+    "mobilenet-v1-100-224": ((224, 224, 3), 1 / 255, -128, 1, False),
+    "mobilenet-v1-050-224": ((224, 224, 3), 1 / 255, -128, 1, False),
+    "mobilenet-v2-100-224": ((224, 224, 3), 1 / 128, 0, 3, True),
+    "mobilenet-v2-035-224": ((224, 224, 3), 1 / 128, 0, 3, True),
+    "resnet18-224": ((224, 224, 3), 1 / 128, 0, 3, True), "resnet18-96": ((96, 96, 3), 1 / 128, 0, 3, True),
+    "squeezenet11-224": ((224, 224, 3), 1 / 255, -128, 1, False),
 }
 
 

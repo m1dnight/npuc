@@ -429,7 +429,8 @@ copy's start/end test. `frame_sweep.py policy <dirs>` checks the policy against 
 getBestProcessingParams for every node from the output back (computeTilesNumber; a ReLU as its 1x1 dummy conv, a
 concat skipped), the IFM rounded to 16 channels behind a conv; recalculateTilingForStratum grows chains along single
 links only (a node's one predecessor read by it alone, V: the decompile's predecessor/successor counts), so a stratum
-never crosses a fork, a join or a concat. V: the tile count of every tiled node and every stratum NPUC prints in the
+never crosses a fork, a join or a concat; a node feeding an eltwise neither starts nor joins one (V: large random t1002,
+G: the type test before a chain starts). V: the tile count of every tiled node and every stratum NPUC prints in the
 seven tiled zoo compiles and the 40 large random graphs (cat128-128: c1, c2 in 3 row tiles each, c3 in 32;
 mobilenet-v2-100-224: {conv3, dw2} in 4, dw4 in 2; squeezenet11-224-npu: {conv1, pool1} in 2).
 
@@ -443,9 +444,17 @@ POOL, store), its ops' chunk sizes the largest over the tiles. Its input comes f
 buffer, or a tensor its producer stores for it) and its output goes to DRAM: a concat's buffer at the producer's offset
 (the tile stores of 6.5 with that base; V: cat128-128, cat160-64), the output's IM, or an IM its readers load back. The
 chunks join the graph's allocation: the weights first citizens live over tile 0 (one-op tiles: ordinary chunks of the
-op's group), then the SPLIT alone, then tile 0's ops; its NPUC nodes take positions in the node order (the SPLIT, every
-tile's nodes, the vConcat). A reader of a stratum's output loads it into a chunk of its own, live at it only and
-allocated right after the stratum ("WCONCAT", the vConcat node's chunk; V: squeezenet11-224-npu).
+op's group), then the SPLIT alone, then tile 0's ops (a conv's WEIGHT chunk by the planner's size, as the graph's other
+convs: V t1000, a concat reader); its NPUC nodes take positions in the node order (the SPLIT, every tile's nodes, the
+vConcat). A reader of a stratum's output loads it into a chunk of its own, live at it only and allocated right after the
+stratum ("WCONCAT", the vConcat node's chunk; V: squeezenet11-224-npu, t1031); when the output heads a concat's branches
+(input sharing), one first citizen from the vConcat to the last reader, loaded by the first (V: t1016).
+
+**Clustered tile loads** (V: t1016, t1025, t1027, t1031, t1034, t1035): a tile loaded per IDP with 16 planes per IDP or
+more and a PAD or POOL first (not a TRIM: t1000, t1008) comes in 4 parts of ceil(pp / 4) planes, part by part over the
+IDPs, each part right before the NFU ops of its slots (section 5's DMACluster, as an untiled input's chunked load); a
+part's descriptor: DRAM offset + s0 x plane, c = its planes, SRAM offset + s0 x h x w, n_stride 0x40000 - planes x h x w,
+0 for the part landing at SRAM offset 0 (t1016; G: the rule behind the "direct" loads of 6.5).
 
 **Layer-block forwarding** (LayerBlockFMSharingCalculator, after the policy; read from the decompile): input sharing,
 concat in SRAM and full forwarding each hold memory for a whole fork-join block (the head's output, or the concat's
@@ -457,8 +466,10 @@ A node that would only fit with a weight ring under the reduced bound is refused
 
 **Not yet**: NPUC's trim and spill inside a graph ("Allocating splitted chunk": a long-lived tensor, a residual, split
 around a layer that cannot be allocated; resnet18-96, resnet18-224, mobilenet-v2-100-224), the policy's weight rings
-in graph layers (resnet18's 512-channel convs), a tile's per-core input loads clustered in 4 parts (cores x planes >= 64,
-section 5's DMACluster; 6 of the large random graphs), a tiled read-back in a graph, strata joined to each other.
+in graph layers (resnet18's 512-channel convs), a CMDQ cut in a tiled plan's single block (mobilenet-v1-100-224), a
+tiled read-back in a graph, strata joined to each other, a tiled layer whose input heads a concat's branches; the io
+batch id of a clustered load's last part (t1016: NPUC keeps all 16 loads in one batch). Rate on the unseen large random
+graphs: 31 of 40 (22 before the clustered loads, the shared WCONCAT and the chain rule).
 
 ## 7. The intrinsics (V: disassembled from every variant; our own A32 encoder writes them)
 

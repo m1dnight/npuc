@@ -41,7 +41,7 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
 
 ## Status (2026-11-22, NPUC root-314e61a6)
 
-**24 models: 23 exact, 1 fails in NPUC.** kws-cnn, magic-wand and alexnet-96 are exact as published since npunet
+**24 models: 23 exact, 1 fails in NPUC** (and 8 at standard resolutions, 3 exact: the next section). kws-cnn, magic-wand and alexnet-96 are exact as published since npunet
 rewrites the strides NPUC refuses (item 7; compiled with root-fd659af2): each lowers to its `-npu` variant's network,
 NPUC compiles it to that variant's NCP byte for byte, and its CPU reference is the published network's
 (`tests/rewrite_ref.py`, against a direct reference of the original graph on random inputs). Every model has its CPU
@@ -76,6 +76,14 @@ time includes npunet's lowering and was measured under a parallel load.
 | mobilenet-v2-035-dense | 96x96x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3537 KB, 24.4 s | **EXACT** (8 s) | 0cc597e5b755, 1000 B, 11.9 s |
 | ds-cnn | 49x10x1 | --allow-none | ok, 11 NPU layers | PASS, 209 KB, 2.7 s | **EXACT** (0 s) | ad2c9fdec999, 12 B, 1.7 s |
 | ds-cnn-dense | 49x10x1 | --allow-none | ok, 11 NPU layers | PASS, 209 KB, 22.2 s | **EXACT** (3 s) | ad2c9fdec999, 12 B, 2.0 s |
+| mobilenet-v1-100-224 | 224x224x3 | --allow-none | ok, 29 NPU layers | PASS, 9703 KB, 68.6 s | differs: a CMDQ cut in a tiled plan's single block (not modelled) | 22a1e37fb771, 1000 B, 296 s |
+| mobilenet-v1-050-224 | 224x224x3 | --allow-none | ok, 29 NPU layers | PASS, 3163 KB, 21.2 s | **EXACT** (4 s) | da63edc51cf4, 1000 B, 78 s |
+| mobilenet-v2-100-224 | 224x224x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 11496 KB, 90.3 s | refused: NPUC's trim and spill in a graph (not modelled) | 10ed9127ab45, 1000 B, 330 s |
+| mobilenet-v2-035-224 | 224x224x3 | --quant 3 --allow-none | ok, 64 NPU layers | PASS, 3549 KB, 24.0 s | **EXACT** (6 s) | 30bcbed0cfb8, 1000 B, 51 s |
+| resnet18-224 | 224x224x3 | --quant 3 --allow-none | ok, 39 NPU layers | PASS, 15700 KB, 29.6 s | refused: trim and spill, weight rings in a graph (not modelled) | 232aa259c426, 1000 B, 122 s |
+| resnet18-96 | 96x96x3 | --quant 3 --allow-none | ok, 39 NPU layers | PASS, 13989 KB, 29.3 s | refused: trim and spill, weight rings in a graph (not modelled) | 12534cce06ef, 1000 B, 27 s |
+| squeezenet11-224 | 224x224x3 | - | refused: pool4: a 13x13 global average pool over 1000 channels (identity conv of 1000 x 1000 x 13 x 13 weights) | - | - | - |
+| squeezenet11-224-npu | 224x224x3 | - | ok, 37 NPU layers | PASS, 1842 KB, 8.7 s | **EXACT** (30 s) | 464456bc20f2, 169000 B, 43 s |
 
 Per published model: LeNet-5, the Keras MNIST convnet and MLP, the TensorFlow CIFAR CNN, a VGG-style CIFAR CNN, the
 DCASE/MLPerf Tiny autoencoder, the TFLM sine model, SqueezeNet 1.1, VGG-11, Tiny YOLOv2 and ResNet-8 are **exact as
@@ -87,6 +95,37 @@ layer to the dense block-diagonal conv, and NPUC's NCP for the depthwise form is
 MobileNet v2 lowers and compiles the same way and is exact too (with its adaptations; its MEAN as Keras writes it);
 DS-CNN is **exact as published** too (its 25x5 global average pool as the identity conv, item 5). micro_speech **fails
 in NPUC**.
+
+## Standard resolutions (2026-11-22)
+
+**8 more models at the resolutions they are published at: 3 exact, 4 that NPUC compiles and ncpgen does not generate
+yet, 1 refused by npunet.** NPUC compiles all seven that npunet lowers. These are the models that need NPUC's tiling
+inside a graph (docs/format/frame.md 6.11): ncpgen now follows NPUC's policy over a graph's nodes, cuts the layers it
+tiles into per-tile groups exactly as in a chain, and joins them to the graph through DRAM (graph-split's three concat
+blocks, the large random graphs 31 of 40 unseen, `ncpgen/stream_graphs.py random <dir> 1000 40 --set large`).
+
+| model | NPUC | ncpgen | what NPUC does |
+|---|---|---|---|
+| mobilenet-v1-050-224 | PASS | **EXACT** | no tiling; a trim-and-spill copy before dw13 and the 512 -> 1000 classifier cut in three groups |
+| mobilenet-v2-035-224 | PASS | **EXACT** | the 56x56 dw2 in 2 row tiles inside the graph |
+| squeezenet11-224-npu | PASS | **EXACT** | conv1 + pool1 one stratum of 2 row tiles; every fire module's concat in SRAM |
+| mobilenet-v1-100-224 | PASS | differs | conv2 + dw2 a stratum of 2 row tiles; four layers cut for their CMDQ in the single blocks (the cut of a tiled plan's single block: not modelled) and weight rings of 30-32 slots there |
+| mobilenet-v2-100-224 | PASS | refused | {conv3, dw2} in 4 row tiles, dw4 in 2; the 56x56x144 depthwise blocks kept whole, which no allocation order fits beside the residual: NPUC's trim and spill inside a graph ("Allocating splitted chunk", the long-lived block input split around the layer): not modelled |
+| resnet18-96, resnet18-224 | PASS | refused | the stem (224: conv1 in 2 row tiles); the 512-channel convs with weight rings of 11-16 slots (NPUC's policy, the residual held across the block) and the same trim and spill |
+
+Findings on the way (NPUC, V):
+- **A global average pool over 1024 or 1280 channels** at 7x7: NPUC's NFU pools take strides up to 3 and kernels up to
+  8 (9..13 assert "ncp_nfu_pooling: Invalid parameters!", `$NCPGEN_WORK/zoo-evidence/probe-gap7/`), and npunet lowers
+  a stride-7 pool as an identity conv of C x C x 7 x 7 weights, which it refuses over 512 channels. The same function
+  with one output: a 7x7 pool at **stride 1** VALID; NPUC compiles it over 1024 and 1280 channels and ncpgen is exact.
+  The zoo writes the 224 models so (`Net.gap1`); npunet could lower any global pool with a 1x1 output at stride 1
+  (a lowering change, not made here: npunet.py belongs to the stride work). SqueezeNet's 13x13 pool has no such form
+  (kernel 13): its `-npu` variant ends the NPU part at conv10 and leaves the pool and softmax to the CPU.
+- **Residual blocks at 96..160 px crash NPUC** (graph-split res96-64 .. res160-64): its policy has to tile the eltwise,
+  whose back-propagator is a SingleTileBackPropagator, which asserts "Trying to split an unsplittable layer into more
+  than one tile!". NPUC compiles a residual block only while its operands and result fit 256 KiB per core
+  (`frame.graph_policy` refuses the rest); real ResNets and MobileNet v2 downsample first (56x56x64 is 150 KB), so this
+  does not matter for them.
 
 ## What ncpgen and npunet need, ranked
 
@@ -226,6 +265,13 @@ What unblocks the most models for the least work comes first. Items marked done 
    NPU: days; what folding them costs meanwhile: the section "Per-channel weight scales" below). Done (2026-11-22): `graph_to_tflite` for every op npunet lowers, so the zoo writes TFLite and the
    TFLite path is tested on real topologies (all 24 lower as their JSON; `tests/run.sh`).
 
+10. **Tiling inside a graph: what remains** (frame.md 6.11): NPUC's trim and spill inside a graph (a long-lived tensor
+   split around a layer no allocation order fits: mobilenet-v2-100-224, resnet18-*; 5 of the large random graphs);
+   the policy's weight rings in graph layers (resnet18's 512-channel convs: the stream's own ring rule ignores the
+   tensors a graph keeps live); a CMDQ cut inside a tiled plan's single block (mobilenet-v1-100-224, with its rings
+   from the policy there); a tiled read-back, a tiled layer whose input heads a concat's branches, a layer-block whose
+   nodes only fit with a ring (one large random graph each). **Effort: days** (the spill first: it unlocks three models).
+
 ## NPUC limits met here (V, the oracle)
 
 | Layer | NPUC | Seen in |
@@ -249,6 +295,9 @@ What unblocks the most models for the least work comes first. Items marked done 
 | max pool 2x2 stride 3 | refuses ("The stride value should be equal or less than the size of kernel") | 28 frame-sweep variants, probe |
 | conv kernel side > 64 | not measured (our harness takes 1..64) | gap_sweep |
 | max pool 2x2 stride 1 SAME, 3x3 stride 3 SAME/VALID on 128x3/129x3, 3x1 stride 1 on 42x1 | compile; ncpgen exact | yolov2-tiny-128, magic-wand-npu, probes |
+| average pool 7x7 stride 1 VALID over 64, 1024, 1280 channels; 8x8 stride 1 | compile; ncpgen exact | probe-gap7, the 224 models |
+| average pool 9x9 .. 13x13 (stride 1) | "ncp_nfu_pooling: Invalid parameters!" (13x13 over 1000 channels: a DynamicBuffer assertion) | probe-gap7, squeezenet11-224 |
+| eltwise add whose operands and result pass 256 KiB per core (residual blocks of 64+ channels at 96..160 px) | asserts "Trying to split an unsplittable layer into more than one tile!" (SingleTileBackPropagator) | graph-split res96-64 .. res160-64 |
 
 The probes' networks (`probe-src/`, npu-net/1 JSON, our weights; `probe-stride/<probe>/model.json`) and NPUC's outputs
 (`probe/`, `probe3/`, `probe-pool/`, `probe-stride/`, `gaplim-defect/`) are in `$NCPGEN_WORK/zoo-evidence/` (outside `sweep/`, so `regress.sh` does not take
@@ -500,3 +549,67 @@ would make per-channel scales exact.
 - **Ops**: conv2d 10x4/2, conv2d 3x3 x4, conv2d 1x1 x4, conv2d 25x5, reshape, fully_connected, softmax; 0.68 M weights; output 1x1x12; `--allow-none`
 - **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); dropout removed (inference); each depthwise 3x3 conv -> a dense 3x3 conv with block-diagonal weights (the same function); the 25x5 global average pool written as the identity conv npunet lowers it to; the output FC: --allow-none
 - **Status**: exact (lowering: ok, 11 NPU layers; NPUC: PASS, 209 KB, 22.2 s; ncpgen check: EXACT (3 s))
+
+### mobilenet-v1-100-224
+
+- **Source**: MobileNet v1 1.0 (Howard et al. 2017; keras.applications MobileNet alpha 1.0 at 224x224: conv 3x3/2, 13 depthwise-separable blocks, 32..1024 channels, global average pool, 1x1 conv to 1000 classes)
+- **Task / input**: ImageNet 224x224x3, 1000 classes; input 224x224x3 int8 (scale 0.00392157, zero point -128)
+- **Ops**: conv2d 3x3/2, depthwise 3x3 x13, conv2d 1x1 x14, average_pool2d, reshape, softmax; 4.21 M weights; output 1x1x1000; `--allow-none`
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); dropout removed (inference); ReLU6 at TFLite's 6/255 (zp -128); the 7x7 global average pool as a 7x7 stride-1 VALID average pool (one output: the same function; NPUC's NFU pools take strides up to 3, and npunet's identity-conv form of a stride-7 pool is 1024 x 1024 x 7 x 7 weights); the logits conv: --allow-none
+- **Status**: differs (lowering: ok, 29 NPU layers; NPUC: PASS, 9703 KB, 68.6 s; ncpgen check: strea - | intri count 34/40 | weigh ok | file - (9 s))
+
+### mobilenet-v1-050-224
+
+- **Source**: MobileNet v1 0.5 (Howard et al. 2017; keras.applications MobileNet alpha 0.5 at 224x224: conv 3x3/2, 13 depthwise-separable blocks, 16..512 channels, global average pool, 1x1 conv to 1000 classes)
+- **Task / input**: ImageNet 224x224x3, 1000 classes; input 224x224x3 int8 (scale 0.00392157, zero point -128)
+- **Ops**: conv2d 3x3/2, depthwise 3x3 x13, conv2d 1x1 x14, average_pool2d, reshape, softmax; 1.32 M weights; output 1x1x1000; `--allow-none`
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); dropout removed (inference); ReLU6 at TFLite's 6/255 (zp -128); the 7x7 global average pool as a 7x7 stride-1 VALID average pool (one output: the same function; NPUC's NFU pools take strides up to 3, and npunet's identity-conv form of a stride-7 pool is 512 x 512 x 7 x 7 weights); the logits conv: --allow-none
+- **Status**: exact (lowering: ok, 29 NPU layers; NPUC: PASS, 3163 KB, 21.2 s; ncpgen check: EXACT (4 s))
+
+### mobilenet-v2-100-224
+
+- **Source**: MobileNet v2 1.0 (Sandler et al. 2018; keras.applications MobileNetV2 alpha 1.0 at 224x224: 17 inverted residual blocks, 16..320 channels, conv 1280, 1000 classes)
+- **Task / input**: ImageNet 224x224x3, 1000 classes; input 224x224x3 int8 (scale 0.0078125, zero point 0)
+- **Ops**: conv2d 3x3/2, depthwise 3x3 x17, conv2d 1x1 x34, add x10, average_pool2d, reshape, fully_connected, softmax; 3.47 M weights; output 1x1x1000; `--quant 3 --allow-none`
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); the 7x7 global average pool as a 7x7 stride-1 VALID average pool (one output: the same function; NPUC's NFU pools take strides up to 3, and npunet's identity-conv form of a stride-7 pool is 1280 x 1280 x 7 x 7 weights); the linear bottlenecks and the classifier: --allow-none
+- **Status**: differs (lowering: ok, 64 NPU layers; NPUC: PASS, 11496 KB, 90.3 s; ncpgen check: strea - | intri - | weigh ok | file - (31 s))
+
+### mobilenet-v2-035-224
+
+- **Source**: MobileNet v2 0.35 (Sandler et al. 2018; keras.applications MobileNetV2 alpha 0.35 at 224x224: 17 inverted residual blocks, 8..112 channels, conv 1280, 1000 classes)
+- **Task / input**: ImageNet 224x224x3, 1000 classes; input 224x224x3 int8 (scale 0.0078125, zero point 0)
+- **Ops**: conv2d 3x3/2, depthwise 3x3 x17, conv2d 1x1 x34, add x10, average_pool2d, reshape, fully_connected, softmax; 1.66 M weights; output 1x1x1000; `--quant 3 --allow-none`
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the 10 residual ADDs; ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 saturation); the 7x7 global average pool as a 7x7 stride-1 VALID average pool (one output: the same function; NPUC's NFU pools take strides up to 3, and npunet's identity-conv form of a stride-7 pool is 1280 x 1280 x 7 x 7 weights); the linear bottlenecks and the classifier: --allow-none
+- **Status**: exact (lowering: ok, 64 NPU layers; NPUC: PASS, 3549 KB, 24.0 s; ncpgen check: EXACT (6 s))
+
+### resnet18-224
+
+- **Source**: ResNet-18 (He et al. 2016; torchvision resnet18: conv 7x7/2 64, max pool 3x3/2, 4 stages of 2 basic blocks, 64..512 channels, 1x1 stride-2 projection shortcuts, global average pool, FC 1000)
+- **Task / input**: ImageNet 224x224x3, 1000 classes; input 224x224x3 int8 (scale 0.0078125, zero point 0)
+- **Ops**: conv2d 7x7/2, max_pool2d, conv2d 3x3 x13, add x8, conv2d 3x3/2 x3, conv2d 1x1/2 x3, average_pool2d, reshape, fully_connected, softmax; 11.68 M weights; output 1x1x1000; `--quant 3 --allow-none`
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two and every zero point 0 (quant 3): NPUC's Eltwise add aligns by shifts only and has no zero-point term; explicit padding -> TFLite SAME (pad bottom/right for the stride-2 layers); no activation on the second conv of each block and on the shortcuts: --allow-none
+- **Status**: differs (lowering: ok, 39 NPU layers; NPUC: PASS, 15700 KB, 29.6 s; ncpgen check: strea - | intri - | weigh ok | file - (20 s))
+
+### resnet18-96
+
+- **Source**: ResNet-18 (He et al. 2016; torchvision resnet18: conv 7x7/2 64, max pool 3x3/2, 4 stages of 2 basic blocks, 64..512 channels, 1x1 stride-2 projection shortcuts, global average pool, FC 1000)
+- **Task / input**: 96x96x3 images, 1000 classes; input 96x96x3 int8 (scale 0.0078125, zero point 0)
+- **Ops**: conv2d 7x7/2, max_pool2d, conv2d 3x3 x13, add x8, conv2d 3x3/2 x3, conv2d 1x1/2 x3, average_pool2d, reshape, fully_connected, softmax; 11.68 M weights; output 1x1x1000; `--quant 3 --allow-none`
+- **Adaptations**: batch normalisation folded into the conv/FC before it (as the TFLite converter does); every activation scale a power of two and every zero point 0 (quant 3): NPUC's Eltwise add aligns by shifts only and has no zero-point term; explicit padding -> TFLite SAME (pad bottom/right for the stride-2 layers); no activation on the second conv of each block and on the shortcuts: --allow-none
+- **Status**: differs (lowering: ok, 39 NPU layers; NPUC: PASS, 13989 KB, 29.3 s; ncpgen check: strea - | intri - | weigh ok | file - (10 s))
+
+### squeezenet11-224
+
+- **Source**: SqueezeNet 1.1 (Iandola et al. 2016; the v1.1 reference: conv1 3x3/2 64, fire2-9, conv10 1000, global average pool)
+- **Task / input**: ImageNet 224x224x3, 1000 classes; input 224x224x3 int8 (scale 0.00392157, zero point -128)
+- **Ops**: conv2d 3x3/2, max_pool2d x3, conv2d 1x1 x17, conv2d 3x3 x8, concat x8, mean, softmax; 1.23 M weights; output 1x1x1000; `--quant 1`
+- **Adaptations**: dropout removed (inference); the two expand convs of a fire module share one output quantisation (NPUC's concat copies bytes; TFLite's converter does the same for CONCATENATION)
+- **Status**: refused (lowering: refused: pool4: a global average pool over 1000 channels as a conv needs 1000 x 1000 x 13 x 13 weights (NPUC compiles 512 x 512 x 7 x 7 in seconds; 1024 channels did not finish): reduce the channels first; NPUC: -; ncpgen check: -)
+
+### squeezenet11-224-npu
+
+- **Source**: SqueezeNet 1.1 (Iandola et al. 2016; the v1.1 reference: conv1 3x3/2 64, fire2-9, conv10 1000, global average pool)
+- **Task / input**: ImageNet 224x224x3, 1000 classes; input 224x224x3 int8 (scale 0.00392157, zero point -128)
+- **Ops**: conv2d 3x3/2, max_pool2d x3, conv2d 1x1 x17, conv2d 3x3 x8, concat x8; 1.23 M weights; output 13x13x1000; `--quant 1`
+- **Adaptations**: dropout removed (inference); the two expand convs of a fire module share one output quantisation (NPUC's concat copies bytes; TFLite's converter does the same for CONCATENATION); the NPU part ends at conv10 (13x13x1000); the global average pool and the softmax run on the CPU: NPUC's NFU pools take kernels up to 8 (V: 8x8 compiles, 9..13 'ncp_nfu_pooling: Invalid parameters!') and the identity-conv form is 1000 x 1000 x 13 x 13 weights
+- **Status**: exact (lowering: ok, 37 NPU layers; NPUC: PASS, 1842 KB, 8.7 s; ncpgen check: EXACT (30 s))

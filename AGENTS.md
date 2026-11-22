@@ -17,7 +17,8 @@ the compiler, and it is tested on the host against NPUC.
    it must never emit bytes it has not matched against NPUC.
 4. **Test before every commit.** `tests/run.sh` (no vendor file; must PASS) for any change. For a change to a part
    (`stream.py`, `frame.py`, `weights.py`, `grelu.py`, `npunet.py`): also `tests/regress.sh`, which checks every compiled
-   set in `work/sweep` (only the known misses allowed: graph 93/98, graph-random2 64/66, NPUC's own uninitialised bytes).
+   set in `work/sweep` (only the known misses allowed: graph 93/98, graph-random2 64/66, NPUC's own uninitialised
+   bytes; zoo 4 and graph-large 9: trim and spill inside a graph and the rest of frame.md 6.11's list).
    A change meant to change no output (a refactor, a speed-up): `tests/snapshot.py compare` against a snapshot the code
    before it recorded must say IDENTICAL. Say the numbers in the commit message.
 5. **New networks become regression data.** A new sweep goes to `work/sweep/<name>/` (one folder per variant, as
@@ -44,10 +45,12 @@ Python: `python3 -I`, standard library only. The host has docker (arm64 containe
 
 ## Where things stand (2026-11-22)
 
-Byte-exact with NPUC on every compiled network (`tests/regress.sh`) except NPUC's 7 uninitialised-byte eltwises and 3
-graph blocks NPUC tiles inside a graph. Common models: `models/` (20 of 24 exact; models/README.md). Depthwise is lowered
+Byte-exact with NPUC on every compiled network (`tests/regress.sh`) except NPUC's 7 uninitialised-byte eltwises and the
+listed misses of the zoo's standard-resolution models and of graph-large (NPUC's trim and spill inside a graph, not
+modelled: docs/format/frame.md 6.11). Tiling inside a graph follows NPUC's policy (frame.graph_policy). Common models:
+`models/` (models/README.md). Depthwise is lowered
 to the dense block-diagonal conv NPUC itself compiles (docs/format/depthwise.md; NPUC's own depthwise-optimised path is
-off on the device and unproven on the NPU). Not supported yet: tiling inside a graph, channel split/slice, other
+off on the device and unproven on the NPU). Not supported yet: trim and spill inside a graph, channel split/slice, other
 activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling (NPUC's deconvolution crashed in the
 harness), several outputs. Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the
 nervesinator porting kit).

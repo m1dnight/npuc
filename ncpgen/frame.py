@@ -918,8 +918,10 @@ def plan_graph(low, weight_sizes=None):
                 while j < len(dmas) and dmas[j][2] == g and dmas[j][0].kind == "load" and \
                         getattr(dmas[j][0], "tile", None) == op.tile and getattr(dmas[j][0], "what", None) == "ifm":
                     j += 1
-                _tile_dma(got, cell(*chw[op.tensor]), (r0, r1 - 1, c0, c1 - 1), tvec(op.tensor), op.sram, True, g,
-                          ns0=getattr(op, "ns0", False))
+                lay = cell(*chw[op.tensor])
+                _tile_dma(got, lay, (r0, r1 - 1, c0, c1 - 1), tvec(op.tensor), op.sram, True, g,
+                          ns0=getattr(op, "ns0", False),
+                          parts=op.slots[1] - op.slots[0] if getattr(op, "slots", None) else None)
             else:
                 j = k + len(op.flags)
                 prod = getattr(op, "prod", gl[g])
@@ -1642,6 +1644,10 @@ def _graph_policy(low, wsize=None):
             continue
         cand = tnr[n]
         p = pred1(n)
+        if any(by[r]["kind"] == "eltwise" for r in cons.get(n, [])):
+            # a node feeding an eltwise neither starts nor joins a stratum (V: large random t1002, a tiled residual
+            # block input left alone; G: the decompile's type test before a chain starts)
+            continue
         if not cand and p is not None and tnr[p]:
             s = succ1(n)
             if s is not None and tnr[s]:
@@ -1686,11 +1692,12 @@ def node_whole(nd, limit):
     return _pol_full(nd, 0, True) <= limit or _pol_full(nd, 0, False) <= limit
 
 
-def _tile_dma(dmas, lay, rng, dram_vec, sram_off, load, g, ns0=False, pool=False, base=0):
+def _tile_dma(dmas, lay, rng, dram_vec, sram_off, load, g, ns0=False, pool=False, base=0, parts=None):
     """one tile's DMAs between a DRAM tensor (IDP-major, real planes) and the SRAM (V: H tiles use h = rows, w = 2Wp;
     tiles narrower than the tensor use cell rows, w = cells * 64 and a DRAM w_stride; more than one plane per IDP: one
     DMA per IDP through its own SRAM vector, planes contiguous in SRAM). base: the tensor's offset in the DRAM vector
-    (a graph's concat buffer, frame.md 6.8)"""
+    (a graph's concat buffer, frame.md 6.8). parts: a per-IDP load in 4 parts of that many planes, part by part over
+    the IDPs (NPUC's DMACluster; 6.11)"""
     r0, r1, c0, c1 = rng
     rows = rup(r1 - r0 + 1, 4)
     cells_row = lay["Wp"] // 8
@@ -1712,6 +1719,17 @@ def _tile_dma(dmas, lay, rng, dram_vec, sram_off, load, g, ns0=False, pool=False
         sdram = _blob(dram_vec, doff, 1, n, h, w, ws=ws, cs=lay["per_idp"] - dspan if n > 1 else 0)
         ssram = _blob(0, sram_off, 1, n, h, w, cs=(IDP_STRIDE - h * w) if n > 1 else 0)
         dmas.append((g, 0, sdram, ssram) if load else (g, 1, ssram, sdram))
+    elif parts and load:
+        for s0 in range(0, pp, parts):
+            q = min(pp, s0 + parts) - s0
+            for i in range(n):
+                sdram = _blob(dram_vec, i * lay["per_idp"] + s0 * lay["plane"] + doff, 1, q, h, w, ws=ws,
+                              cs=lay["plane"] - dspan)
+                # V: no n_stride for the part landing at SRAM offset 0 (large random t1016's first part; t1031's
+                # parts at 7040.. all keep it); G: the rule behind the "direct" loads above
+                o = sram_off + s0 * h * w
+                ssram = _blob(i, o, 1, q, h, w, ns=0 if o == 0 else IDP_STRIDE - q * h * w)
+                dmas.append((g, 0, sdram, ssram))
     else:
         for i in range(n):
             # V: loads move every IDP's pp planes; a store from an IDP holding fewer planes (the last one) moves
@@ -1852,8 +1870,10 @@ def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
             tuple(layers[lis[0]]["stride"]) == (1, 1) and len(lis) == 1
         wch = [c for c in st["chunks"] if c["kind"] == "WEIGHT"]
         st["groups"] = list(range(group, group + len(st["tiles"])))
+        clus = lin["pp"] >= 16 and lin["n"] > 1 and st["ops"][1]["op"] in ("PAD", "POOL")
         for ti, t in enumerate(st["tiles"]):
-            tile_dma(lin, t["load"], src_vec, split_off, True, group, ns0=direct)
+            _tile_dma(dmas, lin, t["load"], src_vec, split_off, True, group, ns0=direct,
+                      parts=cdiv(lin["pp"], 4) if clus else None)
             for k, li in enumerate([x for x in lis if layers[x]["kind"] == "conv"]):
                 nin = cell(*shapes[li]["in"])["n"]
                 per = wsize[li] // nin

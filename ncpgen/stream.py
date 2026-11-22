@@ -502,27 +502,47 @@ class Plan:
         convs = [li for li in lis if layers[li]["kind"] == "conv"]
         wbase = {li: wch[k]["off"] // 64 for k, li in enumerate(convs)}
         cin0 = Dist(shapes[lis[0]]["in"][0])
+        # a tile loaded per core with 16 plane slots per core or more, a pad or pool first (not a trim): each core's
+        # planes in 4 parts of ceil(ppc / 4) slots, part by part over the cores, each part just before the NFU ops of
+        # its slots (NPUC's DMACluster, as an untiled input's chunked load; V: the large random graphs t1016, t1025,
+        # t1027, t1031, t1034, t1035; a trim first: t1000, t1008, one load per core)
+        clus = cin0.ppc >= 16 and st["ops"][1]["op"] in ("PAD", "POOL")
+        part = cdiv(cin0.ppc, 4)
         for ti, t in enumerate(tiles):
             ops = []
             nl = cin0.cores if cin0.ppc > 1 else 1
             l0, l1, m0, m1 = t["load"]
-            for k in range(nl):
-                ops.append(Op("load", what="ifm", flag=self.event(), tile=ti, core=k if nl > 1 else None,
-                              sram=split * 64, region=(l0, l1 + 1, m0, m1 + 1)))
-            loads = list(range(nl))
             i0, i1, j0, j1 = t["layers"][lis[0]]["in"]
             hl, wl, hn, wn = l1 - l0 + 1, m1 - m0 + 1, i1 - i0 + 1, j1 - j0 + 1
+            if not clus:
+                for k in range(nl):
+                    ops.append(Op("load", what="ifm", flag=self.event(), tile=ti, core=k if nl > 1 else None,
+                                  sram=split * 64, region=(l0, l1 + 1, m0, m1 + 1)))
+            loads = list(range(nl)) if not clus else []
+            cur = [loads]
+
+            def slot_deps(sl):
+                if clus and sl % part == 0:
+                    cur[0] = []
+                    for k in range(nl):
+                        ops.append(Op("load", what="ifm", flag=self.event(), tile=ti, core=k,
+                                      sram=(split + sl * cells(hl, wl)) * 64, region=(l0, l1 + 1, m0, m1 + 1),
+                                      slots=(sl, min(cin0.ppc, sl + part))))
+                        cur[0].append(len(ops) - 1)
+                return list(cur[0])
             if has_trim:
                 for sl in range(cin0.ppc):
+                    dep = slot_deps(sl)
                     for rc, pc in nfu_grid(hl, hn, 1, 1, -(i0 - l0), 0, wl, wn, 1, 1, -(j0 - m0), 0):
                         ops.append(Op("trim", L=layers[lis[0]], din=cin0, hl=hl, wl=wl, hn=hn, wn=wn, rc=rc,
                                       skiph=i0 - l0, pc=pc, src=split + sl * cells(hl, wl),
-                                      dst=trim + sl * cells(hn, wn), deps=loads, cm=cin0.mask,
+                                      dst=trim + sl * cells(hn, wn), deps=dep, cm=cin0.mask,
                                       one_layer=len(lis) == 1))
                 src = trim
             else:
                 src = split
             pending = loads                     # the first consumer waits for the input loads
+            first_stage = clus and not has_trim
             full = True
             for li in lis:
                 L = layers[li]
@@ -534,13 +554,15 @@ class Plan:
                 din, dout = Dist(shapes[li]["in"][0]), Dist(shapes[li]["out"][0])
                 if L["kind"] == "pool":
                     for sl in range(din.ppc):
+                        dep = slot_deps(sl) if first_stage else pending
                         for rc, pc in nfu_grid(h, ho, L["k"][0], L["stride"][0], tp[0], tp[1],
                                                w, wo, L["k"][1], L["stride"][1], tp[2], tp[3]):
                             ops.append(Op("pool", L=L, din=din, h=h, w=w, ho=ho, wo=wo, pc=pc, rc=rc,
                                           src=src + sl * cells(h, w),
                                           dst=ch[("POOL", li)]["off"] // 64 + sl * cells(ho, wo),
-                                          deps=pending, pads=tp, cm=self.slot_mask(din, sl, full)))
+                                          deps=dep, pads=tp, cm=self.slot_mask(din, sl, full)))
                     pending = []
+                    first_stage = False
                     src = ch[("POOL", li)]["off"] // 64
                     continue
                 kh, kw = L["k"]
@@ -550,11 +572,13 @@ class Plan:
                     hp, wp = h + tp[0] + tp[1], w + tp[2] + tp[3]
                     pad = ch[("PAD", li)]["off"] // 64
                     for sl in range(din.ppc):
+                        dep = slot_deps(sl) if first_stage else pending
                         for rc, pc in nfu_grid(h, hp, 1, 1, tp[0], tp[1], w, wp, 1, 1, tp[2], tp[3]):
                             ops.append(Op("pad", L=L, din=din, h=h, w=w, hp=hp, wp=wp, pc=pc, rc=rc, tpads=tp,
-                                          src=src + sl * cells(h, w), dst=pad + sl * cells(hp, wp), deps=pending,
+                                          src=src + sl * cells(h, w), dst=pad + sl * cells(hp, wp), deps=dep,
                                           cm=self.slot_mask(din, sl, full)))
                     pending = []
+                    first_stage = False
                     src, hin, win = pad, hp, wp
                 kin = 2 * din.ppc
                 if s2d == 2:
@@ -1073,6 +1097,7 @@ class Plan:
         c0, h0, w0 = low["input"]["chw"]
         chs, hw, head, tail, geo = {src: c0}, {src: (h0, w0)}, {}, {}, {}
         tgeo = {}                                           # stratum head -> its tiles (graph_stratum)
+        psize = None
         pos = 1
         for L in order:
             n, k = L["name"], L["kind"]
@@ -1103,9 +1128,14 @@ class Plan:
             elif n in tst:
                 st = tst[n]
                 sub = [by[x] for x in st["layers"]]
+                if psize is None:       # NPUC's planner sizes (its WEIGHT chunks; weights.weight_layer_info)
+                    try:
+                        psize = {x["name"]: x["planning_size"] for x in weights.weight_layer_info(low)}
+                    except ValueError as e:
+                        raise Unsupported("weights.py: %s" % e)
                 tgeo[n] = graph_stratum(sub, [pol["shapes"][x] for x in st["layers"]],
-                                        dict(st, wsize=pol["wsize"], nsub={x["name"]: weight_rows(x, self.q)[1]
-                                                                           for x in sub if x["kind"] == "conv"}))
+                                        dict(st, wsize=psize, nsub={x["name"]: weight_rows(x, self.q)[1]
+                                                                    for x in sub if x["kind"] == "conv"}))
                 nt = len(tgeo[n]["ops"]) - 1
                 na = 2 + len(tgeo[n]["tiles"]) * nt
                 head[n], tail[n] = pos + 1, pos + na - 1     # tile 0's first node .. the vConcat
@@ -1225,6 +1255,7 @@ class Plan:
         # chunk live from 0 (V: cat2, cat3, cat-chain); a concat read by one layer, one first citizen from the concat
         # (V: cat2, cat3); else one chunk per reader, live at it only (NPUC's "Hack on LA"; V: add2, res; g006, g022)
         rch = {}
+        wshared = set()                                     # stratum outputs one chunk serves every reader of
         catch, store = set(), {}
         xidx = {L["name"]: i for i, L in enumerate(order)}
         for t in dsrc:
@@ -1234,10 +1265,18 @@ class Plan:
             nm = "INPUT" if t == src else "CONCAT"
             size = insize if t == src else Dist(chs[t]).ppc * cells(*hw[t]) * 64
             if t in tst:
-                # a tiled stratum's output read back: per reader a chunk live at it only, allocated after the
-                # stratum's own (NPUC's vConcat node, "WCONCAT"; V: squeezenet11-224-npu)
-                for j, r in enumerate(rs):
-                    rch[t, r] = chunk("WCONCAT", size, [head[r], head[r]], (2, oidx[tst[t]["layers"][0]], 2, j))
+                # a tiled stratum's output read back (NPUC's vConcat node's "WCONCAT" chunk): by one reader, a chunk
+                # live at it only, allocated after the stratum's own (V: squeezenet11-224-npu, large random t1031: a
+                # conv and an eltwise); heading a concat's branches, one first citizen from the vConcat to the last
+                # reader, loaded by the first and shared (input sharing; V: large random t1016)
+                if not any(all(bulb_root(i) == t for i in ins[kn]) and
+                           bulb_fits(kn, frame._pol_blk(*pol["shapes"][t]["out"])) for kn in cats):
+                    for j, r in enumerate(rs):
+                        rch[t, r] = chunk("WCONCAT", size, [head[r], head[r]], (2, oidx[tst[t]["layers"][0]], 2, j))
+                else:
+                    ck = chunk("WCONCAT", size, [tail[t], max(head[r] for r in rs)], (0, tail[t], 1))
+                    rch.update({(t, r): ck for r in rs})
+                    wshared.add(t)
                 continue
             if t == src and shared:
                 ck = chunk(nm, size, [0, max(head[r] for r in rs)], (0, 0, 0))
@@ -1450,7 +1489,7 @@ class Plan:
             # V: add2, in-two vs add-branches, g020; g022: a concat's buffer read by two convs)
             firstr = next(x["name"] for x in order if x["name"] in cons[i0]) if i0 in cons else None
             ld = (i0, load_kind(L, d)) if i0 in dsrc and k != "eltwise" else None
-            if i0 == src and shared:
+            if (i0 == src and shared) or i0 in wshared:
                 first = n == firstr
             elif ld is not None:
                 first = ld != prev
@@ -2133,8 +2172,9 @@ def npuc_profile(ops, plan):
                 h, w = {"conv": ("hin", "win"), "trim": ("hl", "wl"), "reformat": ("hp", "wp")}.get(c.kind, ("h", "w"))
                 din, h, w = c.din, getattr(c, h), getattr(c, w)
                 plane = cells(h, w) * 64
-                if core is not None:            # all ppc planes, also on a short last core (V: tw300c20)
-                    pushes += [_span(op.sram + (core + j) * IDP_SPAN, plane) for j in range(din.ppc)]
+                if core is not None:            # all ppc planes, also on a short last core (V: tw300c20); a part
+                    nj = op.slots[1] - op.slots[0] if getattr(op, "slots", None) else din.ppc     # its own (t1031)
+                    pushes += [_span(op.sram + (core + j) * IDP_SPAN, plane) for j in range(nj)]
                 elif getattr(op, "part", None) is not None:
                     cnt = [min(din.ppc, din.planes - d * din.ppc) for d in range(din.cores)]
                     v = _distinct(cnt)[op.part]
