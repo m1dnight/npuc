@@ -295,7 +295,9 @@ def _fit_batch(batch, placed, limit, first=None):
         first = main + [c for c in batch if c.tail]
     main = [c for c in first if not c.tail]
     tail = [c for c in first if c.tail]
-    back = list(reversed(main)) + tail
+    # backward: the start of the live range, latest first, equal starts smaller first (frame._first_fit's; V: large
+    # random t2016, t2029: a stratum's CONV, PAD, TRIM stay in that order, the plain reverse fitted another way)
+    back = sorted(reversed(main), key=lambda c: -c.live[0]) + tail
     idx = list(range(len(back)))
     tries = [first, back]
     n = 0
@@ -612,11 +614,15 @@ class Plan:
         # untiled: one SRAM-forwarded run of every layer, loading from and storing to DRAM (a layer NPUC tiles raises
         # NeedsTiling: frame.plan tiles every network NPUC tiles)
         self.layout(layers, final=True, inp=tuple(low["input"]["chw"]))
+        self.chain_groups = {}
         for li, L in enumerate(layers):
             if "copy" in self.info[li]:
                 self.groups.append(self.copy_group(self.info[li]))
             ev0 = self.ev
-            self.groups += self.cut(self.layer_group(li, L, first=li == 0, last=li == len(layers) - 1), ev0)
+            self.chain_groups[li] = len(self.groups)
+            sp = li + 1 < len(layers) and self.info[li + 1].get("spill")    # a spill: store, reload (6.12)
+            self.groups += self.cut(self.layer_group(li, L, first=li == 0 or self.info[li].get("spill", False),
+                                                     last=li == len(layers) - 1 or sp), ev0)
         last = self.info[-1]
         nu = unflatten_tiles(last, last["ho"], last["wo"])
         dout = last["dout"]
@@ -649,18 +655,24 @@ class Plan:
         layers = self.low["layers"]
         shapes = fp["shapes"]
         last = None
+        self.chain_groups = {}
         for st in fp["strata"]:
             lis = st["layers"]
             if st["kind"] == "single":
                 run = [layers[li] for li in lis]
-                self.layout(run, final=False, inp=tuple(shapes[lis[0]]["in"]))
+                # frame's single block (its allocation: trim and spill, the policy's rings; frame.md 6.6-6.12)
+                self.layout(run, final=False, inp=tuple(shapes[lis[0]]["in"]), fst=st)
                 for k, L in enumerate(run):
                     if "copy" in self.info[k]:
                         self.groups.append(self.copy_group(self.info[k]))
                     ev0 = self.ev
-                    self.groups += self.cut(self.layer_group(k, L, first=k == 0, last=k == len(run) - 1), ev0)
+                    self.chain_groups[lis[k]] = len(self.groups)
+                    sp = k + 1 < len(run) and self.info[k + 1].get("spill")
+                    self.groups += self.cut(self.layer_group(k, L, first=k == 0 or self.info[k].get("spill", False),
+                                                             last=k == len(run) - 1 or sp), ev0)
                 last = self.info[-1]
                 continue
+            self.chain_groups[lis[0]] = len(self.groups)
             self.frame_stratum(st, shapes)
             co, ho, wo = shapes[lis[-1]]["out"]
             last = {"dout": Dist(co), "ho": ho, "wo": wo, "conv": layers[lis[-1]]["kind"] == "conv"}
@@ -858,8 +870,9 @@ class Plan:
         self.ev += 1
         return f
 
-    def layout(self, layers, final=True, inp=None):
-        """the node order, the chunks and their offsets of an SRAM-forwarded run of layers (input from DRAM)"""
+    def layout(self, layers, final=True, inp=None, fst=None):
+        """the node order, the chunks and their offsets of an SRAM-forwarded run of layers (input from DRAM); fst: frame
+        plan's single block for them (its chunks, rings, copies and spills stand)"""
         c0, h0, w0 = inp or self.low["input"]["chw"]
         whole = [c0, h0, w0] == list(self.low["input"]["chw"]) and len(layers) == len(self.low["layers"])
         chunks = []
@@ -938,9 +951,12 @@ class Plan:
                 if d["ring"] < d["passes"] and d["ring"] <= 4:
                     # a ring of 4 slots or fewer lives on its conv only (frame.md 6.7; V: f043, wl-512-h21)
                     d["weight"].live = [d["out"].live[0], d["out"].live[0]]
-        allocate(chunks)
+        if fst is not None:
+            self.take_frame_chunks(chunks, fst["chunks"], fst["layers"])
+        else:
+            allocate(chunks)
         self.chunks = chunks
-        if whole:
+        if whole and fst is None:
             self.frame_single(chunks)
         # NPUC tiles a layer (SPLIT/TRIM/CONCAT nodes, several tiles per group: not modelled) when the SRAM a core
         # needs passes 256 KiB or an output dimension passes 255 (V: t200 one tile at 245120 B, t208 tiled at
@@ -966,23 +982,37 @@ class Plan:
             return
         if fp.get("tiled") or "chunks" not in fp:
             return
-        fc = {(c["kind"], c.get("layer", -1)): c for c in fp["chunks"]}
-        for ck in chunks:
-            c = fc.get((ck.name, ck.batch - 1))
-            if c is None:
-                return                      # not the same block: keep ours
-        for ck in chunks:
-            c = fc[(ck.name, ck.batch - 1)]
+        self.take_frame_chunks(chunks, fp["chunks"], list(range(len(self.low["layers"]))), strict=False)
+
+    def take_frame_chunks(self, chunks, fchunks, lis, strict=True):
+        """frame.plan's chunks of a single block of layers lis (global indices; our info and batches are local):
+        offsets, sizes, rings and slot steps, its trim-and-spill copies (6.7) and spilled reloads (6.12: the reader
+        loads its input into its own chunk, the producer stores)"""
+        fc = {(c["kind"], c.get("layer", -1)): c for c in fchunks}
+        loc = {li: k for k, li in enumerate(lis)}
+        key = [(ck.name, lis[ck.batch - 1] if ck.batch else -1) for ck in chunks]
+        if any(k not in fc for k in key):
+            if strict:
+                raise Unsupported("frame's single block has other chunks than ours")
+            return                          # not the same block: keep ours
+        for ck, k in zip(chunks, key):
+            c = fc[k]
             ck.off, ck.size = c["off"], c["size"]
             if ck.name == "WEIGHT":
                 d = self.info[ck.batch - 1]
                 d["ring"] = c.get("ring") or d["ring"]
                 d["wstep"] = c.get("step")
-        for c in fp["chunks"]:
+        for c in fchunks:
+            if c.get("layer") not in loc:
+                continue
+            d = self.info[loc[c["layer"]]]
             if c["kind"] == "TRIM" and c.get("copy"):
-                d = self.info[c["layer"]]
                 d["copy"] = {"src": c["src"], "dst": c["off"], "size": c["size"]}
                 d["in"] = Chunk(None, "TRIM", c["size"], list(c["live"]), d["in"].batch)
+                d["in"].off = c["off"]
+            elif c.get("spill"):
+                d["spill"], d["full"] = True, True
+                d["in"] = Chunk(None, "INPUT", c["size"], list(c["live"]), d["in"].batch)
                 d["in"].off = c["off"]
 
     def copy_group(self, d):
@@ -1349,6 +1379,10 @@ class Plan:
         except ValueError as e:
             raise Unsupported("weights.py: %s" % e)
         cats = [L["name"] for L in order if L["kind"] == "concat"]
+        # a concat in SRAM: NPUC's static conditions (common.concat_in_sram); its layer-block forwarding's test of the
+        # block must pass too (frame.forwarding, mode "cs"): a block that fails it (large random t2022: the concat in
+        # DRAM, its single reader's chunk a second citizen, the next block's pool output a first citizen) is refused
+        fwd = frame.forwarding(low, pol)
         scats = [kn for kn in cats if concat_in_sram(kn, out, by, ins, cons)
                  and not any(x in tst for x in ins[kn] + cons.get(kn, []))]
         # tensors their readers load from DRAM: the network input, a concat's buffer, a tiled stratum's output read by
@@ -1421,21 +1455,22 @@ class Plan:
                     t = ins[t][0]
             return out_
 
-        def bulb_fits(kn, mem):
-            # NPUC's layer-block forwarding (LayerBlockFMSharingCalculator::tryProcessInternalNode): no node of the
-            # block tiled, and each kept whole with the SRAM the block holds (mem: the head's output for input
-            # sharing, the concat for concat in SRAM) left over (frame.node_whole)
+        def bulb_fits(kn, mode):
+            # NPUC's layer-block forwarding (frame.forwarding: LayerBlockFMSharingCalculator, mode "is" input
+            # sharing, "cs" concat in SRAM): no node of the block tiled, each kept whole with the SRAM the block holds
+            # left over (V: t1038, its 96-channel branch conv counted without the shared input or the concat)
             nodes = bulb_nodes(kn)
             if any(x in tst for x in nodes):
                 return False
-            for x in nodes:
-                if x in pol["nodes"] and not frame.node_whole(pol["nodes"][x], SRAM_LIMIT - mem):
-                    raise Unsupported("a layer-block NPUC's forwarding may refuse on memory (%s): not modelled" % x)
-            return True
+            heads = [h for h, k in fwd["heads"].items() if k == kn]
+            ok = bool(heads) and fwd["ok"][mode].get(heads[0], False)
+            if ok and any(fwd["nbuf"][mode].get(x) for x in nodes):
+                raise Unsupported("a layer-block whose node only fits with a weight ring: not modelled")
+            return ok
         for kn in scats:
-            bulb_fits(kn, frame._pol_blk(*pol["shapes"][kn]["out"]))
-        shared = any(all(bulb_root(i) == src for i in ins[kn]) and bulb_fits(kn, frame._pol_blk(c0, h0, w0))
-                     for kn in cats)
+            if not bulb_fits(kn, "cs"):
+                raise Unsupported("a concat in SRAM NPUC's forwarding refuses (%s): not modelled" % kn)
+        shared = any(all(bulb_root(i) == src for i in ins[kn]) and bulb_fits(kn, "is") for kn in cats)
         # a concat whose branches all start at one computed tensor ("Input sharing" from a layer): when that layer
         # is a single node (a pool, a ReLU, a conv without pad or stride), NPUC stores it to DRAM, its first reader
         # loads it back and the other branches share it in SRAM (V: g005, g008, g009, g030, g047); after a padded
@@ -1445,8 +1480,10 @@ class Plan:
             rs = {bulb_root(i) for i in ins[kn]}
             r = min(rs)
             if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r]:
-                if r in tst or any(x in tst for x in bulb_nodes(kn)):
-                    raise Unsupported("tiling in a graph: a concat's branches from a computed tensor, tiled")
+                if r in tst:
+                    raise Unsupported("tiling in a graph: a concat's branches from a tiled stratum's output")
+                if any(x in tst for x in bulb_nodes(kn)):
+                    continue                # a tiled branch: no input sharing (6.11), the root an ordinary tensor
                 roots |= rs
         for r in roots:
             stored.setdefault(r, ("im", r))
@@ -1469,7 +1506,7 @@ class Plan:
                 # conv and an eltwise); heading a concat's branches, one first citizen from the vConcat to the last
                 # reader, loaded by the first and shared (input sharing; V: large random t1016)
                 if not any(all(bulb_root(i) == t for i in ins[kn]) and
-                           bulb_fits(kn, frame._pol_blk(*pol["shapes"][t]["out"])) for kn in cats):
+                           bulb_fits(kn, "is") for kn in cats):
                     for j, r in enumerate(rs):
                         rch[t, r] = chunk("WCONCAT", size, [head[r], head[r]], (2, oidx[tst[t]["layers"][0]], 2, j))
                 else:
@@ -1598,7 +1635,7 @@ class Plan:
                 full[n] = True
             tens[n] = d["out"]
             info[n] = d
-        life = frame.forwarding(low, pol)
+        life = fwd["life"]
         for n, d in info.items():
             if "weight" in d:
                 # the WEIGHT chunk as NPUC's planner sizes it: its own pack of the kernel (planning rows; for a conv
@@ -1673,12 +1710,21 @@ class Plan:
                 d["in"], d["full"] = ck, True
             else:
                 raise Unsupported("trim and spill: a spilled tensor read as a second input (not modelled)")
+        # a trimmed tensor: every reader reads the copy, made by its own group right after the producer's (V: t1038,
+        # a copy of an eltwise output before its two readers; chains: frame.md 6.7)
+        copies = {}
         for X, T in ts.get("trims", []):
-            r = T.layer
-            if r not in info or "in" not in info[r] or info[r]["in"] is not X:
-                raise Unsupported("trim and spill: a copy of a chunk its node does not read (not modelled)")
-            info[r]["copy"] = {"src": X.off, "dst": T.off, "size": X.size}
-            info[r]["in"] = T
+            t = X.tensor
+            for r in cons.get(t, []):
+                d = info[r]
+                if by[r]["kind"] == "eltwise":
+                    d["ins"] = [T if i == t else c for i, c in zip(ins[r], d["ins"])]
+                elif d.get("in") is X:
+                    d["in"] = T
+                else:
+                    raise Unsupported("trim and spill: a copy of a chunk its reader does not read (not modelled)")
+            r0 = next(x for x in [L["name"] for L in order] if x in cons[t])
+            copies[t] = dict(info[r0], copy={"src": X.off, "dst": T.off, "size": X.size})
         self.spilled = spilled
         for tg in tgeo.values():            # the strata's chunk offsets, as frame.plan_tiled lists them
             tg["chunks"] = [{"kind": kind, "layer": li, "off": ck.off, "size": ck.size} for kind, li, ck in tg["req"]]
@@ -1755,9 +1801,6 @@ class Plan:
                 even = dl.planes - (dl.cores - 1) * dl.ppc == dl.ppc
                 d["parts"] = 1 if even or load_kind(L, d) == "core" else 2
             last = n in stored
-            if "copy" in d:                 # a trim-and-spill copy of the input: its own group first (frame.md 6.12)
-                self.groups.append(self.copy_group(d))
-                self.group_layers.append(n)
             ev0 = self.ev
             if k in ("conv", "pool"):
                 self.info.append(d)
@@ -1772,18 +1815,27 @@ class Plan:
                 elif op.kind == "store":
                     op.tensor = stored[n][1]
             self.groups += self.cut(ops, ev0) if k != "eltwise" else [ops]
+            if n in copies:                 # a trim-and-spill copy of its output (frame.md 6.12)
+                self.groups.append(self.copy_group(copies[n]))
             self.group_layers += [n] * (len(self.groups) - len(self.group_layers))
         if by[out]["kind"] == "concat":
             o = {"dout": Dist(chs[out]), "ho": hw[out][0], "wo": hw[out][1]}
         else:
             o = info[out]
         nu = unflatten_tiles(o, o["ho"], o["wo"])
-        if nu > 1:
-            raise Unsupported("tiling in a graph (the unflatten of %d x %d)" % (o["ho"], o["wo"]))
         self.out_chw = (o["dout"].c, o["ho"], o["wo"])
-        self.groups.append([Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out),
-                            Op("nopop", deps=[0]), Op("unflatten")])
-        self.group_layers.append(None)
+        if nu == 1:
+            self.groups.append([Op("load", what="dram", flag=self.event(), utile=len(self.groups), tensor=out),
+                                Op("nopop", deps=[0]), Op("unflatten")])
+            self.group_layers.append(None)
+        # a tiled read-back, as a chain's (frame.md 6.5: row tiles by NPUC's policy, each its own output group,
+        # loaded per core with several planes per core; V: large random t1039)
+        for u in range(nu if nu > 1 else 0):
+            nl = o["dout"].cores if o["dout"].ppc > 1 else 1
+            ops = [Op("load", what="dram", flag=self.event(), utile=u, core=k if nl > 1 else None, tensor=out)
+                   for k in range(nl)]
+            self.groups.append(ops + [Op("nopop", deps=list(range(nl))), Op("unflatten")])
+            self.group_layers.append(None)
 
     def relu_group(self, L, d, first, last):
         """a standalone ReLU: NPUC's 1x1 dummy conv, one pass per pair of plane slots (V: res, relu-c4..c64)"""

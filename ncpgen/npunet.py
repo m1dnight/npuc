@@ -748,13 +748,21 @@ def _global_avg_as_conv(L, cur, dtype, low):
             (max(sh, sw) > 3 or sh != sw or not same_q)):
         return None
     if C * C * kh * kw > 1 << 24:
-        raise Refused("%s: a global average pool over %d channels as a conv needs %d x %d x %d x %d weights (NPUC "
-                      "compiles 512 x 512 x 7 x 7 in seconds; 1024 channels did not finish): reduce the channels first"
-                      % (L.get("name", "pool"), C, C, C, kh, kw))
-    why = gap_conv_fits(C, kh, kw, low["quant_mode"])
+        why = ("as a conv it needs %d x %d x %d x %d weights (NPUC compiles 512 x 512 x 7 x 7 in seconds; 1024 channels "
+               "did not finish)" % (C, C, kh, kw))
+    else:
+        why = gap_conv_fits(C, kh, kw, low["quant_mode"])
+        why = why and "as a conv " + why
     if why:
-        raise Refused("%s: a global average pool %dx%d over %d channels, quant %d: NPUC's pooling takes strides up to 3, "
-                      "and as a conv %s; pool in steps first" % (L.get("name", "pool"), kh, kw, C, low["quant_mode"], why))
+        # the same function with one output: the map's window at stride 1, VALID, which NPUC's NFU pooling takes
+        # when the kernel is at most 8 x 8 (V: $NCPGEN_WORK/zoo-evidence/probe-gap7 and probe-gap-s1: 7x7 over 64,
+        # 1008, 1024, 1280 and 8x8 over 64, 512, 1024 compile; 9x9 and 13x13 'Invalid kernel size! Kernel size in
+        # (x,y) can be up to: 7', the field holding k - 1) and keeps its quantisation
+        if max(kh, kw) <= 8 and same_q:
+            low["warnings"].append("%s: global average pool %dx%d (strides %dx%d) lowered as the same pool at stride "
+                                   "1 (one output; %s)" % (L.get("name", "pool"), kh, kw, sh, sw, why))
+            return dict(L, strides=[1, 1])
+        return {"cpu": why}
     act = "relu" if _nonneg(low, cur["name"]) else "none"
     data = [1 if c == o else 0 for o in range(C) for i in range(kh) for j in range(kw) for c in range(C)]
     low["warnings"].append("%s: global average pool %dx%d lowered to a %dx%d VALID conv with identity weights and "
@@ -1380,10 +1388,25 @@ def _lower_softmax(lw, idx, L, op, name, key, ins, srcs):
     return dict(cur, tail=True)
 
 
+def _lower_cpu_mean(lw, idx, L, op, name, key, ins, srcs):
+    """a global average pool (or MEAN over H and W) with no NPU form, last in the network but for the CPU part: a
+    CPU-tail op computing TFLite's integer mean (reference_integer_ops::Mean: the sum of x - zp, rounded half away
+    from zero over the window's count, plus the output zero point; its multiplier is 1, the quantisation kept)"""
+    cur = srcs[0]
+    if lw.tail is not None or not lw.low["layers"] or cur["name"] != lw.low["layers"][-1]["name"]:
+        raise Refused("%s %s: a CPU-side global average pool must read the NPU part's last output" % (op, name))
+    C, H, W = cur["chw"]
+    lw.tail = key
+    lw.low["cpu_tail"].append({"op": "mean", "hw": [H, W], "zp": cur["zp"]})
+    lw.low["warnings"].append("%s: global average pool %dx%d over %d channels on the CPU (NPUC has no form of it: "
+                              "%s)" % (L.get("name", name), H, W, C, L.get("why")))
+    return dict(cur, chw=[C, 1, 1], tail=True)
+
+
 LOWER_OPS = {"conv2d": _lower_conv, "fully_connected": _lower_conv, "depthwise_conv2d": _lower_depthwise,
              "max_pool2d": _lower_pool,
              "average_pool2d": _lower_pool, "add": _lower_add, "concat": _lower_concat, "relu": _lower_relu,
-             "relu6": _lower_relu, "reshape": _lower_reshape, "softmax": _lower_softmax}
+             "relu6": _lower_relu, "reshape": _lower_reshape, "softmax": _lower_softmax, "cpu_mean": _lower_cpu_mean}
 
 
 def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, relu6_range=False):
@@ -1434,8 +1457,16 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, re
             L, op = _mean_as_pool(L, srcs[0], name), "average_pool2d"
         if op == "average_pool2d":
             gap = _global_avg_as_conv(L, srcs[0], dtype, low)
-            if gap is not None:
-                L, op = gap, "conv2d"
+            if gap is not None and "cpu" in gap:
+                # no NPU form: the pool runs on the CPU when only the CPU part (RESHAPE, SOFTMAX) follows it
+                if any(e[0]["op"] not in ("reshape", "softmax") for e in ents[idx + 1:]):
+                    kh_, kw_ = L["pool"]
+                    raise Refused("%s: a global average pool %dx%d over %d channels: NPUC's pooling takes strides up "
+                                  "to 3 and kernels up to 8 x 8, and %s; pool in steps first, or end the NPU part "
+                                  "before it" % (L.get("name", "pool"), kh_, kw_, srcs[0]["chw"][0], gap["cpu"]))
+                L, op = dict(L, why=gap["cpu"]), "cpu_mean"
+            elif gap is not None:       # the identity conv, or the same pool at stride 1
+                L, op = gap, gap["op"]
         if op not in LOWER_OPS:
             raise Refused("op %s is not supported (conv2d, depthwise_conv2d, fully_connected, max_pool2d, average_pool2d, mean, "
                           "add, concat, relu; "
@@ -1489,11 +1520,15 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, re
     low["npu_output"] = last["name"]
     low["npu_out_chw"] = last["out_chw"]
     C2, H2, W2 = last["out_chw"]
-    shape = lw.blobs[ents[-1][1]].get("nhwc", [1, H2, W2, C2])
+    C3, H3, W3 = lw.blobs[ents[-1][1]]["chw"]          # after the CPU part (a mean there: 1 x 1)
+    shape = lw.blobs[ents[-1][1]].get("nhwc", [1, H3, W3, C3])
     for t in low["cpu_tail"]:
         if t["op"] == "reshape":
             shape = t["shape"]
-    low["output"] = {"shape": shape, "dtype": dtype, "bytes": C2 * H2 * W2}
+    nb = 1
+    for x in shape:
+        nb *= x
+    low["output"] = {"shape": shape, "dtype": dtype, "bytes": nb}
     if is_graph(low):
         low["npuc_net"] = 2
     return low
@@ -1729,6 +1764,14 @@ def cpu_tail(low, y_chw):
     C, H, W = low["npu_out_chw"]
     y = bytes(y_chw[(c * H + h) * W + w] for h in range(H) for w in range(W) for c in range(C))
     for t in low["cpu_tail"]:
+        if t["op"] == "mean":           # TFLite's integer mean over H x W (reference_integer_ops::Mean)
+            n, zp = H * W, t["zp"]
+            out = bytearray()
+            for c in range(C):
+                acc = sum(y[k * C + c] - zp for k in range(n))
+                q = (acc + n // 2) // n if acc > 0 else -((-acc + n // 2) // n)
+                out.append(min(255, max(0, q + zp)))
+            y, H, W = bytes(out), 1, 1
         if t["op"] == "softmax":
             si, zi = hex_f32(t["in_scale"]), t["in_zp"]
             so, zo = hex_f32(t["out_scale"]), t["out_zp"]
@@ -2838,21 +2881,44 @@ def _selftest_gap():
                % len(GAP_MEASURED), not wrong))
     r = random.Random(11)
 
-    def gapnet(C, hw, quant):
+    def gapnet(C, hw, quant, after=True):
+        # the pool, then a 1x1 conv (it is not the NPU part's end, so no CPU form: _lower_cpu_mean)
         g = _sgraph([_sconv("c", C, C, r, k=1), {"op": "average_pool2d", "name": "g", "pool": list(hw),
-                                                  "strides": list(hw), "padding": "valid"}], shape=(1,) + tuple(hw) + (C,))
+                                                  "strides": list(hw), "padding": "valid"}]
+                    + ([_sconv("d", C, C, r, k=1)] if after else []), shape=(1,) + tuple(hw) + (C,))
         return lambda: lower(g, quant=quant)
-    l25 = gapnet(64, (25, 5), 1)()["layers"][-1]
+    l25 = gapnet(64, (25, 5), 1)()["layers"][1]
     ok.append(("ds-cnn's global average pool 25x5 over 64 channels (quant 1): a 25x5 VALID identity conv",
                l25["kind"] == "conv" and l25["k"] == [25, 5] and l25["out_chw"] == [64, 1, 1]))
     ok.append(("global average pool 16x16 over 8 channels, quant 1: lowered (NPUC's one sub-batch per core)",
                not _refuses(gapnet(8, (16, 16), 1))))
-    ok.append(("global average pool 16x16 over 16 channels, quant 1: refused (a 128-byte bitmap)",
+    ok.append(("global average pool 16x16 over 16 channels, quant 1, then a conv: refused (a 128-byte bitmap)",
                "over 127" in _refusal(gapnet(16, (16, 16), 1))))
     ok.append(("global average pool 10x10 over 40 channels, quant 1: refused (maxPossibleBatches); quant 3: lowered",
                "maxPossibleBatches" in _refusal(gapnet(40, (10, 10), 1)) and not _refuses(gapnet(40, (10, 10), 3))))
-    ok.append(("global average pool 30x17 over 8 channels, quant 3: refused", _refuses(gapnet(8, (30, 17), 3))))
+    ok.append(("global average pool 30x17 over 8 channels, quant 3, then a conv: refused",
+               _refuses(gapnet(8, (30, 17), 3))))
     ok.append(("global average pool 65x1: refused (kernel sides up to 64 measured)", "over 64" in _refusal(gapnet(8, (65, 1), 1))))
+    # no conv form: the same pool at stride 1 when its kernel is at most 8 x 8 (V: probe-gap7, probe-gap-s1), else on
+    # the CPU when it ends the NPU part (TFLite's integer mean; SqueezeNet 1.1's 13x13 over 1000 classes)
+    l7 = gapnet(1024, (7, 7), 1)()["layers"][1]
+    ok.append(("global average pool 7x7 over 1024 channels (no conv form): the 7x7 pool at stride 1",
+               l7["kind"] == "pool" and l7["k"] == [7, 7] and l7["stride"] == [1, 1] and l7["out_chw"] == [1024, 1, 1]))
+    ok.append(("global average pool 9x9 over 1024 channels, then a conv: refused (NFU kernels up to 8)",
+               "kernels up to 8" in _refusal(gapnet(1024, (9, 9), 1))))
+    g16 = gapnet(16, (16, 16), 1, after=False)()
+    rr = random.Random(5)
+    x = bytes(rr.randrange(256) for _ in range(16 * 16 * 16))
+    y_npu = ref_npu(g16, model_in_to_chw(g16, x))
+    want = bytearray()
+    for c in range(16):
+        acc = sum(y_npu[c * 256 + k] - g16["cpu_tail"][0]["zp"] for k in range(256))
+        q = int(math.copysign(math.floor(abs(acc) / 256 + 0.5), acc))
+        want.append(min(255, max(0, q + g16["cpu_tail"][0]["zp"])))
+    ok.append(("global average pool 16x16 over 16 channels, quant 1, last: on the CPU (the NPU part ends at the conv),"
+               " TFLite's mean rounded half away", [t["op"] for t in g16["cpu_tail"]] == ["mean"] and
+               len(g16["layers"]) == 1 and out_to_model(g16, cpu_tail(g16, y_npu)) == out_to_model(g16, bytes(want))
+               and g16["output"]["shape"] == [1, 1, 1, 16]))
     return ok
 
 
