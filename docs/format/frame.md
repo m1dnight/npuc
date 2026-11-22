@@ -495,9 +495,15 @@ conv only (WEIGHT live [conv, conv]), which the trim and spill of 6.12 then depe
 - the io batch ids of a graph: the stream part's (NPUC's SetBatchTransferInGroup, cmdq.md 7b), not re-derived from the
   ev2set masks (t1016: a clustered load's 16 parts in one batch, which the masks cannot tell).
 
-**Not yet**: strata joined to each other, a tiled stratum's output heading a concat's branches. Rate on the large random graphs: 40 of 40 (31 before the
-trim and spill of 6.12, the forwarding model and the items above; 22 before the clustered loads, the shared WCONCAT
-and the chain rule).
+**Not yet**: strata joined to each other, a tiled stratum's output heading a concat's branches, a concat the forwarding
+keeps out of SRAM (fresh t2022: its reader's chunk a second citizen, the next block's pool output a first citizen),
+fresh t2006 (a spill our model aborts on, NPUC not; its weight blocks differ too). Rate on the first large random set:
+40 of 40 (31 before the trim and spill of 6.12, the forwarding model and the items above; 22 before the clustered
+loads, the shared WCONCAT and the chain rule). **A fresh unseen set** (`stream_graphs.py random
+$NCPGEN_WORK/sweep/graph-large2 2000 40 --set large`, compiled after the work above): 35 of 39 at first sight (NPUC
+crashes on t2031, GlobalMemoryAllocator.cpp:860); t2016 and t2029 then fixed by NPUC's backward order in the stream
+allocator (the start of the live range, latest first, as frame._first_fit has it, not the plain reverse of bigger
+first): 37 of 39.
 
 ### 6.12 Trim and spill (`stream.allocate(ts=...)`, `_trim_spill`; V: decompiled GlobalMemoryAllocator, `oracle/ghidra/targets-spill*.txt`; mobilenet-v2-100-224, resnet18-96, resnet18-224, large random t1004, t1013, t1021, t1033, t1036)
 

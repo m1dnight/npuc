@@ -300,7 +300,9 @@ def _fit_batch(batch, placed, limit, first=None):
         first = main + [c for c in batch if c.tail]
     main = [c for c in first if not c.tail]
     tail = [c for c in first if c.tail]
-    back = list(reversed(main)) + tail
+    # backward: the start of the live range, latest first, equal starts smaller first (frame._first_fit's; V: large
+    # random t2016, t2029: a stratum's CONV, PAD, TRIM stay in that order, the plain reverse fitted another way)
+    back = sorted(reversed(main), key=lambda c: -c.live[0]) + tail
     idx = list(range(len(back)))
     tries = [first, back]
     n = 0
@@ -1382,6 +1384,10 @@ class Plan:
         except ValueError as e:
             raise Unsupported("weights.py: %s" % e)
         cats = [L["name"] for L in order if L["kind"] == "concat"]
+        # a concat in SRAM: NPUC's static conditions (common.concat_in_sram); its layer-block forwarding's test of the
+        # block must pass too (frame.forwarding, mode "cs"): a block that fails it (large random t2022: the concat in
+        # DRAM, its single reader's chunk a second citizen, the next block's pool output a first citizen) is refused
+        fwd = frame.forwarding(low, pol)
         scats = [kn for kn in cats if concat_in_sram(kn, out, by, ins, cons)
                  and not any(x in tst for x in ins[kn] + cons.get(kn, []))]
         # tensors their readers load from DRAM: the network input, a concat's buffer, a tiled stratum's output read by
@@ -1453,8 +1459,6 @@ class Plan:
                     out_.append(t)
                     t = ins[t][0]
             return out_
-
-        fwd = frame.forwarding(low, pol)
 
         def bulb_fits(kn, mode):
             # NPUC's layer-block forwarding (frame.forwarding: LayerBlockFMSharingCalculator, mode "is" input
