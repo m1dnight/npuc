@@ -289,7 +289,7 @@ def tasks(kinds, vds, srcs):
         for v in vds:
             try:
                 small = macs(json.load(open(os.path.join(S(v), "lowered.json")))) <= 1500000
-            except (ValueError, KeyError):
+            except (OSError, ValueError, KeyError):
                 small = False
             if small:
                 out.append(("ref:" + v, "task_ref", (v,)))
@@ -376,7 +376,7 @@ def main():
                                                             "; snapshot errors: %s" % errs[:5] if errs else ""))
         return 0
     ref = {k: v for k, v in ref.items() if k.split(":", 1)[0] in kinds and (a.sample == 1 or k in res)
-           and k not in dropped and not k.startswith("meta:")}
+           and k not in dropped and not k.startswith("meta:") and not any(":" + x in k for x in skip)}
     diff = sorted(k for k in set(ref) | set(res) if ref.get(k) != res.get(k))
     for k in diff[:40]:
         print("DIFF %s\n  was %s\n  now %s" % (k, json.dumps(ref.get(k))[:600], json.dumps(res.get(k))[:600]))

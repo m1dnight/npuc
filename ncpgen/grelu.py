@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The GReLU activation table of an NPU2020/Neus convolution (PORT-32, docs/format/grelu.md).
+"""The GReLU activation table of an NPU2020/Neus convolution (docs/format/grelu.md).
 
 Our own model of what Samsung's NPUC 1.36.1.a writes (formulas, register addresses and observed constants only; no
 vendor bytes), and of the corrected table.
@@ -29,8 +29,7 @@ Channel -> DRU (V, sweep of Cout 1..255): chunk = 2 * ceil(Cout / 8) channels pe
 [k * chunk, (k + 1) * chunk); pass p takes lanes [4p, 4p + 4) of every core's chunk; DRU = core * 4 + lane - 4p.
 
 Slope (V: libnpuc_frontend NNGraphNodeScaleONFiller::setScale @0x9da64, fcvtas): m = f32(f32(in * w) / out), doubled
-while < 0.5 (at most 7 times), slope = round_half_away(m * 256), shift = doublings + 8. (ncpgen/npunet.py truncates:
-its slope is 1 low whenever frac(m * 256) >= 0.5; this module computes its own.)
+while < 0.5 (at most 7 times), slope = round_half_away(m * 256), shift = doublings + 8 (common.requant).
 
   grelu.py check <variant dir>...      fixed=False vs the oracle's GReLU writes, fixed=True vs ncp-grelu-patch.py auto
   grelu.py table <ncp>...              print every GReLU block of an NCP (A/B per entry, T1/T2)
@@ -76,7 +75,7 @@ def layer_slope(layer):
 
 def zp_byte(layer, quant_mode):
     """NPUC's ncp_mtc_conv +0x109 (the A of every populated DRU): the output zero point; 0 in quasi-symmetric mode
-    whatever the layer's zero point (V: the stream part's zp-0 graph nets; npunet always writes 128 there)"""
+    whatever the layer's zero point (V: stream.py's zp-0 graph nets; npunet always writes 128 there)"""
     return 0 if quant_mode == 3 else int(layer["out_zp"]) & 0xFF
 
 
@@ -97,6 +96,7 @@ def channel_passes(cout):
 
 
 def act_code(layer):
+    """NPUC's NNActivationType of a lowered conv layer: ReLU or none"""
     return MODE_RELU if int(layer.get("act", 0)) == 1 else MODE_NONE
 
 
@@ -281,6 +281,7 @@ def ncp_grelu(data):
 
 
 def split_blocks(writes):
+    """GReLU writes [(reg, value)] -> one list per block (CMDQ 0x401e0050 = 1 ... = 0)"""
     blocks, cur = [], None
     for r, v in writes:
         if r == GRELU_EN and v == 1:
@@ -317,6 +318,7 @@ def conv_layers(low):
 
 
 def model_writes(low, fixed):
+    """(every GReLU write of a lowered network in order, the extra corrections fixed_vals made)"""
     q = int(low.get("quant_mode", 1))
     ws, extras = [], []
     for l in conv_layers(low):
@@ -327,7 +329,8 @@ def model_writes(low, fixed):
     return ws, extras
 
 
-def first_diff(a, b):
+def _write_diff(a, b):
+    """where two GReLU write lists first differ, as text"""
     for i, (x, y) in enumerate(zip(a, b)):
         if x != y:
             return "write %d: model %#010x=%#010x, oracle %#010x=%#010x" % (i, x[0], x[1], y[0], y[1])
@@ -335,6 +338,7 @@ def first_diff(a, b):
 
 
 def check(dirs):
+    """our tables against each variant's net.ncp (NPUC's) and ncp-grelu-patch.py auto's; 0 when as expected"""
     tot = {"npuc": [0, 0], "fixed": [0, 0, 0]}
     for d in dirs:
         name = os.path.basename(os.path.normpath(d))
@@ -349,7 +353,7 @@ def check(dirs):
         ok = mine == oracle
         tot["npuc"][0 if ok else 1] += 1
         nb = len(split_blocks(oracle))
-        line = "%-14s npuc  %s (%d blocks, %d writes)" % (name, "exact" if ok else "DIFFERS: " + first_diff(mine, oracle),
+        line = "%-14s npuc  %s (%d blocks, %d writes)" % (name, "exact" if ok else "DIFFERS: " + _write_diff(mine, oracle),
                                                         nb, len(oracle))
         fixed, extras = model_writes(low, True)
         auto = ncp_grelu(auto_patched(data))
@@ -361,7 +365,7 @@ def check(dirs):
             line += " | fixed differs from auto as intended: " + "; ".join(sorted(set(extras)))
         else:
             tot["fixed"][2] += 1
-            line += " | fixed DIFFERS from auto: " + first_diff(fixed, auto)
+            line += " | fixed DIFFERS from auto: " + _write_diff(fixed, auto)
         robust, _ = model_writes(low, "robust")
         nd = sum(1 for x, y in zip(robust, auto) if x != y) if len(robust) == len(auto) else -1
         tot["robust"] = tot.get("robust", 0) + (nd == 0)
@@ -375,6 +379,7 @@ def check(dirs):
 
 
 def show_table(path):
+    """print every GReLU block of an NCP"""
     data = open(path, "rb").read()
     for i, b in enumerate(split_blocks(ncp_grelu(data))):
         t = dict(b)
@@ -425,6 +430,7 @@ def selftest():
 
 
 def main(argv=None):
+    """the command line (module docstring)"""
     ap = argparse.ArgumentParser(prog="grelu.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

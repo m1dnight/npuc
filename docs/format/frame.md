@@ -293,7 +293,7 @@ builds the descriptors and vectors from them.
   concat by the same rule on its real channel count (not rounded; unused by any DMA: cat2, g005, g007, g019); then a
   WEIGHT per conv and ReLU layer and a META_DATA per eltwise, in execution order (weights.py's `weight_blocks` gives
   the blocks in that order); IM 8x8x2.
-- **META_DATA** (`meta_block`): per core used, three byte arrays (lowered.json "fl": input 1, input 2, output), each
+- **META_DATA** (`weights.eltwise_block`): per core used, three byte arrays (lowered.json "fl": input 1, input 2, output), each
   one entry per channel slot of a core (cpi) zero-padded to a multiple of 4, in a 32-byte block (64 B when the
   arrays pass 32). Its load moves ceil(size / 64) // cores rows of 64 B per core (0 for 32-byte blocks on several
   cores, 1 on one).

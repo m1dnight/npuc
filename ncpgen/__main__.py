@@ -22,6 +22,7 @@ NPUNET = ("lower", "ref", "layout", "to-npu", "from-npu", "compare", "example", 
 
 
 def main(argv=None):
+    """dispatch to the module that runs the command"""
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)

@@ -22,8 +22,8 @@ shows them +0x100000). No vendor bytes here: register addresses, field layouts, 
   shape/kernel/stride/padding variants up to 128x128 and Cin 512, 6 chains of up to 3 convs with pools, soc 1 and 2,
   plus the c3 and net-current references) and the corrected table identical to `ncp-grelu-patch.py auto` on 90/92
   (the 2 others: Cout <= 2 ReLU, which auto cannot repair; see 8).
-- Side finding (V): NPUC's slope is `round_half_away(m x 256)` (fcvtas), not `trunc`: `ncpgen/npunet.py` is 1 low
-  whenever frac(m x 256) >= 0.5 (seen in 5 variants: 161 vs NPUC 162, 194/195, 90/91, 9/10, 6/7).
+- Side finding (V): NPUC's slope is `round_half_away(m x 256)` (fcvtas), not `trunc` (seen in 5 variants: 161 vs
+  NPUC 162, 194/195, 90/91, 9/10, 6/7); every module now computes it the same way (`common.requant`).
 
 ## 2. The block (V)
 

@@ -613,6 +613,7 @@ FAMILIES = {"ch": fam_ch, "co": fam_co, "hw": fam_hw, "mix": fam_mix, "sq": fam_
 
 
 def specs(fams):
+    """(family, name, npuc-variant arguments, npuc-local options) of the families' variants"""
     for f in fams or FAMILIES:
         for line in FAMILIES[f]():
             parts = [p.strip() for p in line.split("|")] + [""]
@@ -620,6 +621,7 @@ def specs(fams):
 
 
 def run(root, fams, jobs):
+    """compile the variants missing under root with NPUC, jobs at a time"""
     todo = [s for s in specs(fams) if not os.path.isfile(os.path.join(root, s[0], s[1], "net.ncp"))]
     procs, fails = [], []
     while todo or procs:
@@ -711,6 +713,7 @@ def policy(dirs):
 
 
 def main(argv=None):
+    """the command line (module docstring)"""
     ap = argparse.ArgumentParser(prog="frame_sweep.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

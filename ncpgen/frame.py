@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""frame.py: the NCP container, the ARM intrinsics and the NPU's data layout (PORT-32, ncpgen part "frame";
-docs/format/frame.md). Pure Python, our own code: every rule below was read off NPUC 1.36.1.a's output (the
+"""The NCP container, the ARM intrinsics and the NPU's data layout (docs/format/frame.md). Pure Python, our own code: every rule below was read off NPUC 1.36.1.a's output (the
 oracle, oracle/npuc-local.sh) or its disassembly; nothing here is a copied vendor table or blob.
 
   frame.py check <variant dir>...      assemble each variant from the oracle NCP's own streams and weight blocks (cut
@@ -9,7 +8,7 @@ oracle, oracle/npuc-local.sh) or its disassembly; nothing here is a copied vendo
   frame.py layout C H W [c y x]        the IFM/OFM sizes, and the byte address of element (c, y, x)
   frame.py selftest                    the layout against the NPU-measured 8x16x16 map, the A32 encoder
 
-Interface (ncpgen.py):
+Interface (ncpgen.py, stream.py, npunet.py):
   frame(low, streams, intrinsics, weights, fix_npuc=False) -> bytes   the whole NCP from its parts (streams = isa
                          bytes per group, intrinsics = bytes per group, weights = WEIGHT blocks in NCP order)
   intrinsics(low) -> [bytes per group]
@@ -27,7 +26,7 @@ chained layers cut into tiles by rows, columns or both, single-tile blocks betwe
 layers, chains and tile counts by NPUC's own policy read from its code, npuc_policy, frame.md 6.10), with
 weights resident or streamed through a ring of slots, PARTIAL_SUM chunks for sub-batched weights, and NPUC's copy
 group when no allocation order fits a layer (frame.md 6.6, 6.7); graph networks with eltwise adds, concats and
-standalone ReLUs (plan_graph, from the stream part's plan; frame.md 6.8). frame()'s weights are the WEIGHT blocks in
+standalone ReLUs (plan_graph, from stream.py's plan; frame.md 6.8). frame()'s weights are the WEIGHT blocks in
 the NCP's vector order (weights.py's weight_blocks; for graphs the execution order, META_DATA included).
 
 Tags in comments: V = seen in the oracle's bytes/log or the disassembly, G = guess (consistent with all variants,
@@ -91,6 +90,7 @@ def ifm_addr(c, y, x, C, H, W):
 
 
 def ifm_size(C, H, W):
+    """the IFM buffer's size in bytes (cell())"""
     return cell(C, H, W)["size"]
 
 
@@ -101,6 +101,7 @@ def ofm_addr(c, y, x, C, H, W):
 
 
 def ofm_size(C, H, W):
+    """the OFM's size in bytes (dense CHW)"""
     return C * H * W
 
 
@@ -269,7 +270,7 @@ def _read_back(dmas, g, ol, Co, v_im, fix_npuc):
 
 
 def _ps_size(shp, L):
-    """V (the stream part, cmdq.md 5): a conv whose weights come in sub-batches accumulates in a PARTIAL_SUM chunk of
+    """V (stream.py, cmdq.md 5): a conv whose weights come in sub-batches accumulates in a PARTIAL_SUM chunk of
     2 x 7 planes over its MTC input (padded, or the space-to-depth input for stride 2), 896 B per cell"""
     C, H, W = shp["in"]
     pt, pb, pl, pr = L["pads"]
@@ -292,7 +293,7 @@ def _ring_chunk(per, cout, r, passes):
 
 
 def _ring(passes, slot, fm):
-    """V (the stream part's rule, cmdq.md 7b; c256, r_c256h24, r_c320h24, r_c512h16, r_c512h24): the WEIGHT chunk of a
+    """V (stream.py's rule, cmdq.md 7b; c256, r_c256h24, r_c320h24, r_c512h16, r_c512h24): the WEIGHT chunk of a
     conv holds every pass when its node fits (feature maps fm = input, output, partial sums, plus every pass's slot,
     within 256 KiB), else a ring of R slots: R_max = (256 KiB - fm) // slot, R = ceil(passes / ceil(passes / R_max)).
     None when not even one slot fits (NPUC tiles)."""
@@ -401,7 +402,7 @@ def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_n
         nl = cdiv(L["cout"], 16)        # V: one kernel load per 16 output channels
         part = per // nl
         for k in (range(nl) if ks is None else ks):
-            # V: load k goes to slot k mod R of the WEIGHT chunk (a ring when R < the loads; the stream part's io)
+            # V: load k goes to slot k mod R of the WEIGHT chunk (a ring when R < the loads; stream.py's io)
             _weight_load(dmas, grp_of[li], v_w[li], per, part, k, nin, nl,
                          w_chunk[li]["off"] + (k % ring[li]) * w_chunk[li]["step"])
 
@@ -458,7 +459,7 @@ def _single_block(layers, shapes, lis, wsize, v_src, v_dst, v_w, g0, dmas, fix_n
 
 def _weight_load(dmas, g, v_w, per, part, k, nin, nl, sram_off):
     """the load of pass k of a conv's weights (per bytes per IDP, part per pass) into SRAM offset sram_off: one DMA over
-    the IDPs (DRAM c_stride per - part), or, when the kernel passes 4 MiB in all (4 x per; the stream part's rule),
+    the IDPs (DRAM c_stride per - part), or, when the kernel passes 4 MiB in all (4 x per; stream.py's rule),
     one per IDP through its own SRAM vector (V: k3c64-ci512, s2c64 cut; tiling3 ra002, ra067 rings: source c x per +
     k x part, part / 64 rows of 64 B)"""
     if 4 * per > 4 << 20 and nin > 1:
@@ -542,7 +543,7 @@ def _io(dmas):
 def plan(low, weight_sizes=None, strict=True, fix_npuc=False):
     """NPUC's plan: groups, ops, SRAM chunks, vectors and DMAs (see the module docstring); plan_tiled() when a layer
     needs tiling. weight_sizes: the byte size of each conv's WEIGHT block in layer order (they set the SRAM
-    allocation); by default weights.py's (the weights part) when it can pack them, else a dense estimate (not exact
+    allocation); by default weights.py's when it can pack them, else a dense estimate (not exact
     for compressed weights). strict=False skips the refusal of plans near 256 KiB whose partial sums weights.py cannot
     tell (for callers that only need the structure).
     fix_npuc=True writes the two DMA strides NPUC gets wrong (G until run on the NPU, docs/format/frame.md
@@ -630,15 +631,16 @@ def _plan(low, weight_sizes, strict, fix_npuc):
 
 # ---- NPUC's "CMDQ seems too big" cut (docs/format/cmdq.md 7d; frame.md 6.9) ---------------------------------
 CMDQ_LIMIT = 61440
-_IN_STREAM = False      # set while frame asks the stream part for its plan (stream.Plan calls frame.plan back)
+_IN_STREAM = False      # set while frame asks stream.py for its DMAs (stream.Plan calls frame.plan back)
 
 
 def copies_any(placed):
+    """a plan with one of NPUC's trim-and-spill copies"""
     return any(c.get("copy") for c in placed)
 
 
 def _cmdq_estimate(L, shp):
-    """NPUC's "Heuristically predicted size of CMDQ" for a layer's group (the stream part's rule, V on 1619 blocks):
+    """NPUC's "Heuristically predicted size of CMDQ" for a layer's group (stream.py's rule, V on 1619 blocks):
     16350 + 1020 per conv pass + 60 per padded plane slot + 102 per reformatted one + 150 per pooled one"""
     C = shp["in"][0]
     slots = cdiv(cell(C, 1, 1)["cpi"], 2)
@@ -698,7 +700,7 @@ def _unflatten_tiles(Co, Hi, Wi, after_conv=True):
 
 def _cut_plan(low, layers, shapes, placed, ops, dmas, wsize, v_in, v_im, v_w, av, mv, v_out, convs, oshape, fix_npuc):
     """a single-tile plan where NPUC cuts a layer's group in chunks (cmdq.md 7d): the groups and the DMA order, events
-    and batches are the stream part's (stream.plan_dmas: per chunk its input slots, its passes' weights, its store);
+    and batches are stream.py's (stream.plan_dmas: per chunk its input slots, its passes' weights, its store);
     the descriptors are built here: input slot loads as the clustered loads (section 5), each pass's weight load (core
     by core, 4 per pass to the same slot, when the kernel passes 4 MiB: k3c64-ci512, s2c64), a store per chunk of its
     passes' planes (_range_store), the output read-back"""
@@ -848,7 +850,7 @@ def plan_graph(low, weight_sizes=None):
 
     def coff(t, kn):
         # a producer's place in a concat's DRAM buffer: after the earlier inputs' channels, each a half plane of the
-        # concat's cells (V: cat2, g030; uneven splits 1+7, 3+5, 5+3, 20+12 of the weights part's cat sweep)
+        # concat's cells (V: cat2, g030; uneven splits 1+7, 3+5, 5+3, 20+12 of weights.py's cat sweep)
         o = 0
         for x in ins[kn]:
             if x == t:
@@ -976,7 +978,7 @@ def _tile_geometry(layers, shapes, lis, rt, ct):
     loaded range (start aligned down to the cell, 4 rows / 8 columns: V). A tile whose output reaches the stratum
     output's last row (column) computes every layer's output to that layer's last row (column), its input to the
     tensor's end with the layer's trailing pad (V: tiling2 e03, e04, 2x2 pools on 27 x 31 behind a 3x3 conv; NPUC's
-    layouts add each layer's rounding left-over to the last tile, frame.md 6.10: the stream part's tile_to_end)"""
+    layouts add each layer's rounding left-over to the last tile, frame.md 6.10: stream.py's tile_to_end)"""
     geo = []
     end_h, end_w = shapes[lis[-1]]["out"][1] - 1, shapes[lis[-1]]["out"][2] - 1
     for r in rt:
@@ -1689,7 +1691,7 @@ def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
 
 
 def _sub_batches(low):
-    """{conv layer index: its weight sub-batch count} from weights.py (the weights part); None for a conv it cannot
+    """{conv layer index: its weight sub-batch count} from weights.py; None for a conv it cannot
     pack (then the PARTIAL_SUM chunk is unknown)"""
     out = {}
     for li, L in enumerate(low["layers"]):
@@ -1874,7 +1876,7 @@ def batches_from_streams(io, streams, capped=(), wvecs=()):
     ev2set once per batch with the batch's trigger bits << 16, in uid order; a batch of more than 16 DMAs (trigger
     bits wrap) takes a second write for the wrapped ones of the same direction, which continues it, except in a group
     of `capped` (a tile group with a TRIM or a weight ring) once the batch holds 15 weight loads (loads from a vector
-    of `wvecs`): the stream part's cap, cmdq.md 7b (V: tiling3 tr-c8, the input + 15 of 16 passes, the 16th a batch of
+    of `wvecs`): stream.py's cap, cmdq.md 7b (V: tiling3 tr-c8, the input + 15 of 16 passes, the 16th a batch of
     its own). Returns the bids, or None when the streams do not match the DMAs (then plan()'s own rule stands: runs of
     one direction in one group, at most 15 DMAs; the streams contradict it only for some batches of exactly 16
     loads)."""
@@ -1919,7 +1921,7 @@ def frame(low, streams, intrinsics_, weights, fix_npuc=False):
         raise ValueError("%d groups planned, %d streams and %d intrinsics given" % (G, len(streams), len(intrinsics_)))
     av = [list(a) for a in p["av"]]
     mv, io = p["mv"], [list(x) for x in p["io"]]
-    # the batches the streams declare; a cut plan keeps the stream part's (a group with 64 loads or more has them all
+    # the batches the streams declare; a cut plan keeps stream.py's (a group with 64 loads or more has them all
     # in one batch while its triggers come in sub-batches: cmdq.md 7d)
     capped = set(g for st in p.get("strata", []) if st["kind"] == "tiled"
                  and (any(o["op"] == "TRIM" for o in st["ops"])
@@ -2039,6 +2041,7 @@ MEASURED_8x16x16 = {0: 0, 1: 1, 2: 2, 3: 4, 4: 5, 5: 8, 6: 3, 7: 6, 8: 7, 9: 9, 
 
 
 def selftest():
+    """the IFM layout against the NPU-measured 8x16x16 map and injectivity on other shapes; the A32 encoder"""
     n = 0
     C, H, W = 8, 16, 16
     for c in range(C):
@@ -2065,6 +2068,7 @@ def selftest():
 
 
 def check(dirs):
+    """our container around NPUC's own streams and weight blocks, against each variant's net.ncp; 0 when all exact"""
     n = ok = iok = 0
     fails = {}
     for d in dirs:
@@ -2103,6 +2107,7 @@ def check(dirs):
 
 
 def main(argv=None):
+    """the command line (module docstring)"""
     ap = argparse.ArgumentParser(prog="frame.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

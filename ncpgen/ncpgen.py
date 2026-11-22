@@ -203,6 +203,7 @@ def cmd_corpus(d, jobs):
 
 
 def main(argv=None):
+    """the command line (module docstring)"""
     ap = argparse.ArgumentParser(prog="ncpgen", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("gen", help="the NCP of a model")

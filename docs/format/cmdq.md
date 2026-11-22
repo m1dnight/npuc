@@ -221,14 +221,15 @@ else 1 (r015, r067: 9 channels, ppc 2; c34p...).
 ## 7b. Tiling, weight rings, allocation fallbacks (V: tile sweep `stream_variants_tile.txt`, 73 networks; the
 frame part's tiled compiles `$NCPGEN_WORK/sweep/frame/fs/{tiled,t2..t5,dim}`, 153)
 
-**Who decides.** When `ncpgen/frame.py` is present, stream.py takes every tiling decision from `frame.plan(low)`
+**Who decides.** stream.py takes every tiling decision from `frame.plan(low)`
 (NPUC's own policy since frame.md 6.10: strata, tiles, back-propagated per-layer ranges and pads, SRAM chunks, a tiled
 conv's ring and slot step) so both halves of the NCP agree; the two old refusals (a stratum with a halo pool, a conv
 with weight sub-batches) are gone (V: final-chains f002, f012, f059; tiling2 a*, c*, d*, g*: 50 networks; the tile
-sweep's w300pool, tch5, r_c256h40, c512, r_c384, r_c448, t-32x32-* stay exact through `frame_stratum`). Its own
-planner (`Plan.tiled_conv`, `Plan.segment`) now runs only without frame.py. Overrides of ours (V, below): a tile that
-reaches the end of the stratum's output computes every layer to its end (`tile_to_end`, with the chunks re-allocated
-by frame.py's own allocator, `stratum_chunks`), and the read-back tiling.
+sweep's w300pool, tch5, r_c256h40, c512, r_c384, r_c448, t-32x32-* stay exact through `frame_stratum`). The old
+planner of its own (`Plan.tiled_conv`, `Plan.segment`, which ran only without frame.py) is gone: a layer frame.plan does
+not tile but the untiled layout cannot hold raises NeedsTiling. Checks and overrides of ours (V, below): a tile that
+reaches the end of the stratum's output computes every layer to its end (`tile_to_end`; frame.plan's tiles already
+are, and a tile it would extend is refused), and the read-back tiling.
 
 **A tile's own geometry** (V: tiling2 e03, e04: 3x3 conv, 2x2 pools on 54 x 62 -> 27 x 31 -> 13 x 15): a tile whose
 output reaches the stratum output's last row (column) extends every layer's output to that layer's last row (column)

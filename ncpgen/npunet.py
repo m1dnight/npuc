@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""npunet: the host half of "run a network on the Exynos 990 NPU" (PORT-32; npu/README.md). Pure Python 3: no numpy,
-no flatbuffers package (a minimal FlatBuffer reader and writer are below).
+"""npunet: models in, and the host half of running them on the Exynos 990 NPU (the porting kit's npu/README.md). Pure
+Python 3: no numpy, no flatbuffers package (a minimal FlatBuffer reader and writer are below).
 
-  npunet.py lower <model.tflite|net.json> <dir> [--quant 1|3] [--fold-per-channel]
+  npunet.py lower <model.tflite|net.json> <dir> [--quant 1|3] [--allow-none] [--fold-per-channel]
         the model as the NPU will compute it: <dir>/lowered.json (every parameter explicit) and <dir>/net.npuc (the
         phone's compiler harness input, oracle/harness/npuc-net.cpp)
   npunet.py ref <lowered.json> <input.bin> <output.bin>        the CPU reference: the model's output bytes
@@ -17,7 +17,7 @@ no flatbuffers package (a minimal FlatBuffer reader and writer are below).
   npunet.py selftest
 
 Model formats. (1) A quantized TFLite file (int8 or uint8, one subgraph, one input, one output; ops in graph order,
-a tensor may feed several ops). (2) Our graph JSON "npu-net/1" (npu/README.md; npu/example/tiny-net.json): the same
+a tensor may feed several ops). (2) Our graph JSON "npu-net/1" (example_graph() below; the porting kit's npu/README.md): the same
 information, written by hand or by a script. Each layer reads the previous layer's output unless it names its
 input(s): "input": "<tensor>" or "inputs": ["<a>", "<b>", ...] (a tensor = the network input's or a layer's "name").
 input.bin / output.bin are the model's own tensors: NHWC, in the model's dtype (int8 or uint8), as a TFLite
@@ -75,11 +75,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def die(msg):
+    """print the refusal and exit 1"""
     print("npunet: FAIL: " + msg)
     sys.exit(1)
 
 
 class Refused(Exception):
+    """a model this path cannot take (NPUC would refuse it, or it is not modelled)"""
     pass
 
 
@@ -122,6 +124,7 @@ def rnd(v, mode):
 
 # ---- a minimal FlatBuffer reader (enough for TFLite's schema) ----------------------------------------------------
 class FTable:
+    """a FlatBuffer table at pos in b"""
     def __init__(self, b, pos):
         self.b, self.pos = b, pos
         self.vt = pos - struct.unpack_from("<i", b, pos)[0]
@@ -178,6 +181,7 @@ class FTable:
 
 # ---- a minimal FlatBuffer writer: front to back, children after their parent (every uoffset forward) ----------
 class FWriter:
+    """a FlatBuffer written front to back"""
     def __init__(self, ident=b"TFL3"):
         self.b = bytearray(8)
         self.b[4:8] = ident
@@ -350,6 +354,7 @@ def _read_tflite(data):
 
 
 def tflite_summary(tf):
+    """one line per operator of a read TFLite model"""
     lines = []
     for o in tf["ops"]:
         t = tf["tensors"][o["outputs"][0]] if o["outputs"] else {}
@@ -1027,6 +1032,7 @@ def npuc_text(low):
 
 
 def load_model(path, quant=1, fold=False, allow_none=False):
+    """a TFLite file or an npu-net/1 JSON -> lowered.json's dict (lower())"""
     data = open(path, "rb").read()
     tfl = is_tflite(data) and not data.lstrip()[:1] == b"{"
     if tfl:
@@ -1044,6 +1050,7 @@ def load_model(path, quant=1, fold=False, allow_none=False):
 
 # ---- the CPU reference -------------------------------------------------------------------------------------------
 def ref_conv(l, x, rounding, none_defect, quant):
+    """a lowered conv on a CHW uint8 tensor, NPUC's arithmetic (bias, multiplier, rounding, the activation)"""
     C, H, W = l["in_chw"]
     cout, (kh, kw), (sh, sw) = l["cout"], l["k"], l["stride"]
     pt, pb, pl, pr = l["pads"]
@@ -1083,6 +1090,7 @@ def ref_conv(l, x, rounding, none_defect, quant):
 
 
 def ref_pool(l, x):
+    """a lowered max/average pool on a CHW tensor (TFLite's arithmetic for the average)"""
     C, H, W = l["in_chw"]
     (kh, kw), (sh, sw) = l["k"], l["stride"]
     pt, _, pl, _ = l["pads"]
@@ -1144,6 +1152,7 @@ def ref_eltwise(l, a, b, rounding="half_away", variant="sum"):
 
 
 def ref_relu(l, x, variant="max"):
+    """a standalone ReLU layer: max(x, zero point) (or the variant compare tries)"""
     zp = l["out_zp"]
     if variant == "identity":
         return bytes(x)
@@ -1229,6 +1238,7 @@ def cpu_tail(low, y_chw):
 
 # ---- IO: the model's bytes <-> CHW uint8 -------------------------------------------------------------------------
 def model_in_to_chw(low, data):
+    """the model's input tensor (NHWC, its dtype) -> the NPU's uint8 CHW values"""
     C, H, W = low["input"]["chw"]
     if len(data) != C * H * W:
         raise Refused("input is %d B; the model takes %d (NHWC 1x%dx%dx%d %s)" % (len(data), C * H * W, H, W, C, low["io_dtype"]))
@@ -1238,10 +1248,12 @@ def model_in_to_chw(low, data):
 
 
 def out_to_model(low, y):
+    """the NPU part's output (after the CPU tail) -> the model's output bytes (NHWC, its dtype)"""
     return bytes(b ^ 0x80 for b in y) if low["io_dtype"] == "int8" else bytes(y)
 
 
 def reference(low, data, rounding="half_away", none_defect=False):
+    """the CPU reference: the model's output bytes for its input bytes"""
     return out_to_model(low, cpu_tail(low, ref_npu(low, model_in_to_chw(low, data), rounding, none_defect)))
 
 
@@ -1250,6 +1262,7 @@ MV_TYPES = {0: "IN_FMAP", 1: "OT_FMAP", 2: "IM_FMAP", 7: "WEIGHT"}
 
 
 def ncp_parse(d):
+    """(address vectors, memory vectors, io descriptors) of an NCP v22; Refused for anything else"""
     if len(d) < 0x80:
         raise Refused("not an NCP (%d B)" % len(d))
     h = struct.unpack_from("<32I", d, 0)
@@ -1349,11 +1362,13 @@ def ncp_layout_basic(low, ncp):
 
 
 def ifm_addr(c, y, x, lay):
+    """byte offset of input element (c, y, x) in the NPU's IFM buffer described by a layout"""
     w = lay["ifm"]["plane_w"]
     return (c // 2) * lay["ifm"]["plane_h"] * w + (y // 4) * 4 * w + (x // 8) * 64 + (c % 2) * 32 + (y % 4) * 8 + (x % 8)
 
 
 def to_npu(low, lay, chw):
+    """CHW input values -> the bytes of the NPU's IFM buffer (layout from ncp_layout)"""
     C, H, W = low["input"]["chw"]
     pad = low["input"]["zp"]
     buf = bytearray([pad]) * lay["ifm"]["size"]
@@ -1367,6 +1382,7 @@ def to_npu(low, lay, chw):
 
 
 def from_npu(low, lay, ofm, layout="CHW"):
+    """the NPU's OFM buffer -> CHW values (or HWC with layout='HWC')"""
     C, H, W = low["npu_out_chw"]
     n = C * H * W
     if len(ofm) < n:
@@ -1596,11 +1612,13 @@ def cmd_variants(d):
 
 
 def example_input(seed=0x4E505532, n=2048):
+    """the example's deterministic input bytes"""
     r = random.Random(seed)
     return bytes(r.randrange(256) for _ in range(n))
 
 
 def cmd_example(d):
+    """write the tiny example (graph JSON, TFLite, input, expected output) into d"""
     os.makedirs(d, exist_ok=True)
     g = example_graph()
     json.dump(g, open(os.path.join(d, "tiny-net.json"), "w"), indent=1)
@@ -1648,6 +1666,7 @@ def residual_graph():
 
 
 def cmd_example_residual(d):
+    """write the residual block example (two inputs and outputs) into d"""
     os.makedirs(d, exist_ok=True)
     g = residual_graph()
     json.dump(g, open(os.path.join(d, "residual-net.json"), "w"), indent=1)
@@ -1683,6 +1702,7 @@ def cmd_example_residual(d):
 
 # ---- self-test -----------------------------------------------------------------------------------------------------
 def selftest():
+    """the lowering, the reference and the layout against facts and the examples; 0 when all pass"""
     ok = []
     # 1. NPUC's multiplier on the values its log printed (npu-compiler.md 9.8: slope 16, shift 15)
     ok.append(("multiplier 1/128 x 1/256 / (1/16) = 16 / 2^15", npuc_multiplier(1 / 128, 1 / 256, 1 / 16) == (16, 15)))
@@ -2031,6 +2051,7 @@ def cmd_lower(a):
 
 
 def cmd_ref(a):
+    """the CPU reference of an input"""
     low = json.load(open(a.lowered))
     y = reference(low, open(a.input, "rb").read())
     open(a.output, "wb").write(y)
@@ -2038,6 +2059,7 @@ def cmd_ref(a):
 
 
 def cmd_layout(a):
+    """the NPU's IFM/OFM formats of an NCP, into a layout JSON"""
     low = json.load(open(a.lowered))
     lay = ncp_layout(low, open(a.ncp, "rb").read())
     json.dump(lay, open(a.layout, "w"), indent=1)
@@ -2049,6 +2071,7 @@ def cmd_layout(a):
 
 
 def cmd_to_npu(a):
+    """a model input -> the NPU's IFM buffer"""
     low, lay = json.load(open(a.lowered)), json.load(open(a.layout))
     b = to_npu(low, lay, model_in_to_chw(low, open(a.input, "rb").read()))
     open(a.out, "wb").write(b)
@@ -2056,6 +2079,7 @@ def cmd_to_npu(a):
 
 
 def cmd_from_npu(a):
+    """the NPU's OFM buffer -> the model's output"""
     low, lay = json.load(open(a.lowered)), json.load(open(a.layout))
     y = out_to_model(low, cpu_tail(low, from_npu(low, lay, open(a.ofm, "rb").read())))
     open(a.out, "wb").write(y)
@@ -2063,6 +2087,7 @@ def cmd_from_npu(a):
 
 
 def cmd_compare(a):
+    """the NPU's outputs against the CPU reference; 0 when bit-exact or within 1 LSB"""
     low, lay = json.load(open(a.lowered)), json.load(open(a.layout))
     pairs = [(open(p.split(":", 1)[0], "rb").read(), open(p.split(":", 1)[1], "rb").read()) for p in a.pairs]
     v, why = compare(low, lay, pairs)

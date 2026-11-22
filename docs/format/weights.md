@@ -2,7 +2,7 @@
 
 How NPUC 1.36.1.a (the host oracle, `oracle/npuc-local.sh`) packs a conv layer's weights into the NCP's
 WEIGHT address-vector blocks, measured by differential compiles and read from `libnpuc_template.so` (NPU2020 LIR kernel
-pack). Code: `ncpgen/weights.py` (`weight_blocks(low)`, `weight_block_sizes(low)`,
+pack). Code: `ncpgen/weights.py` (`weight_blocks(low)`, `weight_block_sizes(low)`, `conv_block(L, quant_mode)`,
 `weight_geometry(low)`, `check <variant dir>...`). Tags: V = seen in bytes, logs or disassembly; G = guess.
 
 ## Status (2026-11-22)

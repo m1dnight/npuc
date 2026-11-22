@@ -22,6 +22,7 @@ ROOT = os.environ.get("NPU_ROOT") or os.path.join(os.environ.get("NCPGEN_WORK") 
 
 
 class Net:
+    """an npu-net/1 network being written, with each tensor's channels, size and scale"""
     def __init__(self, name, h, w, c, seed=1):
         self.r = random.Random(seed)
         self.g = {"format": "npu-net/1", "name": name,
@@ -76,6 +77,7 @@ class Net:
 
 
 def variants():
+    """{name: Net} of the graph sweep"""
     V = {}
 
     def mk(name, h=16, w=16, c=8, seed=1):
@@ -303,6 +305,7 @@ def random_net(name, seed):
 
 
 def main(argv=None):
+    """the command line (module docstring)"""
     ap = argparse.ArgumentParser(prog="stream_graphs.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

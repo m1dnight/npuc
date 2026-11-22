@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""The WEIGHT blocks of an NCP, generated from npunet.py's lowered form (PORT-32, the open NCP generator; notes in
-docs/format/weights.md). Pure Python, no vendor bytes: the packing below was measured against NPUC 1.36.1.a
-(the byte-exact oracle, oracle/npuc-local.sh) by differential compiles.
+"""The WEIGHT blocks of an NCP, generated from npunet.py's lowered form (notes in docs/format/weights.md). Pure Python,
+no vendor bytes: the packing below was measured against NPUC 1.36.1.a (the byte-exact oracle, oracle/npuc-local.sh)
+by differential compiles.
 
-  python3 -I weights.py check [--loose] <variant dir>...   compare with the oracle's WEIGHT blocks (lowered.json +
-                                                  net.ncp); --loose also generates the unmodelled corner
-  python3 -I weights.py show <lowered.json>       the geometry and block sizes this module computes
+  weights.py check <variant dir>...    compare with the oracle's WEIGHT blocks (lowered.json + net.ncp)
+  weights.py show <lowered.json>       the geometry and block sizes this module computes
 
 Interface: weight_blocks(low) -> list[bytes], every WEIGHT block in the NCP's order (padding included): a chain, one per
 conv (and standalone ReLU) in layer order; a graph (eltwise, concat, standalone ReLU), one per conv, eltwise and ReLU
-in NPUC's execution order (exec_order). layer_blocks(low) -> [(layer, kind, block)]; weight_block_sizes(low); weight_geometry(low) -> per conv what the io descriptors need (cores, rows per load,
-loads...); weight_layers(low) (convs and ReLU dummy convs, layer order: sizes for the stream part).
+in NPUC's execution order (exec_order). layer_blocks(low) -> [(layer, kind, block)]; weight_block_sizes(low);
+conv_block(L, quant_mode) -> (geometry, block); weight_layer_info(low) (sizes and geometry for stream.py);
+weight_geometry(low) -> per conv what the io descriptors need (cores, rows per load, loads...); weight_layers(low)
+(convs and ReLU dummy convs, layer order).
 
 Graph layers (V: graph sweeps 98 + 47 + 66, ops-check 13, npunet-graph 10, all exact): a conv reading a concat kept in
 SRAM sees each core holding [input 1's core share, input 2's, ...] (_segments); an eltwise's block is its CU_BIN
@@ -744,6 +745,7 @@ def check(dirs):
 
 
 def main(argv=None):
+    """the command line (module docstring)"""
     ap = argparse.ArgumentParser(prog="weights.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

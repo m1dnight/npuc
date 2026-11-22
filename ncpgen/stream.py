@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""ncpgen/stream: the CMDQ instruction streams of an NCP's groups, generated from npunet's lowered form, byte for byte
-as Samsung's NPUC 1.36.1.a emits them (PORT-32; docs/format/cmdq.md holds the register map and its evidence).
+"""The CMDQ instruction streams of an NCP's groups, generated from npunet's lowered form, byte for byte as Samsung's
+NPUC 1.36.1.a emits them (docs/format/cmdq.md holds the register map and its evidence).
 
   stream.py check <variant dir>...     compare group_streams(<dir>/lowered.json) with the isa bytes of <dir>/net.ncp
                                        (compiled by the oracle, oracle/npuc-local.sh; nothing is compiled
@@ -9,8 +9,8 @@ as Samsung's NPUC 1.36.1.a emits them (PORT-32; docs/format/cmdq.md holds the re
   stream.py events <variant dir>...    replay NPUC's event schedule from <dir>/log.txt's memory profile and compare
                                        its ev2set lines and waits with NPUC's streams (cmdq.md 7b)
 
-Interface: group_streams(low, fixed=False) -> list[bytes], low = lowered.json's dict. fixed=True asks the GReLU hook
-for the corrected activation table instead of NPUC's (ncpgen/grelu.py when present).
+Interface: group_streams(low, fixed=False) -> list[bytes], low = lowered.json's dict; fixed is grelu.grelu_regs'
+(True: the corrected activation table, "robust", False: NPUC's own). plan_dmas(low) lists the DMAs for frame.py.
 
 Instruction encoding (V, NPUC's compile log): 6 bytes, u32 value then u16 opcode. set_reg: opcode = block << 12 |
 word index (CMDQ 8 @0x401e0000, MTC 9 @0x40120000, NFUBR a @0x40160000, INTCOM b @0x40100000); nop = 0/0;
@@ -19,14 +19,10 @@ waiti3(irN, rM, v) = 0x3a00 | N << 4 | M; wait3(rN, rM, v) = 0x2b00 | N << 4 | M
 The model, in NPUC's own terms (its log: IR elements, events, SRAM chunks), for the family it covers: chains of
 convolutions (stride 1 or 2, kernels up to 13, SAME or VALID, any channel count up to 255, several output passes,
 weight sub-batches with partial sums, weight rings) and max/avg pools, whole or tiled (NPUC's strata from
-frame.plan: per-tile groups with trim, then every layer's pad, reformat, conv or pool; dossier cmdq.md 7b),
-and untiled graphs (npuc-net 2: eltwise add as an ARM intrinsic group, concat in DRAM or SRAM, standalone ReLU/ReLU6
-as NPUC's dummy conv; cmdq.md 7c).
-Anything outside raises Unsupported rather than guess. plan_dmas(low) lists the DMAs for the container.
-
-Uses the sibling modules when present: grelu.py (the activation table, grelu_regs) and weights.py (rows per weight
-batch and the sub-batch split, conv_block); without them it falls back on its own derivations (NPUC's table; batch
-sizes without sub-batches).
+frame.plan: per-tile groups with trim, then every layer's pad, reformat, conv or pool; cmdq.md 7b), and untiled
+graphs (npuc-net 2: eltwise add as an ARM intrinsic group, concat in DRAM or SRAM, standalone ReLU/ReLU6 as NPUC's
+dummy conv; cmdq.md 7c). The activation table is grelu.py's, the weight batches' rows and sub-batches weights.py's.
+Anything outside raises Unsupported rather than guess.
 """
 import argparse
 import json
@@ -245,6 +241,7 @@ def unflatten_tiles(d, ho, wo):
 
 # ---- planning: groups, IR elements, events, SRAM ---------------------------------------------------------------------
 class Op:
+    """an IR element of a group: its kind, its dependencies (indices in the group) and its fields"""
     def __init__(self, kind, **kw):
         self.kind = kind
         self.deps = []
@@ -384,7 +381,7 @@ class Plan:
                             min(last["ho"], (u + 1) * cdiv(cdiv(last["ho"], nu), 4) * 4))) for k in range(nl)]
             self.groups.append(ops + [Op("nopop", deps=list(range(nl))), Op("unflatten")])
 
-    # ---- tiled plans from the frame part (ncpgen/frame.py) -----------------------------------------------------
+    # ---- tiled plans from frame.py -----------------------------------------------------
     def frame_plan(self):
         """frame.plan(low) when NPUC tiles this network: frame.py's tiling decisions (strata, tiles, back-propagated
         ranges, SRAM chunks; V on its sweep), so that both halves of the NCP agree. None (the planner below) when
@@ -718,7 +715,7 @@ class Plan:
     def copy_group(self, d):
         """NPUC's trim-and-spill copy (frame.md 6.6; V: ws-191-256x2, r3-076/077/096/111): its own group, no DMA:
         one NFU copy (TRIM mode, no skip) per plane slot of the layer's input and NFU command piece, from the
-        spilled chunk to the new one, every core (V: the oracle's streams, per the frame part; tiling2 b03, b05)"""
+        spilled chunk to the new one, every core (V: the oracle's streams, per frame.py; tiling2 b03, b05)"""
         din, h, w = d["din"], d["h"], d["w"]
         src, dst = d["copy"]["src"] // 64, d["copy"]["dst"] // 64
         # NFU command pieces as any NFU op (V: tiling2 b03, b05: 138 and 128 columns in 2 pieces)
@@ -1388,6 +1385,7 @@ class Plan:
 
 # ---- emission ----------------------------------------------------------------------------------------------------
 def emit_pad(c, op, q, tail):
+    """an NFU pad command (one plane slot, one piece)"""
     L, din = op.L, op.din
     cm = op.cm
     pt, pb, pl, pr = getattr(op, "tpads", L["pads"])
@@ -1522,10 +1520,12 @@ def emit_reformat(c, op, q, tail):
 
 
 def shift_code(s):
+    """the MTC's encoding of a requantisation shift"""
     return s << 11 | s << 6
 
 
 def emit_conv(c, op, q, fixed, tail, cache=None):
+    """one MTC convolution pass: its registers, weights, partial sums, GReLU table and shifts"""
     L, din, dout, p = op.L, op.din, op.dout, op.p
     kh, kw = op.k
     c.w(MTC + 0x004, 0x420)
@@ -1610,6 +1610,7 @@ def emit_conv(c, op, q, fixed, tail, cache=None):
 
 
 def clear_regs(c):
+    """the registers NPUC clears at the end of a group"""
     for i in range(1, 16):
         c.w(R[i], 0)
 
@@ -1645,6 +1646,7 @@ def group_schedule(ops, plan):
 
 
 def emit_group(gi, ops, plan, last, fixed):
+    """the instructions of one group (its ops in NPUC's order, the DMA triggers and waits of its event schedule)"""
     c = Code()
     for op in ops:
         op.group = gi
@@ -1763,6 +1765,7 @@ def emit_group(gi, ops, plan, last, fixed):
 
 
 def group_streams(low, fixed=False):
+    """the isa bytes of every group of the network (the isa area padded to 64 bytes)"""
     plan = Plan(low)
     codes = [emit_group(gi, ops, plan, gi == len(plan.groups) - 1, fixed) for gi, ops in enumerate(plan.groups)]
     out = [c.bytes() for c in codes]
@@ -2418,6 +2421,7 @@ decode = decode_isa
 
 
 def check(dirs):
+    """our streams against each variant's net.ncp; True when none differs"""
     n_ok = n_bad = n_uns = 0
     for d in dirs:
         name = os.path.basename(os.path.normpath(d))
@@ -2453,6 +2457,7 @@ def check(dirs):
 
 
 def show(d, diff=False):
+    """print our streams (with diff: only the instructions that differ from NPUC's)"""
     low = json.load(open(os.path.join(d, "lowered.json")))
     got = group_streams(low)
     want = ncp_streams(open(os.path.join(d, "net.ncp"), "rb").read()) if diff else None
@@ -2470,6 +2475,7 @@ def show(d, diff=False):
 
 
 def main(argv=None):
+    """the command line (module docstring)"""
     ap = argparse.ArgumentParser(prog="stream.py", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)

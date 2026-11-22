@@ -31,14 +31,18 @@ outputs; a conv after a widened pool): `--fix-npuc` corrects them, unproven on t
 
 ```bash
 # a model -> an NCP (TFLite int8/uint8 or the npu-net/1 JSON of ncpgen/npunet.py)
-python3 -I ncpgen/ncpgen.py gen model.tflite net.ncp [--quant 1|3] [--allow-none] [--grelu fixed|robust|npuc] [--fix-npuc]
+python3 -m ncpgen gen model.tflite net.ncp [--quant 1|3] [--allow-none] [--grelu fixed|robust|npuc] [--fix-npuc]
 
 # the CPU reference: what the NPU must output for an input (the model's own NHWC tensor)
-python3 -I ncpgen/npunet.py lower model.tflite low/        # low/lowered.json, low/net.npuc
-python3 -I ncpgen/npunet.py ref low/lowered.json input.bin expected.bin
+python3 -m ncpgen lower model.tflite low/                  # low/lowered.json, low/net.npuc
+python3 -m ncpgen ref low/lowered.json input.bin expected.bin
 
+python3 -m ncpgen -h                                       # every command; a part's own: python3 -m ncpgen stream -h
 tests/run.sh                                               # the tests, no vendor file needed
 ```
+
+`python3 -m ncpgen` runs from the repository's root. Each module also runs as a script from anywhere, e.g.
+`python3 -I ncpgen/ncpgen.py gen ...` or `python3 -I ncpgen/npunet.py lower ...` (the porting kit calls them so).
 
 Running an NCP needs the NPU, its firmware (`NPU.bin`, from the phone's own stock firmware; not distributable) and a
 driver: the [nervesinator](../nervesinator) porting kit has a test driver and the scripts (`ports/samsung-x1s/npu/`).
@@ -47,15 +51,16 @@ driver: the [nervesinator](../nervesinator) porting kit has a test driver and th
 
 | Path | What |
 |---|---|
-| `ncpgen/ncpgen.py` | the generator's entry: `gen`, `check` (against compiled networks), `corpus` |
+| `ncpgen/ncpgen.py` | the generator: `generate(low)`; `gen`, `check` (against compiled networks), `corpus` (`ncpgen/__main__.py`: `python3 -m ncpgen`) |
 | `ncpgen/stream.py` | the CMDQ instruction streams (`docs/format/cmdq.md`) |
 | `ncpgen/frame.py` | the container: header, vectors, DMA descriptors, intrinsics, NPUC's plan and tiling policy, the input layout (`docs/format/frame.md`) |
 | `ncpgen/weights.py` | the weight packing (`docs/format/weights.md`) |
 | `ncpgen/grelu.py` | the activation table (`docs/format/grelu.md`) |
 | `ncpgen/npunet.py` | models in: TFLite or JSON lowered to NPUC's arithmetic; the exact CPU reference; input/output conversion |
+| `ncpgen/common.py` | what the parts share: float32 arithmetic and NPUC's multiplier, topology, the instruction encoding, an NCP's sections, memoisation |
 | `ncpgen/*_sweep*`, `stream_variants*.txt`, `stream_graphs.py`, `frame_sweep.py` | the sweeps each rule was found and checked on |
 | `oracle/` | NPUC as an oracle: our harness around it (`harness/`), the host runner, `npuc-local.sh`, `npuc-variant.py`, `ncp-dump.py`, Ghidra scripts (`ghidra/`), op tests (`ops/`); `docs/oracle.md` |
-| `tests/` | `run.sh` and `golden.txt` |
+| `tests/` | `run.sh` and `golden.txt`; `regress.sh` (against the work folder's compiles); `snapshot.py` (every output of the code on the work folder, recorded and compared: the bar for a refactor) |
 
 ## Vendor files
 
