@@ -5,8 +5,7 @@
 #   tests/regress.sh [set...]       (default: every set under $NCPGEN_WORK/sweep)
 # Prints "<set>: <exact> of <n>" per set and a total. Known misses: graph 93/98 and graph-random2 64/66 (NPUC's own
 # uninitialised bytes, docs/oracle.md); grelu/r 1/5 (hand-edited net.npuc files whose lowered.json does not describe the
-# compiled network: ncpgen refuses them); zoo 1 (mobilenet-v1-100-224: a CMDQ cut and a spill in a tiled plan's single
-# blocks: not modelled, models/README.md). Every other set must be exact. Exit 0 when only those known misses remain.
+# compiled network: ncpgen refuses them). Every other set must be exact. Exit 0 when only those known misses remain.
 # The sets are checked in parallel: REGRESS_JOBS (default: the CPU count).
 set -uo pipefail
 . "$(dirname "$0")/../oracle/env.sh"
@@ -16,7 +15,7 @@ if [ $# -gt 0 ]; then sets=("$@"); else
   mapfile -t sets < <(find . -mindepth 3 -name lowered.json -path '*/*/lowered.json' | sed 's|^\./||; s|/[^/]*/lowered.json$||' | sort -u)
 fi
 tot=0; ok=0; bad=0
-declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=1)
+declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4)
 J=${REGRESS_JOBS:-$(sysctl -n hw.ncpu 2> /dev/null || nproc 2> /dev/null || echo 4)}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # one check per set, J at a time; the results are printed in the sets' order

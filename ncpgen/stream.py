@@ -617,11 +617,15 @@ class Plan:
         # untiled: one SRAM-forwarded run of every layer, loading from and storing to DRAM (a layer NPUC tiles raises
         # NeedsTiling: frame.plan tiles every network NPUC tiles)
         self.layout(layers, final=True, inp=tuple(low["input"]["chw"]))
+        self.chain_groups = {}
         for li, L in enumerate(layers):
             if "copy" in self.info[li]:
                 self.groups.append(self.copy_group(self.info[li]))
             ev0 = self.ev
-            self.groups += self.cut(self.layer_group(li, L, first=li == 0, last=li == len(layers) - 1), ev0)
+            self.chain_groups[li] = len(self.groups)
+            sp = li + 1 < len(layers) and self.info[li + 1].get("spill")    # a spill: store, reload (6.12)
+            self.groups += self.cut(self.layer_group(li, L, first=li == 0 or self.info[li].get("spill", False),
+                                                     last=li == len(layers) - 1 or sp), ev0)
         last = self.info[-1]
         nu = unflatten_tiles(last, last["ho"], last["wo"])
         dout = last["dout"]
@@ -654,18 +658,24 @@ class Plan:
         layers = self.low["layers"]
         shapes = fp["shapes"]
         last = None
+        self.chain_groups = {}
         for st in fp["strata"]:
             lis = st["layers"]
             if st["kind"] == "single":
                 run = [layers[li] for li in lis]
-                self.layout(run, final=False, inp=tuple(shapes[lis[0]]["in"]))
+                # frame's single block (its allocation: trim and spill, the policy's rings; frame.md 6.6-6.12)
+                self.layout(run, final=False, inp=tuple(shapes[lis[0]]["in"]), fst=st)
                 for k, L in enumerate(run):
                     if "copy" in self.info[k]:
                         self.groups.append(self.copy_group(self.info[k]))
                     ev0 = self.ev
-                    self.groups += self.cut(self.layer_group(k, L, first=k == 0, last=k == len(run) - 1), ev0)
+                    self.chain_groups[lis[k]] = len(self.groups)
+                    sp = k + 1 < len(run) and self.info[k + 1].get("spill")
+                    self.groups += self.cut(self.layer_group(k, L, first=k == 0 or self.info[k].get("spill", False),
+                                                             last=k == len(run) - 1 or sp), ev0)
                 last = self.info[-1]
                 continue
+            self.chain_groups[lis[0]] = len(self.groups)
             self.frame_stratum(st, shapes)
             co, ho, wo = shapes[lis[-1]]["out"]
             last = {"dout": Dist(co), "ho": ho, "wo": wo, "conv": layers[lis[-1]]["kind"] == "conv"}
@@ -863,8 +873,9 @@ class Plan:
         self.ev += 1
         return f
 
-    def layout(self, layers, final=True, inp=None):
-        """the node order, the chunks and their offsets of an SRAM-forwarded run of layers (input from DRAM)"""
+    def layout(self, layers, final=True, inp=None, fst=None):
+        """the node order, the chunks and their offsets of an SRAM-forwarded run of layers (input from DRAM); fst: frame
+        plan's single block for them (its chunks, rings, copies and spills stand)"""
         c0, h0, w0 = inp or self.low["input"]["chw"]
         whole = [c0, h0, w0] == list(self.low["input"]["chw"]) and len(layers) == len(self.low["layers"])
         chunks = []
@@ -943,9 +954,12 @@ class Plan:
                 if d["ring"] < d["passes"] and d["ring"] <= 4:
                     # a ring of 4 slots or fewer lives on its conv only (frame.md 6.7; V: f043, wl-512-h21)
                     d["weight"].live = [d["out"].live[0], d["out"].live[0]]
-        allocate(chunks)
+        if fst is not None:
+            self.take_frame_chunks(chunks, fst["chunks"], fst["layers"])
+        else:
+            allocate(chunks)
         self.chunks = chunks
-        if whole:
+        if whole and fst is None:
             self.frame_single(chunks)
         # NPUC tiles a layer (SPLIT/TRIM/CONCAT nodes, several tiles per group: not modelled) when the SRAM a core
         # needs passes 256 KiB or an output dimension passes 255 (V: t200 one tile at 245120 B, t208 tiled at
@@ -971,23 +985,37 @@ class Plan:
             return
         if fp.get("tiled") or "chunks" not in fp:
             return
-        fc = {(c["kind"], c.get("layer", -1)): c for c in fp["chunks"]}
-        for ck in chunks:
-            c = fc.get((ck.name, ck.batch - 1))
-            if c is None:
-                return                      # not the same block: keep ours
-        for ck in chunks:
-            c = fc[(ck.name, ck.batch - 1)]
+        self.take_frame_chunks(chunks, fp["chunks"], list(range(len(self.low["layers"]))), strict=False)
+
+    def take_frame_chunks(self, chunks, fchunks, lis, strict=True):
+        """frame.plan's chunks of a single block of layers lis (global indices; our info and batches are local):
+        offsets, sizes, rings and slot steps, its trim-and-spill copies (6.7) and spilled reloads (6.12: the reader
+        loads its input into its own chunk, the producer stores)"""
+        fc = {(c["kind"], c.get("layer", -1)): c for c in fchunks}
+        loc = {li: k for k, li in enumerate(lis)}
+        key = [(ck.name, lis[ck.batch - 1] if ck.batch else -1) for ck in chunks]
+        if any(k not in fc for k in key):
+            if strict:
+                raise Unsupported("frame's single block has other chunks than ours")
+            return                          # not the same block: keep ours
+        for ck, k in zip(chunks, key):
+            c = fc[k]
             ck.off, ck.size = c["off"], c["size"]
             if ck.name == "WEIGHT":
                 d = self.info[ck.batch - 1]
                 d["ring"] = c.get("ring") or d["ring"]
                 d["wstep"] = c.get("step")
-        for c in fp["chunks"]:
+        for c in fchunks:
+            if c.get("layer") not in loc:
+                continue
+            d = self.info[loc[c["layer"]]]
             if c["kind"] == "TRIM" and c.get("copy"):
-                d = self.info[c["layer"]]
                 d["copy"] = {"src": c["src"], "dst": c["off"], "size": c["size"]}
                 d["in"] = Chunk(None, "TRIM", c["size"], list(c["live"]), d["in"].batch)
+                d["in"].off = c["off"]
+            elif c.get("spill"):
+                d["spill"], d["full"] = True, True
+                d["in"] = Chunk(None, "INPUT", c["size"], list(c["live"]), d["in"].batch)
                 d["in"].off = c["off"]
 
     def copy_group(self, d):
