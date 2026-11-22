@@ -35,7 +35,7 @@ if not __package__:     # run as a script: the package is this file's directory
 
 from ncpgen import frame, grelu, weights  # noqa: E402
 from ncpgen.common import (CMDQ, INTC, MTC, NFU, Memo, cdiv, concat_in_sram, decode_isa, encode_isa,  # noqa: E402
-                           exec_order, is_graph, multiplier, ncp_parts, network_key, requant, scale_value, set_reg_addr,
+                           exec_order, is_graph, ncp_parts, network_key, set_reg_addr,
                            set_reg_op, GRAPH_KINDS)
 
 
@@ -105,11 +105,6 @@ def cells(h, w):
 
 
 # ---- the GReLU hook ----------------------------------------------------------------------------------------------
-def layer_shift(layer):
-    """the requantisation shift of a conv (NPUC's ScaleONFiller::setScale, common.requant)"""
-    return requant(multiplier(*(scale_value(layer[k]) for k in ("in_scale", "w_scale", "out_scale"))))[2]
-
-
 def grelu_writes(layer, quant_mode, p, fixed=False, cache=None):
     """the activation table's writes for pass p of a conv, CMDQ 0x401e0050 = 1 ... = 0 included: grelu.grelu_regs
     (every pass's block), split here at the 0x401e0050 brackets. cache: a dict kept while one plan is emitted (the
@@ -2065,13 +2060,16 @@ def emit_conv(c, op, q, fixed, tail, cache=None):
     for k in range(4):
         for j in range(2):
             c.w(MTC + 0x700 + 8 * k + 4 * j, op.ofm + (2 * p + j) * oc)
-    sc = 0 if relu else shift_code(layer_shift(L))
+    # the shift word of each populated DRU: its channel's shift (per channel in NPUC's node data, docs/format/
+    # perchannel.md; one value per layer from NPUC's own frontend)
+    shifts = None if relu else [shift_code(sh) for _, sh in grelu.channel_requant(L)]
     for k in range(4):
         for j in range(2):
             v = 0
             for cc in range(2):
-                if out_channel(dout, k, p, j, cc) is not None:
-                    v |= sc << (16 * cc)
+                o = out_channel(dout, k, p, j, cc)
+                if o is not None and shifts is not None:
+                    v |= shifts[o] << (16 * cc)
             c.w(MTC + 0x900 + 8 * k + 4 * j, v)
     for k in range(4):
         for j in range(2):
