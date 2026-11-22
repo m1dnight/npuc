@@ -20,7 +20,7 @@ The porting kit's dossier (`ports/samsung-x1s/dossier/npu-compiler.md` §9.1) ha
 
 Our programs call NPUC in-process, as Android's NNAPI HAL does, through objects reconstructed in `harness/npuc.h`:
 `npuc-probe` (load test), `npuc-conv` (one conv) and `npuc-net` (a network from `npunet.py lower`'s `net.npuc`: conv, pool,
-eltwise add, concat, relu). They need the Android NDK r27d, Linux x86-64 build
+eltwise add, concat, relu, depthwise conv). They need the Android NDK r27d, Linux x86-64 build
 (`android-ndk-r27d-linux.zip`, sha256 `601246087a682d1944e1e16dd85bc6e49560fe8b6d61255be2829178c8ed15d9`), in
 `work/tools/android-ndk-r27d` or `NDK=`.
 
@@ -29,10 +29,12 @@ oracle/harness/build.sh                    # on x86-64 Linux; on a Mac, in an am
 docker run --rm --platform linux/amd64 -v "$PWD/..":"$PWD/.." -w "$PWD" python:3.12-slim-bookworm oracle/harness/build.sh
 ```
 
-It writes `work/n3/root-<sha8>/` (Bionic + NPUC + the programs, SHA256SUMS) and links `work/n3/root-current` to it.
-The build is reproducible from any path (the repository and the NDK are mapped to `.` and `/ndk` in the debug info):
-with this firmware's files and NDK r27d it gives **`root-314e61a6`** (`npuc-net-6f90837b`, `npuc-probe-85fe33b0`,
-`npuc-conv-5500f56c`). `check-symbols.py` checks every import binds in Bionic's lookup scopes before anything runs.
+It writes `work/n3/root-<sha8>/` (Bionic + NPUC + the programs, SHA256SUMS) and links `work/n3/root-current` to it
+(not with `LINK_CURRENT=0`, e.g. `docker run -e LINK_CURRENT=0 ...`, for a trial build while other runs use the current
+one). The build is reproducible from any path (the repository and the NDK are mapped to `.` and `/ndk` in the debug
+info): with this firmware's files and NDK r27d it gives **`root-fd659af2`** (`npuc-net-acc7a456`, `npuc-probe-85fe33b0`,
+`npuc-conv-6e2aa54d`; with `dwconv`, docs/format/depthwise.md); before that, root-314e61a6 (`npuc-net-6f90837b`,
+`npuc-conv-5500f56c`), which gives the same NCPs on every earlier input (docs/harness-ops.md section 4). `check-symbols.py` checks every import binds in Bionic's lookup scopes before anything runs.
 
 ## 3. Run it
 

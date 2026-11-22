@@ -30,6 +30,16 @@
 //        nn-eden-drv's ConcatAttr; NPUC places each input as a channel slice, in this order, without rescaling
 //   relu <name> <input> <ReLU|ReLU6>
 //        a standalone activation layer (Caffe type "ReLU"/"ReLU6"; NPUC makes it a 1x1 convolution)
+//   dwconv <name> <input> <stock|dwopt> <kh> <kw> <sh> <sw> <SAME|VALID> <act 0|1>
+//        <in scale hex> <in zp> <w scale hex> <w zp> <out scale hex> <out zp> <weights: C x kh x kw uint8, hex> <nbias> <bias...>
+//        a depthwise convolution, multiplier 1 (C in = C out = group, C >= 2; docs/format/depthwise.md): a Caffe
+//        "Convolution" whose ConvAttr has group = numInput = numOutput = C (as nn-eden-drv's ConvAttr::setKernelInfo
+//        sets it for a non-"Conv2D" attribute). Its kernel goes to NPUC as NPUC's own off-device KernelFiller expands a
+//        depthwise kernel: dense C x C x kh x kw, the channel's taps on the diagonal (o == i), the weight zero point
+//        (a real 0) elsewhere. The weights here are per channel, [c][ky][kx]. Mode: "stock" is what NPUC 1.36.1.a does
+//        on the device (NNGraphAttribute::DwOptSupported is false there: it asks for the framework "scaffe" and the
+//        on-device frontend is "stensorflow"); "dwopt" makes DwOptSupported see "scaffe" for this layer (the hook
+//        below), so NPUC's own remaining tests decide whether its depthwise path (group = C) is taken
 // In an "npuc-net 2" file every reader must declare the scale and zero point its input blob already has (NPUC does not
 // rescale between layers on this path); "npuc-net 1" files are read exactly as before (the new lines refused there).
 //
@@ -132,6 +142,44 @@ void npuc_hook_addElemtWiseGraphNode(void *self, void *node)
 		_exit(2);
 	}
 	orig(self, node);
+}
+#endif
+
+// ---- Depthwise: NPUC's DW path, behind a test the on-device frontend always fails (docs/format/depthwise.md) ------
+// NNGraphAttribute::DwOptSupported() (libnpuc_frontend 0x5333c) wants group > 1, a Convolution node, a kernel of
+// C x C (C a multiple of 16) and the attribute's framework string (+0x18) equal to "scaffe"; NNGraphAttribute's
+// constructor sets "stensorflow", so on the device it is always false. addConvolutionGraphNode (frontend) and
+// PolicyMaker::makeCompressedKernel (template) call it through their PLTs, so Bionic binds those calls to this
+// definition (the executable first in the lookup scope). For a "dwconv ... dwopt" layer it lets NPUC's own function
+// run with the framework string set to "scaffe", then puts "stensorflow" back; for every other node it is NPUC's
+// function unchanged. Networks without such a layer never change behaviour.
+static std::map<std::string, int> g_dwopt;  // layer name -> number of DwOptSupported calls answered with "scaffe"
+
+#if defined(__aarch64__)
+extern "C++" __attribute__((visibility("default"))) bool npuc_hook_DwOptSupported(void *self)
+	__asm__("_ZN4NPUC16NNGraphAttribute14DwOptSupportedEv");
+bool npuc_hook_DwOptSupported(void *self)
+{
+	using fn_t = bool (*)(void *);
+	static fn_t orig = reinterpret_cast<fn_t>(dlsym(RTLD_NEXT, kSymDwOptSupported));
+	if (!orig) {
+		printf("npuc-net: FAIL (no NPUC DwOptSupported behind the hook)\n");
+		_exit(2);
+	}
+	auto *a = static_cast<char *>(self);
+	NNLayer *l = *reinterpret_cast<NNLayer **>(a + NNGraphAttributeOff::layer);
+	auto it = l ? g_dwopt.find(l->name) : g_dwopt.end();
+	if (it == g_dwopt.end())
+		return orig(self);
+	auto &fw = *reinterpret_cast<std::string *>(a + NNGraphAttributeOff::framework);
+	std::string saved = fw;
+	fw = "scaffe";
+	bool r = orig(self);
+	fw = saved;
+	if (it->second++ == 0)
+		printf("dwconv %s: NNGraphAttribute::DwOptSupported with framework \"scaffe\" (was \"%s\") = %d\n",
+		       l->name.c_str(), saved.c_str(), (int)r);
+	return r;
 }
 #endif
 
@@ -414,7 +462,11 @@ int main(int argc, char **argv)
 			blobs[name] = s;
 			last = name;
 			printf("layer %s Input out %dx%dx%d\n", name.c_str(), s.c, s.h, s.w);
-		} else if (kw == "conv" || kw == "pool") {
+		} else if (kw == "conv" || kw == "pool" || kw == "dwconv") {
+			if (kw == "dwconv" && ver < 2) {
+				tk.fail("'dwconv' needs an \"npuc-net 2\" file");
+				break;
+			}
 			std::string name = tk.str(), input = tk.str();
 			auto bi = blobs.find(input);
 			if (bi == blobs.end()) {
@@ -428,10 +480,19 @@ int main(int argc, char **argv)
 			Shape is = bi->second;
 			const std::vector<int32_t> inShape = {1, is.c, is.h, is.w};
 			std::shared_ptr<NNLayer> l;
-			int cout = is.c, kh, kw_, sh, sw, act;
-			std::string padType, ptype;
-			if (kw == "conv") {
-				cout = (int)tk.num(1, 4096, "cout");
+			int cout = is.c, kh, kw_, sh, sw, act, group = 1;
+			std::string padType, ptype, dwmode;
+			if (kw == "conv" || kw == "dwconv") {
+				const bool dw = kw == "dwconv";
+				if (dw) {
+					dwmode = tk.str();
+					if (dwmode != "stock" && dwmode != "dwopt")
+						tk.fail("dwconv " + name + ": mode " + dwmode + " (stock or dwopt)");
+					if (is.c < 2)
+						tk.fail("dwconv " + name + ": " + std::to_string(is.c) + " channel (NPUC's isDwConvolution wants group > 1)");
+					group = is.c;
+				} else
+					cout = (int)tk.num(1, 4096, "cout");
 				kh = (int)tk.num(1, 64, "kh"), kw_ = (int)tk.num(1, 64, "kw");
 				sh = (int)tk.num(1, 16, "sh"), sw = (int)tk.num(1, 16, "sw");
 				padType = tk.str();
@@ -444,10 +505,21 @@ int main(int argc, char **argv)
 				int outZ = (int)tk.num(0, 255, "out zp");
 				bool ok;
 				std::vector<uint8_t> wbytes = unhex(tk.str(), ok);
-				size_t nw = (size_t)cout * is.c * kh * kw_;
+				size_t nw = dw ? (size_t)is.c * kh * kw_ : (size_t)cout * is.c * kh * kw_;
 				if (!ok || wbytes.size() != nw)
-					tk.fail("conv " + name + ": weights: want " + std::to_string(nw) + " bytes in hex, got " +
+					tk.fail(kw + " " + name + ": weights: want " + std::to_string(nw) + " bytes in hex, got " +
 					        std::to_string(wbytes.size()));
+				if (dw && !tk.bad) {
+					// NPUC's off-device NNGraphNodeKernelFiller::setKernel expands a depthwise kernel to a dense
+					// C x C x kh x kw one, the channel's taps where o == i and a zero weight elsewhere; the on-device
+					// KernelONFiller takes numOutput x numInput x kh x kw bytes as they are. A real 0 is the weight
+					// zero point (quant 3: 128, which saveKernelDataWithSubstracting128 makes 0)
+					std::vector<uint8_t> dense((size_t)is.c * is.c * kh * kw_, (uint8_t)wZ);
+					const size_t kk = (size_t)kh * kw_;
+					for (int c = 0; c < is.c; c++)
+						memcpy(&dense[((size_t)c * is.c + c) * kk], &wbytes[(size_t)c * kk], kk);
+					wbytes.swap(dense);
+				}
 				long nb = tk.num(0, 4096, "nbias");
 				if (nb != cout)
 					tk.fail("conv " + name + ": " + std::to_string(nb) + " biases for " + std::to_string(cout) + " outputs");
@@ -455,20 +527,24 @@ int main(int argc, char **argv)
 				for (long j = 0; j < nb && !tk.bad; j++)
 					bd->push_back((int32_t)tk.num(-2147483647L - 1, 2147483647L, "bias"));
 				if (padType != "SAME" && padType != "VALID")
-					tk.fail("conv " + name + ": pad type " + padType + " (NPUC 1.36.1.a's NNConvLayer knows SAME and VALID)");
+					tk.fail(kw + " " + name + ": pad type " + padType + " (NPUC 1.36.1.a's NNConvLayer knows SAME and VALID)");
 				qin(tk, name, input, inS, inZ);
 				if (tk.bad)
 					break;
 				if (ver >= 2)
 					bq[name] = {outS, outZ};
+				if (dw && dwmode == "dwopt")
+					g_dwopt[name] = 0;
 				// loadConvAttrForConvolutionLayer, as npuc-conv
 				std::shared_ptr<ConvAttr> ca(new ConvAttr());
-				ca->attrType = "Conv2D";
+				// nn-eden-drv's ConvAttr::setKernelInfo: "Conv2D" -> group 1; any other attribute type is depthwise:
+				// group = numOutput = numInput (NPUC itself never reads attrType on this path)
+				ca->attrType = dw ? "DepthwiseConv2dNative" : "Conv2D";
 				ca->pad = {0, 0, 0, 0};  // NPUC's computeOutputShape writes SAME's pads back here
 				ca->stride = {1, 1, sh, sw};
 				ca->dilation = {1, 1, 1, 1};
 				ca->padType = padType;
-				ca->group = 1;
+				ca->group = group;
 				ca->numInput = is.c;
 				ca->numOutput = cout;
 				ca->kernel = {kh, kw_};
@@ -495,6 +571,9 @@ int main(int argc, char **argv)
 				       "scales in %.9g zp %d w %.9g zp %d out %.9g zp %d\n", name.c_str(), input.c_str(), is.c, is.h,
 				       is.w, kh, kw_, sh, sw, padType.c_str(), act, is.c, cout, (double)inS, inZ, (double)wS, wZ,
 				       (double)outS, outZ);
+				if (dw)
+					printf("layer %s depthwise: group %d, mode %s, kernel expanded to %d x %d x %d x %d (diagonal, zero "
+					       "weight %d elsewhere)\n", name.c_str(), group, dwmode.c_str(), cout, is.c, kh, kw_, wZ);
 			} else {
 				ptype = tk.str();
 				kh = (int)tk.num(1, 64, "kh"), kw_ = (int)tk.num(1, 64, "kw");
@@ -550,7 +629,7 @@ int main(int argc, char **argv)
 			Shape os;
 			os.c = it->second[1], os.h = it->second[2], os.w = it->second[3];
 			blobs[name] = os;
-			std::vector<int32_t> pads = kw == "conv" ? convs.back()->pad
+			std::vector<int32_t> pads = kw != "pool" ? convs.back()->pad
 			                                         : std::static_pointer_cast<PoolAttr>(l->attr)->pad;
 			while (pads.size() < 4)
 				pads.push_back(-1);
@@ -559,10 +638,15 @@ int main(int argc, char **argv)
 			print_shapes(l);
 			char lb[512];
 			snprintf(lb, sizeof lb, "%s{\"name\": \"%s\", \"type\": \"%s\", \"input\": \"%s\", \"out_shape\": [1, %d, %d, %d], "
-			         "\"pads\": [%d, %d, %d, %d]}", first ? "" : ",\n  ", name.c_str(),
-			         kw == "conv" ? "Convolution" : "Pooling", input.c_str(), os.c, os.h, os.w, pads[0], pads[1], pads[2],
+			         "\"pads\": [%d, %d, %d, %d]", first ? "" : ",\n  ", name.c_str(),
+			         kw == "pool" ? "Pooling" : "Convolution", input.c_str(), os.c, os.h, os.w, pads[0], pads[1], pads[2],
 			         pads[3]);
 			jl += lb;
+			if (kw == "dwconv") {
+				snprintf(lb, sizeof lb, ", \"group\": %d, \"dw_mode\": \"%s\"", group, dwmode.c_str());
+				jl += lb;
+			}
+			jl += "}";
 			first = false;
 			layers.push_back(l);
 			last = name;

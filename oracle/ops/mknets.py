@@ -5,8 +5,9 @@
 
 Writes <outdir>/<name>.npuc (our own seeded random weights, the same bytes on every run) and <outdir>/expect.tsv: one line
 per network, "<name>\t<PASS|REFUSE>\t<what to find>". For PASS, every "|"-separated marker must appear in NPUC's
-compile log (log.txt) and the NCP must exist; for REFUSE, npuc-net must exit 1 before calling NPUC, with that text in
-its "npuc-net: FAIL" line. check-ops.sh runs them through the local oracle (npuc-local.sh).
+compile log (log.txt) and the NCP must exist (a marker "=<other name>": the NCP must be byte for byte that network's,
+compiled earlier in the list); for REFUSE, npuc-net must exit 1 before calling NPUC, with that text in its
+"npuc-net: FAIL" line. check-ops.sh runs them through the local oracle (npuc-local.sh).
 """
 import os
 import random
@@ -81,6 +82,47 @@ NETS = [
     ('v1-eltwise', hdr(v=1) + [conv('c1', 'data0', 8, 8), f"eltwise a1 c1 data0 Add {S7} 0 {S7} 0 {S7} 0"], 'REFUSE',
      'needs an "npuc-net 2" file'),
 ]
+
+# Depthwise (docs/format/depthwise.md): "dwconv" lines, with their own seeded stream so the networks above keep their
+# bytes. "stock" must give the very NCP of the same layer written as a regular conv with the dense diagonal kernel
+# (an expected-NCP column: "=<name>"); "dwopt" (C a multiple of 16) must show NPUC's depthwise path in its log.
+DR = random.Random(990)
+
+
+def dwpair(name, inp, c, k=3, s=1, pad='SAME', mode='stock', zp=0, wzp=128):
+    """a depthwise layer as a dwconv line and as the equivalent regular conv line (dense C x C diagonal kernel)"""
+    taps = bytes(DR.randrange(256) for _ in range(c * k * k))
+    b = ' '.join(str(DR.randrange(-200, 200)) for _ in range(c))
+    dense = bytearray([wzp]) * (c * c * k * k)
+    for o in range(c):
+        dense[(o * c + o) * k * k:(o * c + o + 1) * k * k] = taps[o * k * k:(o + 1) * k * k]
+    q = f"{fh(1 / 128)} {zp} {fh(1 / 256)} {wzp} {fh(1 / 128)} {zp}"
+    return (f"dwconv {name} {inp} {mode} {k} {k} {s} {s} {pad} 1 {q} {taps.hex()} {c} {b}",
+            f"conv {name} {inp} {c} {k} {k} {s} {s} {pad} 1 {q} {bytes(dense).hex()} {c} {b}")
+
+
+def dwnet(c, k=3, s=1, pad='SAME', mode='stock', q=3, pre=8):
+    """conv pre->c, the depthwise layer, a 1x1 conv: (dwconv network, dense network)"""
+    zp = 0 if q == 3 else 128
+    c1 = conv('c1', 'data0', pre, c, zp=zp)
+    dw, de = dwpair('d1', 'c1', c, k, s, pad, mode, zp)
+    c2 = conv('c2', 'd1', c, c, k=1, zp=zp)
+    return hdr(q, c=pre) + [c1, dw, c2], hdr(q, c=pre) + [c1, de, c2]
+
+
+DW = 'layer d1 depthwise: group'
+DWOPT = 'DwOptSupported with framework "scaffe" (was "stensorflow") = 1'
+for nm, c, k, s, pad, q in (('dw16', 16, 3, 1, 'SAME', 3), ('dw24-s2-valid', 24, 3, 2, 'VALID', 3),
+                            ('dw32-q1', 32, 3, 1, 'SAME', 1)):
+    a, b = dwnet(c, k, s, pad, 'stock', q)
+    NETS += [(nm + '-dense', b, 'PASS', 'Group is     1'),
+             (nm + '-stock', a, 'PASS', DW + ' %d, mode stock|Group is     %d|=%s-dense' % (c, c, nm))]
+a, b = dwnet(32, mode='dwopt')
+NETS += [('dw32-dwopt', a, 'PASS', DWOPT + '|Group is     32|numInputChannels 16'),
+         ('dw-v1', [l if l != 'npuc-net 2' else 'npuc-net 1' for l in a], 'REFUSE', '\'dwconv\' needs an "npuc-net 2" file'),
+         ('dw-c1', hdr(c=1) + [dwpair('d1', 'data0', 1)[0]], 'REFUSE', 'wants group > 1'),
+         ('dw-mode', [l.replace(' dwopt ', ' fast ') for l in a], 'REFUSE', 'mode fast (stock or dwopt)'),
+         ('dw-weights', [l.replace(' dwopt 3 3 ', ' dwopt 3 1 ') for l in a], 'REFUSE', 'weights: want 96 bytes')]
 
 
 def main():

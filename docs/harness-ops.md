@@ -95,7 +95,23 @@ two blocks in relu-q3 belong to the two real convs). Since no MergeActivation fi
 a conv is not merged: use the conv's fused activation there; the layer is for a ReLU after an Eltwise, a Concat or a
 pool. What its 1x1 conv computes (identity weights? which activation register?) is G until an NPU run.
 
-### 3.4 Not available from NNNetwork on this path (V)
+### 3.4 Depthwise convolution (`dwconv`): compiles (V; 2026-11-22, docs/format/depthwise.md)
+
+- Layer: NPUC's own `NNConvLayer` (type "Convolution") with ConvAttr group = numInput = numOutput = C, as nn-eden-drv's
+  ConvAttr::setKernelInfo sets it for a non-"Conv2D" attribute (multiplier 1). The kernel must be the dense C x C x kh
+  x kw one (KernelONFiller copies numOutput x numInput x kh x kw bytes, unchecked): the taps on the diagonal, the
+  weight zero point elsewhere, as NPUC's off-device KernelFiller expands a depthwise kernel.
+- **Stock** (what the device's NPUC does): NNGraphAttribute::isDwConvolution is true, but DwOptSupported is false (it
+  wants the framework "scaffe"; the on-device frontend's attribute says "stensorflow"), so the op's group stays 1 and
+  the NCP is byte for byte the NCP of a regular conv with the dense diagonal kernel: 118 of 118 networks (one-layer
+  grid, MobileNet blocks, MobileNet v1 0.25 on 96x96x1, 40 unseen random ones). No NPUC abort.
+- **DW opt** (NPUC's depthwise path, off the device only): the harness defines `NPUC::NNGraphAttribute::DwOptSupported()`
+  (called through the PLTs of libnpuc_frontend and libnpuc_template, so the executable's definition binds first) and,
+  for a `dwconv ... dwopt` layer, runs NPUC's function with the framework string set to "scaffe". Taken for C a
+  multiple of 16 and stride <= 2: a 16-input-channel weight pack per pass and three conv register families change
+  (depthwise.md section 5). Every other node gets NPUC's function unchanged.
+
+### 3.5 Not available from NNNetwork on this path (V)
 
 | Op | What happened | Consequence |
 |---|---|---|
@@ -113,13 +129,17 @@ reconstructed), Flatten/Permute/Crop/Slice (their STF param getters throw).
 eltwise <name> <in1> <in2> Add <in1 scale hex> <in1 zp> <in2 scale hex> <in2 zp> <out scale hex> <out zp>
 concat  <name> 1 <n> <in1> ... <in_n> <out scale hex> <out zp>
 relu    <name> <input> <ReLU|ReLU6>
+dwconv  <name> <input> <stock|dwopt> <kh> <kw> <sh> <sw> <SAME|VALID> <act 0|1> <in scale hex> <in zp> <w scale hex> <w zp>
+        <out scale hex> <out zp> <weights: C x kh x kw uint8, hex> <C> <bias x C>
 ```
 
 Inputs may be any earlier blob (graphs, not only chains). Checks before any NPUC call (exit 1): eltwise Add only, two
 different blobs of the same shape, every scale 2^-n (n 0..31), equal zero points; concat channels only, equal H x W, not
 on the network input; **every reader (conv, pool, eltwise, concat) must declare the scale and zero point its input
 blob already has** (the producer's output; the network input's from its first reader); a blob nobody reads prints a
-note. net.json gets an `"inputs": [...]` list for the new layers (`"input"` = the first). Layouts in npuc.h with
+note. net.json gets an `"inputs": [...]` list for the new layers (`"input"` = the first). `dwconv` (added 2026-11-22):
+C = the input's channels >= 2, the weights per channel [c][ky][kx]; npuc-net expands them to the dense diagonal kernel;
+refused in an "npuc-net 1" file, for C = 1, an unknown mode or a wrong weight count. Layouts in npuc.h with
 static_asserts: EltwiseAttr (+0x08, 0x20), ConcatAttr (+0x08, +0x10, 0x28), NPUMultipleInputMemoryData (+0x08, +0xc8,
 0x1a0), NodeLayerType, NNGraphNode offsets. The hook is compiled for aarch64 only (the host test's x86_64 stub build
 has no NPUC; it still builds and runs, V).
@@ -134,6 +154,12 @@ byte-identical NCPs with root-7517804f and root-b53daf10 (net-current -> 5c080ec
 "npuc-net 2" header give the same NCPs too. `oracle/ops/check-ops.sh [root]` (networks from `ops/mknets.py`,
 our own seeded weights): **20 PASS** (10 compiles with the op in the log, 8 refusals, 2 regressions); a second run gave
 the same 10 NCP hashes (add-res-q3 f4005cdd, concat-q3 aaf6f04e, relu-q3 8480fe7e…).
+
+**Run directory with `dwconv` (2026-11-22)**: `oracle/harness/build.sh` gives root-fd659af2 (npuc-net-acc7a456,
+npuc-conv-6e2aa54d: npuc.h changed, npuc-probe-85fe33b0); `LINK_CURRENT=0` builds it without moving n3/root-current.
+Same NCPs as root-314e61a6 on every earlier input tried: `oracle/ops/check-ops.sh` 31 PASS (the 20 earlier cases with
+their NCP hashes unchanged, plus 3 stock/dense pairs with equal NCPs, a dwopt case and 4 refusals), and 66 of 66
+stored NCPs (40 corpus, 10 graph-random2, 10 random, 6 tiling3) recompiled byte for byte.
 
 ## 5. What ncpgen/npunet.py needs to lower TFLite to it (for the orchestrator)
 
@@ -150,6 +176,8 @@ the same 10 NCP hashes (add-res-q3 f4005cdd, concat-q3 aaf6f04e, relu-q3 8480fe7
   compile on device.
 - Standalone RELU/RELU6 after a conv: fold into the conv's `act`; elsewhere `relu`.
 - The CPU reference: Add as G in §3.1 until measured; ReLU's 1x1 conv as identity + ReLU (G).
+- **DEPTHWISE_CONV_2D** (multiplier 1) -> a plain `conv` with the dense diagonal kernel (no harness syntax needed: the
+  NCP is the stock one, and ncpgen already generates it), or `dwconv ... stock` (same NCP); depthwise.md section 6.
 
 NPU run to propose on the main machine (no phone here): `npu/npu-run.sh` with an add-res-q3-like net (conv + ReLU,
 residual Add of the input at 2^-7, out 2^-7, then a conv) and a concat-q3-like net; compare with the G formula; also

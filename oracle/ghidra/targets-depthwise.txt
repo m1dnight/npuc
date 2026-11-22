@@ -1,0 +1,17 @@
+# depthwise convolution (group = C): the frontend's DW tests, the kernel filler, the conv op's group, the 2020 LIR/ISA
+# use of isDwConvolution/getGroupVal, the device's channels per DW bunch (docs/format/depthwise.md)
+sym:isDwConvolution
+sym:DwOptSupported
+sym:SocSupportsDwOpt
+sym:getGroupVal
+sym:doQuantization_dwconv
+sym:getChannelsPerDwBunch
+sym:16NNGraphAttribute19getConvolutionParam
+callers:isDwConvolution
+callers:getGroupVal
+callers:getChannelsPerDwBunch
+callers:doQuantization_dwconv
+callers:DwOptSupported
+callers:SocSupportsDwOpt
+str:ifmDepth should match
+str:Deconvolution DW support

@@ -5,12 +5,13 @@
 # never go into a repository).
 #   npuc-probe  (npuc-probe.c)   dlopen()s NPUC and resolves its entry points
 #   npuc-conv   (npuc-conv.cpp)  one convolution through npuc.h's reconstructed objects
-#   npuc-net    (npuc-net.cpp)   a network read from a file (ncpgen/npunet.py lower): conv, pool, eltwise, concat, relu
+#   npuc-net    (npuc-net.cpp)   a network read from a file (ncpgen/npunet.py lower): conv, pool, eltwise, concat, relu,
+#                                dwconv (docs/harness-ops.md, docs/format/depthwise.md)
 # out: $NCPGEN_WORK/n3/<prog>-<sha8>     each binary, named by its sha256 (never overwritten)
 #      $NCPGEN_WORK/n3/root-<sha8>/      the run directory (+ root-<sha8>.symbols.txt); n3/root-current -> it
 # Reproducible from any path: the repository is mapped to "." and the NDK to "/ndk" in the debug info, so the same
 # NDK gives the same bytes on any host (the NDK's Linux toolchain: run it on x86-64 Linux, or in an amd64 container).
-#   NDK=<android-ndk-r27d> oracle/harness/build.sh       (default $NCPGEN_WORK/tools/android-ndk-r27d)
+#   NDK=<android-ndk-r27d> [LINK_CURRENT=0] oracle/harness/build.sh       (default $NCPGEN_WORK/tools/android-ndk-r27d)
 set -euo pipefail
 . "$(dirname "$0")/../env.sh"
 O=$NCPGEN_WORK; S=$ORACLE/harness
@@ -61,7 +62,8 @@ R=$O/n3/root-$(sha256sum < "$T/SHA256SUMS" | cut -c1-8)
 if [ -e "$R" ]; then cmp -s "$T/SHA256SUMS" "$R/SHA256SUMS" || { echo "$R exists and differs"; exit 1; }
 else mv "$T" "$R"; fi
 (cd "$R" && sha256sum -c --quiet SHA256SUMS) || { echo "$R does not match its SHA256SUMS"; exit 1; }
-ln -sfn "$(basename "$R")" "$O/n3/root-current"
+# LINK_CURRENT=0 leaves n3/root-current where it is (a trial build while other runs use the current one)
+[ "${LINK_CURRENT:-1}" = 0 ] || ln -sfn "$(basename "$R")" "$O/n3/root-current"
 # The RTLD_NOW load, checked statically on the host (no emulator): every import bound in the directory
 # Bionic scopes: npuc-probe dlopen()s libnpuc_api.so (only), npuc-conv and npuc-net have the libraries in their DT_NEEDED
 python3 -I "$S/check-symbols.py" "$RE" "$R" npuc-probe:libnpuc_api.so npuc-conv npuc-net > "$R.symbols.txt" || { cat "$R.symbols.txt"; exit 1; }

@@ -137,7 +137,9 @@ public:
 	std::vector<int32_t> pad;         // +0x008 V  {top, bottom, left, right} (NNAPI explicit pads 2,3,0,1)
 	std::vector<int32_t> stride;      // +0x020 V  {1, 1, stride_h, stride_w}
 	std::vector<int32_t> dilation;    // +0x038 V  {1, 1, dilation_h, dilation_w}
-	int32_t group = 0;                // +0x050 V  1 for "Conv2D"; = numInput for a depthwise conv (setKernelInfo)
+	int32_t group = 0;                // +0x050 V  1 for "Conv2D"; = numInput for a depthwise conv (setKernelInfo);
+	                                  //   read by NNGraphAttribute::getConvolutionParam (-> param +0x2c), isDwConvolution
+	                                  //   and DwOptSupported (docs/format/depthwise.md)
 	int32_t numInput = 0;             // +0x054 V  input channels (setKernelInfo arg 1 = input shape [1])
 	int32_t numOutput = 0;            // +0x058 V  output channels for "Conv2D" (setKernelInfo arg 2 = filter dim 0)
 	int32_t _pad5c = 0;               // +0x05c
@@ -264,6 +266,22 @@ constexpr size_t multipleInput = 0xe8;   // V  shared_ptr<NPUMultipleInputData>:
 constexpr size_t act = 0x134;            // V  activation NodeLayerType (setFusedActivation; 0x43 when never set)
 }  // namespace NNGraphNodeOff
 constexpr const char *kSymAddElemtWise = "_ZN4NPUC15NNGraphCgObject21addElemtWiseGraphNodeEPNS_11NNGraphNodeE";
+
+// NNGraphAttribute (NNGraphNode +0x70; constructor @libnpuc_frontend 0x4d8e0): the fields the depthwise hook needs (V).
+namespace NNGraphAttributeOff {
+constexpr size_t layer = 0x08;           // V  NNLayer * (the shared_ptr's pointer; = NNGraphNode +0x78)
+constexpr size_t framework = 0x18;       // V  std::string, "stensorflow" from the constructor (no on-device setter seen);
+                                         //    DwOptSupported (@0x5333c) wants "scaffe" (memcmp, 6 bytes)
+constexpr size_t type = 0x30;            // V  NodeLayerType (= NNGraphNode +0xa0)
+constexpr size_t kernel = 0x38;          // V  shared_ptr to the kernel data node (= NNGraphNode +0xa8): its virtual +0x10
+                                         //    returns the kernel shape {numOutput, numInput, kh, kw} (KernelONFiller)
+}  // namespace NNGraphAttributeOff
+// Depthwise (docs/format/depthwise.md, V): NNGraphAttribute::isDwConvolution (@0x53724) is group (ConvAttr +0x50) > 1 and
+// group == C out, kernel shape [0] == [1] == C in == C out; addConvolutionGraphNode sets NN::Op::Convolution's DW flag
+// (+0x79) from it, and its group (+0x84) to ConvAttr.group only when SocSupportsDwOpt() (CompileOptions.soc in 1..3),
+// DwOptSupported() and not (stride h > 2 and stride w > 2), else 1. DwOptSupported: group > 1, node type 8, framework
+// "scaffe", kernel shape [0] == [1], both multiples of 16.
+constexpr const char *kSymDwOptSupported = "_ZN4NPUC16NNGraphAttribute14DwOptSupportedEv";
 
 }  // namespace NPUC
 

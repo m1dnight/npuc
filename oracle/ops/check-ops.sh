@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# PORT-32: check npuc-net's added layer kinds (eltwise Add, concat, relu) against Samsung's NPUC on this host, no phone
-# (docs/harness-ops.md). Generates the test networks (mknets.py), compiles each with the local oracle
+# PORT-32: check npuc-net's added layer kinds (eltwise Add, concat, relu, dwconv) against Samsung's NPUC on this host, no
+# phone (docs/harness-ops.md, docs/format/depthwise.md). Generates the test networks (mknets.py), compiles each with the local oracle
 # (npuc-local.sh, an arm64 Linux container or a native aarch64 Linux host) and checks the expected outcome: an NCP and
 # NPUC's log showing the op, or npuc-net's refusal before any NPUC call. Then the old-input regression: the pinned
 # example net ($NCPGEN_WORK/run/net-current/net.npuc, when present) must still give NCP 5c080ec1.
@@ -14,6 +14,7 @@ ROOT=${1:-$NPU_ROOT}
 O=$NCPGEN_WORK/n3/ops-check/$(basename "$(cd "$ROOT" && pwd -P)"); mkdir -p "$O/nets"
 python3 -I "$S/ops/mknets.py" "$O/nets" || exit 1
 pass=0; fail=0
+declare -A SHA   # name -> NCP sha256 of the networks compiled so far (a marker "=<name>" wants the same NCP)
 ok() { pass=$((pass + 1)); echo "PASS $1"; }
 no() { fail=$((fail + 1)); echo "FAIL $1"; }
 while IFS=$'\t' read -r name want markers; do
@@ -22,10 +23,13 @@ while IFS=$'\t' read -r name want markers; do
   log=$d/log.txt; [ -f "$log" ] || log=/dev/null
   if [ "$want" = PASS ]; then
     [ $rc = 0 ] && [ -s "$d/net.ncp" ] || { no "$name: compile failed (exit $rc): $(printf '%s\n' "$out" | tail -n 2 | tr '\n' ' ')"; continue; }
-    miss=""
+    miss=""; h=$(sha256sum < "$d/net.ncp" | cut -d' ' -f1); SHA[$name]=$h
     IFS='|' read -ra ms <<< "$markers"
-    for m in "${ms[@]}"; do grep -qF -- "$m" "$log" || miss="$miss '$m'"; done
-    [ -z "$miss" ] && ok "$name: NCP $(sha256sum < "$d/net.ncp" | cut -c1-8), log shows: $markers" || no "$name: log lacks$miss"
+    for m in "${ms[@]}"; do
+      if [[ "$m" == =* ]]; then other=${SHA[${m#=}]:-none}; [ "$other" = "$h" ] || miss="$miss '$m' (NCP ${h:0:8}, ${m#=} ${other:0:8})"
+      else grep -qF -- "$m" "$log" || miss="$miss '$m'"; fi
+    done
+    [ -z "$miss" ] && ok "$name: NCP ${h:0:8}, log shows: $markers" || no "$name: log lacks$miss"
   else
     line=$(grep -m1 '^npuc-net: FAIL' "$log" | tr -d '\r')
     if [ $rc = 1 ] && [[ "$line" == *"$markers"* ]] && ! grep -q 'NPUCompiler::compile (' "$log"; then
