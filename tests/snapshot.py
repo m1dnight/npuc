@@ -105,7 +105,8 @@ def run(tool, args, tmp=None):
                        text=True, errors="replace", cwd=tmp or CODE, env=dict(os.environ, NCPGEN_WORK=WORK))
 
     def norm(s):
-        s = s.replace(CODE, "<code>")
+        # the work folder first: a baseline recorded from another checkout (--code) must compare equal
+        s = s.replace(os.path.realpath(WORK), "<work>").replace(WORK, "<work>").replace(CODE, "<code>")
         return s.replace(tmp, "<tmp>") if tmp else s
     err = p.stderr.strip().splitlines()
     last = re.sub(r"^[\w.]+\.(\w+): ", r"\1: ", norm(err[-1])) if err else ""   # npunet.Refused = ncpgen.npunet.Refused
