@@ -7,8 +7,9 @@ NPUC's Eltwise needs).
   stream_graphs.py write <dir> [--set split]      <dir>/<name>.json for every variant
   stream_graphs.py compile <dir> [name...] [--set split]   write, then npuc-local.sh each into <dir>/<name>/ (NPU_ROOT
                                                            below)
-  stream_graphs.py random <dir> <seed> [count] [--set split|large]   seeded random graphs, compiled (large: 64..160 px
-                                                           maps that NPUC tiles inside the graph)
+  stream_graphs.py random <dir> <seed> [count] [--set split|large|camera]   seeded random graphs, compiled (large: 64..160
+                                                           px maps that NPUC tiles inside the graph; camera: the same
+                                                           at 256..320 px inputs, v<seed>)
   --set split: graphs with layers NPUC splits over several groups (its CMDQ cut, cmdq.md 7d) or tiles
 """
 import argparse
@@ -356,13 +357,13 @@ def random_split_net(name, seed):
     return n
 
 
-def random_large_net(name, seed):
+def random_large_net(name, seed, sizes=(64, 80, 96, 112, 128, 160)):
     """a seeded random graph at 64..160 px whose feature maps pass the SRAM (the unseen test of tiling inside a graph,
     frame.md 6.11): a stem, then 2 to 4 blocks (a concat of 2 or 3 conv branches, a residual block, a conv chain, a
     pool), downsampling now and then; a residual's eltwise is kept within 256 KiB per core (NPUC asserts when it would
     have to tile one: models/README.md)"""
     r = random.Random(seed)
-    h = r.choice([64, 80, 96, 112, 128, 160])
+    h = r.choice(list(sizes))
     n = Net(name, h, h, r.choice([3, 8, 16, 32]), seed)
     k = [0]
 
@@ -400,6 +401,11 @@ def random_large_net(name, seed):
             t = n.pool(nm("p"), t, kind=r.choice(["max", "avg"]), k=r.choice([2, 3]), s=2)
     t = conv(t, r.choice([8, 16, 32]), kk=r.choice([1, 3]))
     return n
+
+
+def random_camera_net(name, seed):
+    """random_large_net at camera input sizes, 256..320 px (the camera models' resolutions: models/camera.md)"""
+    return random_large_net(name, seed, sizes=(256, 257, 288, 300, 320))
 
 
 def random_net(name, seed):
@@ -471,14 +477,16 @@ def main(argv=None):
         p.add_argument("names", nargs="*")
         p.add_argument("--set", choices=("main", "split"), default="main")
     p = sub.add_parser("random", help="random graph networks g<seed> (--set split: wide ones, s<seed>; --set large: "
-                                      "64..160 px ones NPUC tiles, t<seed>), compiled")
+                                      "64..160 px ones NPUC tiles, t<seed>; --set camera: 256..320 px, v<seed>), "
+                                      "compiled")
     p.add_argument("dir")
     p.add_argument("seed", type=int)
     p.add_argument("count", type=int, nargs="?", default=40)
-    p.add_argument("--set", choices=("main", "split", "large"), default="main")
+    p.add_argument("--set", choices=("main", "split", "large", "camera"), default="main")
     a = ap.parse_args(argv)
     if a.cmd == "random":
-        f, pre = {"split": (random_split_net, "s"), "large": (random_large_net, "t")}.get(a.set, (random_net, "g"))
+        f, pre = {"split": (random_split_net, "s"), "large": (random_large_net, "t"),
+                  "camera": (random_camera_net, "v")}.get(a.set, (random_net, "g"))
         V = {"%s%03d" % (pre, s): f("%s%03d" % (pre, s), s) for s in range(a.seed, a.seed + a.count)}
         names = list(V)
     else:

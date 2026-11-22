@@ -1423,6 +1423,29 @@ def _pol_basic(shape, nh, nw):
     return None if a is None or b is None else {"C": C, "H": a, "W": b}
 
 
+def _pol_tile_ends(nds, tiles):
+    """NPUC's calculateNodeCodegenParameters on a stratum's tiles (V: decompiled, PolicyMemory.cpp:297-300): every
+    tile of the stratum's input (the split node's layout: tile i from (first - ov) + (i - 1)(middle - ov), first,
+    middle or last long) must end inside the map and after its start, else NPUC asserts ("Tile end row exceeds FM
+    shape" / "Tile end column ..." / "Negative tile length"; V: tiling2 b04, a middle row tile ending on row 9 of 9;
+    posenet-mobilenet-v1-257, conv1 .. dw4 in 5 row tiles, the fourth ending on row 260 of 257). Raises
+    NotImplementedError naming NPUC's assertion."""
+    nh, nw = tiles
+    lays = _pol_layouts(nds, _pol_basic(nds[-1]["out"], nh, nw) or {})
+    if not lays:
+        return
+    _, H, W = nds[0]["in"]
+    for ax, D, what in (("H", H, "row"), ("W", W, "column")):
+        for a, n in _pol_tiles(lays[0][ax]):
+            if a + n - 1 >= D:
+                raise NotImplementedError('NPUC asserts: "Tile end %s exceeds FM shape" (layer %s: its %d x %d tiles, '
+                                          'one from %s %d to %d of %d)' % (what, nds[0]["li"], nh, nw, what, a,
+                                                                          a + n - 1, D))
+            if n < 2:
+                raise NotImplementedError('NPUC asserts: "Negative tile length" (layer %s: its %d x %d tiles)'
+                                          % (nds[0]["li"], nh, nw))
+
+
 def _pol_back(nd, lay):
     """backPropagateTiles: the input layout of a node for output layout lay"""
     L = nd["L"]
@@ -1660,6 +1683,8 @@ def npuc_policy(low, wsize):
                 out.append({"layers": c, "tiles": t, "nbuf": 0})
         elif tiled[li]:
             out.append({"layers": [li], "tiles": best[li]["tiles"], "nbuf": best[li]["nbuf"]})
+    for st in out:
+        _pol_tile_ends([nds[x] for x in st["layers"]], st["tiles"])
     return {"best": best, "strata": out, "readback": readback}
 
 
@@ -1792,6 +1817,8 @@ def _graph_policy(low, wsize=None):
                 strata.append({"layers": c, "tiles": t, "nbuf": 0})
         elif n in best and best[n]["tiles"] != (1, 1):
             strata.append({"layers": [n], "tiles": best[n]["tiles"], "nbuf": best[n]["nbuf"]})
+    for st in strata:
+        _pol_tile_ends([nds[x] for x in st["layers"]], st["tiles"])
     return {"order": order, "shapes": shp, "nodes": nds, "best": best, "strata": strata, "wsize": wsize}
 
 
@@ -1877,6 +1904,14 @@ def forwarding(low, pol=None):
                 ok.add(n)
                 nbuf[mode][n] = r["nbuf"]
     return {"life": life, "ok": res, "nbuf": nbuf, "heads": heads}
+
+
+def concat_ofm_shared(kn, cons, fwd):
+    """NPUC keeps a concat in SRAM only while its OFM is shared (LivenessAnalysis::collectAllChunks: "Concat-node id#k
+    was supposed to be collected in SRAM but its OFM is not shared so it is useless. ConcatInSram was turned off
+    here!"; V: decompiled, large random t2006): read by one layer, or by several that share it, the input-sharing
+    block it heads succeeding (forwarding's "is"); else it goes to DRAM, its readers' weights in the DRAM order"""
+    return len(cons.get(kn, [])) < 2 or bool(fwd["ok"]["is"].get(kn))
 
 
 def node_whole(nd, limit):

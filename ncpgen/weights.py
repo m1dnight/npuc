@@ -414,7 +414,13 @@ def _concat_tiled(name, low, ins, cons):
     finally:
         _POLICY_DEPTH[0] -= 1
     tiled = {x for st in pol["strata"] for x in st["layers"]}
-    return any(x in tiled for x in ins[name] + cons.get(name, []))
+    if any(x in tiled for x in ins[name] + cons.get(name, [])):
+        return True
+    _POLICY_DEPTH[0] += 1
+    try:            # its OFM not shared: NPUC turns the concat in SRAM off (frame.concat_ofm_shared; V: t2006)
+        return not frame.concat_ofm_shared(name, cons, frame.forwarding(low, pol))
+    finally:
+        _POLICY_DEPTH[0] -= 1
 
 
 def _permuted_conv(L, segs):

@@ -432,6 +432,16 @@ order, the edge pads, a ring of 5+ slots preferred: 6.4-6.6). Still G: which poo
 2 DRUs per IDP of the partial-sum block for inputs on fewer IDPs, getTile's starts, the leading-edge pad rule, the
 copy's start/end test. `frame_sweep.py policy <dirs>` checks the policy against any compile's log.
 
+**NPUC's tile-end assertions** (`_pol_tile_ends`, run by `npuc_policy` and `graph_policy`; V: decompiled
+calculateNodeCodegenParameters, PolicyMemory.cpp:297-300, `oracle/ghidra/targets-tileend.txt`): after the policy, NPUC
+cuts each stratum's input by the split node's layout (tile i from (first - ov) + (i - 1)(middle - ov), first, middle
+or last long) and asserts that every tile ends inside the map and after its start: "Tile end row exceeds FM shape"
+(tileEndH < H), "Tile end column ..." (W), "Negative tile length". The back-propagated layout gives the rounding
+left-over to the last tile, but a middle tile can pass the map's end: tiling2 b04 (a 5x5 conv's 3 row tiles, the
+second over rows 2..9 of 9), posenet-mobilenet-v1-257 (conv1 .. dw4 in 5 row tiles at 257 px, the fourth over rows
+179..261), the fresh camera set's v3002 and v3030 (rows 216..262 and 208..259 of 257; predicted before their logs were
+read). ncpgen refuses these now; of the 4043 networks of the sweeps none NPUC compiled trips it.
+
 ### 6.11 Tiling inside a graph (`graph_policy`, stream's `graph_stratum`; V: graph-split cat96-64, cat128-128, cat160-64, the zoo's standard-resolution models, the large random set)
 
 **The policy** is 6.10's over the graph's nodes (`graph_policy`): NPUC tsorts the graph and asks
@@ -487,6 +497,15 @@ full forwarding: checkPredAndSuccPreallocation), its OFM not counted when a conc
 forwarding); under one byte: "too fat", no call. The last call's lifetime stands (_pol_whole: extended only when all
 weights fit so, or a ring of 5+ buffers does): t1004's three branch convs of 112 x 112 keep their weights on their
 conv only (WEIGHT live [conv, conv]), which the trim and spill of 6.12 then depends on.
+
+**A whole node's weight ring is the policy's** (V: ssd-mobilenet-v2-300): getBestProcessingParams' nbuf, as a
+chain takes it (6.6): the stream's own rule (weight_ring, the feature maps from the allocator's chunks) gives 18 of 36
+passes for the 19x19x576 stride-2 depthwise layer, NPUC's estimate (its PAD and REFORMAT working blocks live together:
+82944 + 110592 B) leaves room for 12; with 18 the allocator fails at that node and spills where NPUC does not. No other
+graph compile changes. **A graph's first citizens**: a third or later one that overlaps goes to the end of the SRAM
+holding less so far, the bottom on a tie, as a chain stratum's weights (6.5): ssd-mobilenet-v2-300's first stratum
+(conv1 .. dw2 in 7 row tiles), its weights of 1024, 512, 256, 768 and 5376 B at 0, the top, under it, under it, then
+1024 (the old rule put the fifth under the top ones).
 
 **Also modelled** (V: large random t1016, t1018, t1038, t1039):
 - a layer-block's forwarding decided by `frame.forwarding` (the tests above with their prealloc flags; t1038's

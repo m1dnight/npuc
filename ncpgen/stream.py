@@ -1443,7 +1443,7 @@ class Plan:
         # DRAM, its single reader's chunk a second citizen, the next block's pool output a first citizen) is refused
         fwd = frame.forwarding(low, pol)
         scats = [kn for kn in cats if concat_in_sram(kn, out, by, ins, cons)
-                 and not any(x in tst for x in ins[kn] + cons.get(kn, []))]
+                 and not any(x in tst for x in ins[kn] + cons.get(kn, [])) and frame.concat_ofm_shared(kn, cons, fwd)]
         # tensors their readers load from DRAM: the network input, a concat's buffer, a tiled stratum's output read by
         # a layer
         dsrc = [src] + [kn for kn in cats if kn not in scats and kn != out]
@@ -1702,6 +1702,12 @@ class Plan:
                 # (weights.weight_layer_info; V: c16_8_8-k5-pool, c32_16-k5-conv, g161, g103, g167)
                 pr = d.get("prows", d["wunits"])
                 d["ring"] = weight_ring(dict(d, wunits=pr))
+                b = pol["best"].get(n)
+                if b is not None and b["tiles"] == (1, 1) and b["nbuf"] and b["nbuf"] != d["ring"]:
+                    # the ring NPUC's policy chose (getBestProcessingParams, frame.md 6.10), as a chain takes it: its
+                    # estimate counts a stride-2 conv's PAD and REFORMAT blocks where weight_ring's chunks do not
+                    # (V: ssd-mobilenet-v2-300's 19x19x576 depthwise at stride 2, 12 of 36 passes, not 18)
+                    d["ring"] = b["nbuf"]
                 d["weight"].size = d["ring"] * 2 * pr * 64
                 if d["ring"] < d["passes"] and by[n]["kind"] == "conv" and d["dout"].c % 16:
                     # a ring's slot from the bytes per output channel, as in a chain (frame.md 6.6, frame._ring_chunk;
@@ -1717,14 +1723,20 @@ class Plan:
                     d["weight"].size = cdiv(4 * d["weight"].size, d["dout"].cores)
         # the first citizens, in order of their live ranges: at 0 when free there, else at the top of SRAM, below
         # any top one live at the same time (V: cat16, g002, g021, g028 at the top; g010, g012 at 0; g141, g169)
+        # (a third one or more: at the end that holds less so far, the bottom on a tie, as a chain's stratum weights;
+        # V: ssd-mobilenet-v2-300's first stratum, weights of 1024, 512, 256, 768 and 5376 B at 0, the top, under it,
+        # under it, then 1024)
         fc = sorted((ck for ck in chunks if ck.batch[0] == 0), key=lambda ck: ck.batch)
         for i, ck in enumerate(fc):
             ov = [o for o in fc[:i] if o.live[0] <= ck.live[1] and ck.live[0] <= o.live[1] and o.size]
+            bot = max([0] + [o.off + o.size for o in ov if not o.top])
+            top = min([SRAM_LIMIT] + [o.off for o in ov if o.top])
             if not any(o.off < ck.size for o in ov):
-                ck.off = 0
+                ck.off, ck.top = 0, False
+            elif len(ov) >= 2 and bot <= SRAM_LIMIT - top and cdiv(bot, 64) * 64 + ck.size <= top:
+                ck.off, ck.top = cdiv(bot, 64) * 64, False
             else:
-                ck.off = (min([SRAM_LIMIT] + [o.off for o in ov if o.top]) - ck.size) // 64 * 64
-            ck.top = ck.off > 0
+                ck.off, ck.top = (top - ck.size) // 64 * 64, True
             ck.fixed = True
         # what NPUC's trim and spill needs to know of a chunk (allocate's ts; frame.md 6.12): the node it belongs to,
         # and for a tensor's chunk its readers (not a concat) with the position of their first node
