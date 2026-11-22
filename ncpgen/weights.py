@@ -9,8 +9,7 @@ docs/format/weights.md). Pure Python, no vendor bytes: the packing below was mea
 
 Interface: weight_blocks(low) -> list[bytes], every WEIGHT block in the NCP's order (padding included): a chain, one per
 conv (and standalone ReLU) in layer order; a graph (eltwise, concat, standalone ReLU), one per conv, eltwise and ReLU
-in NPUC's execution order (exec_order). weight_block_map(low) -> {layer: block}; layer_blocks(low) -> [(layer, kind,
-block)]; weight_block_sizes(low); weight_geometry(low) -> per conv what the io descriptors need (cores, rows per load,
+in NPUC's execution order (exec_order). layer_blocks(low) -> [(layer, kind, block)]; weight_block_sizes(low); weight_geometry(low) -> per conv what the io descriptors need (cores, rows per load,
 loads...); weight_layers(low) (convs and ReLU dummy convs, layer order: sizes for the stream part).
 
 Graph layers (V: graph sweeps 98 + 47 + 66, ops-check 13, npunet-graph 10, all exact): a conv reading a concat kept in
@@ -38,6 +37,7 @@ The format (V: byte-exact on the sweep; docs/format/weights.md has the evidence)
   header (bitmap bytes << 9 | non-zero count), the bitmap (bit p, LSB first, set when the stored byte is not the
   zero) and the non-zero bytes in p order. Block = ncores x nloads x 2 x R x 64 bytes, core-major.
 """
+import argparse
 import collections
 import copy
 import hashlib
@@ -45,6 +45,11 @@ import json
 import os
 import struct
 import sys
+
+if not __package__:     # run as a script: the package is this file's directory
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ncpgen.common import cdiv, concat_in_sram, exec_order as _exec_names, has_graph_ops, ncp_parts, topology  # noqa
 
 ROW = 64            # bytes per row of a batch (the io descriptor's w)
 SLOTS = 8           # chunks per batch
@@ -56,20 +61,16 @@ MAX_NZV = 511       # non-zero values per chunk (NPUDevice2020::getMaxNzvInBatch
 MAX_VALUES = 0x3F8  # positions per sub-batch (LIRKernelData::checkMaxValuesInBatch)
 
 
-def _ceil(a, b):
-    return -(-a // b)
-
-
 def conv_geometry(L):
     """The packing geometry of one lowered conv layer."""
     cout, cin = L["cout"], L["in_chw"][0]
     kh, kw = L["k"]
     sh, sw = L.get("stride", [1, 1])
-    cpc = L.get("_cpc") or 2 * _ceil(cin, 2 * MAX_CORES)
-    ncores = L.get("_ncores") or _ceil(cin, cpc)
-    gs = 2 * _ceil(cout, 2 * GROUPS)
-    nloads = _ceil(gs, LANES)
-    vkh, vkw = _ceil(kh, sh), _ceil(kw, sw)
+    cpc = L.get("_cpc") or 2 * cdiv(cin, 2 * MAX_CORES)
+    ncores = L.get("_ncores") or cdiv(cin, cpc)
+    gs = 2 * cdiv(cout, 2 * GROUPS)
+    nloads = cdiv(gs, LANES)
+    vkh, vkw = cdiv(kh, sh), cdiv(kw, sw)
     vcpc = cpc * sh * sw
     nbits = vcpc * vkh * vkw
     return {"cout": cout, "cin": cin, "k": [kh, kw], "stride": [sh, sw], "cpc": cpc, "ncores": ncores, "gs": gs,
@@ -101,7 +102,7 @@ def _chunk(vals, zero):
         if v is not None and v != zero:
             bits |= 1 << p
             nz.append(v)
-    bm_bytes = _ceil(len(vals), 8)
+    bm_bytes = cdiv(len(vals), 8)
     if bm_bytes >= 0x80 or len(nz) > MAX_NZV:
         # NPUC asserts here ("(nzvSize & 0xFE00) == 0", "(bmSize & 0x80) == 0") and aborts the compile
         raise ValueError("chunk of %d positions with %d non-zero values: NPUC aborts (max %d)"
@@ -126,13 +127,13 @@ def _slot_channel(geo, l, b, t):
     return o if lane < geo["gs"] and o < geo["cout"] else None
 
 
-def _min_batches(vals, K, cdiv):
+def _min_batches(vals, K, nch):
     """NPU2020::NPULIRKernelMemoryData::getMinNumberOfBatches for one (core, output channel) (decompiled, @0x3c4ef8):
     vals = the stored bytes in position order (0 for an absent one). checkMaxValuesInBatch counts every value and the
     non-zero ones (non-zero = stored byte != 0, not != the zero point: NPUC passes 0) until one sub-batch would exceed
     1016 values or 511 non-zero (maxrec = the shortest such run, restarting the walk when a later run is shorter).
-    Then cpb0 = floor(maxrec / K / 2) * 2, nb = ceil(cdiv / cpb0), kept if cdiv % nb == 0 or
-    even_ceil(ceil(cdiv / nb)) * K < maxrec, else raised to the next divisor of cdiv. cdiv = the IFM ordering's channel
+    Then cpb0 = floor(maxrec / K / 2) * 2, nb = ceil(nch / cpb0), kept if nch % nb == 0 or
+    even_ceil(ceil(nch / nb)) * K < maxrec, else raised to the next divisor of nch. nch = the IFM ordering's channel
     count / its IDPs (getChannelCount / IDPSet size), not the layout's channels per core: returns the count."""
     maxrec = 0
     while True:
@@ -159,10 +160,10 @@ def _min_batches(vals, K, cdiv):
     cpb = maxrec // K // IL * IL
     if cpb == 0:
         raise ValueError("a sub-batch would hold no channel pair: NPUC divides by zero")
-    nb = _ceil(cdiv, cpb)
-    if cdiv % nb and _ceil(_ceil(cdiv, nb), IL) * IL * K < maxrec:
+    nb = cdiv(nch, cpb)
+    if nch % nb and cdiv(cdiv(nch, nb), IL) * IL * K < maxrec:
         return nb
-    while cdiv % nb:
+    while nch % nb:
         nb += 1
     return nb
 
@@ -173,13 +174,13 @@ def _max_batches(geo):
     getNumChannelsPerIDP = vcpc) >= max(ceil(K * vcpc / 1016), ceil(K * vcpc / 511))"""
     K = geo["vk"][0] * geo["vk"][1]
     vc = geo["vcpc"]
-    bound = max(_ceil(K * vc, MAX_NZV), _ceil(K * vc, MAX_VALUES))
+    bound = max(cdiv(K * vc, MAX_NZV), cdiv(K * vc, MAX_VALUES))
     while vc % bound:
         bound += 1
     return bound
 
 
-def sub_batches(L, quant_mode=1, geo=None, strict=True, planner=False):
+def sub_batches(L, quant_mode=1, geo=None, planner=False):
     """The split of each core's (virtual) channels into sub-batches: (count, virtual channels per sub-batch).
     updateBatchesForFile (@0x3c7be0): the count is the largest getMinNumberOfBatches over every (core, real output
     channel); tryBuildData then sets channels per sub-batch = even_ceil(ceil(vcpc / count)) for every batch, and
@@ -210,22 +211,22 @@ def sub_batches(L, quant_mode=1, geo=None, strict=True, planner=False):
                     continue
                 i = c * geo["cpc"] + e[0]
                 vals.append(w[((o * cin + i) * kh + e[1]) * kw + e[2]] if i < cin else 0)
-            for k, cdiv in enumerate(cdivs):
-                nbs[k] = max(nbs[k], _min_batches(vals, K, cdiv))
+            for k, nch in enumerate(cdivs):
+                nbs[k] = max(nbs[k], _min_batches(vals, K, nch))
     nb = nbs[0] if planner else nbs[-1]
     if nb > 1 and s2 == 1:
         _planner_check(geo, w, zero, pos, K)
     bound = _max_batches(geo)
     if max(nbs) > bound:
         raise ValueError("%d sub-batches > maxPossibleBatches %d: NPUC aborts" % (max(nbs), bound))
-    return nb, _ceil(_ceil(geo["vcpc"], nb), IL) * IL
+    return nb, cdiv(cdiv(geo["vcpc"], nb), IL) * IL
 
 
 def _compact_idps(c):
     """NPUIDPAllocator::assignForChannelCountCompact (decompiled, @0x207410): g = ceil(c / 2) granules,
     u = ceil(g / 4) per IDP, ceil(g / u) IDPs"""
-    g = _ceil(c, IL)
-    return _ceil(g, _ceil(g, MAX_CORES))
+    g = cdiv(c, IL)
+    return cdiv(g, cdiv(g, MAX_CORES))
 
 
 def _planner_check(geo, w, zero, pos, K):
@@ -268,10 +269,10 @@ def _lead(pos, body):
     if lead0 % ROW == 0:
         return lead0
     size, s = body + 1, pos % ROW
-    return _ceil(size, ROW) if s == 0 else (size + s - 1) // ROW
+    return cdiv(size, ROW) if s == 0 else (size + s - 1) // ROW
 
 
-def conv_groups(L, quant_mode=1, strict=True, planner=False):
+def conv_groups(L, quant_mode=1, planner=False):
     """-> geometry, groups[core][load][b] as bytes (the sub-batches of one batch, each a lead byte + 8 chunks,
     concatenated; unpadded)"""
     geo = conv_geometry(L)
@@ -282,7 +283,7 @@ def conv_groups(L, quant_mode=1, strict=True, planner=False):
     if geo["stride"][0] != geo["stride"][1] or geo["stride"][0] not in (1, 2):
         raise ValueError("stride %s: NPUC supports 1 or 2, square, only" % geo["stride"])
     w, zero = _stored(L, quant_mode)
-    nb, cpb = sub_batches(L, quant_mode, geo, strict, planner)
+    nb, cpb = sub_batches(L, quant_mode, geo, planner)
     pos = _positions(geo)
     K = geo["vk"][0] * geo["vk"][1]
     subs = []
@@ -325,7 +326,7 @@ def conv_groups(L, quant_mode=1, strict=True, planner=False):
 _PACKED = collections.OrderedDict()     # conv_block's recent results by _pack_key (the packing is pure)
 
 
-def _pack_key(L, quant_mode, strict, planner):
+def _pack_key(L, quant_mode, planner):
     """everything conv_block's result depends on (the weights by digest)"""
     w = L["weights_oihw_u8"]
     try:
@@ -333,18 +334,18 @@ def _pack_key(L, quant_mode, strict, planner):
     except (TypeError, ValueError):
         wk = tuple(w)
     return (L["cout"], L["in_chw"][0], tuple(L["k"]), tuple(L.get("stride", [1, 1])), L.get("_cpc"), L.get("_ncores"),
-            L.get("w_zp", 128), quant_mode, bool(strict), bool(planner), len(w), wk)
+            L.get("w_zp", 128), quant_mode, bool(planner), len(w), wk)
 
 
-def conv_block(L, quant_mode=1, strict=True, planner=False):
+def conv_block(L, quant_mode=1, planner=False):
     """-> (geometry, the conv's WEIGHT block): conv_groups' batches padded to R rows each, R = the largest. The
     planner, the generator and the checks ask for the same convs many times: the result is memoised by content."""
-    key = _pack_key(L, quant_mode, strict, planner)
+    key = _pack_key(L, quant_mode, planner)
     hit = _PACKED.get(key)
     if hit is None:
         try:
-            geo, groups = conv_groups(L, quant_mode, strict, planner)
-            R = _ceil(max(len(x) for core in groups for load in core for x in load), ROW)
+            geo, groups = conv_groups(L, quant_mode, planner)
+            R = cdiv(max(len(x) for core in groups for load in core for x in load), ROW)
             blk = bytearray()
             for core in groups:
                 for load in core:
@@ -364,80 +365,24 @@ def conv_block(L, quant_mode=1, strict=True, planner=False):
     return copy.deepcopy(hit[0]), hit[1]
 
 
-def weight_blocks(low, strict=True):
+def weight_blocks(low):
     """The exact bytes of each WEIGHT block, in the NCP's order. A chain (convs and pools): one per conv, layer order.
     A graph (an eltwise, a concat or a standalone ReLU): one per conv, eltwise and ReLU layer, in NPUC's execution
     order (layer_blocks). Raises ValueError where NPUC aborts (the checks NPUC asserts on: sub-batch counts above
-    maxPossibleBatches in either pass, chunks over 511 non-zero values, the stride-1 planner abort). strict is kept
-    for callers: nothing is refused any more for being unmodelled."""
-    return [blk for _, _, blk in layer_blocks(low, strict)]
+    maxPossibleBatches in either pass, chunks over 511 non-zero values, the stride-1 planner abort)."""
+    return [blk for _, _, blk in layer_blocks(low)]
 
 
-def weight_block_map(low, strict=True):
-    """{layer name: its WEIGHT block} for the layers that own one"""
-    return {name: blk for name, _, blk in layer_blocks(low, strict)}
-
-
-GRAPH_KINDS = ("eltwise", "concat", "relu")
-
-
-def _is_graph(low):
-    return any(L["kind"] in GRAPH_KINDS for L in low["layers"])
-
-
-def _graph(low):
-    """ins, cons, by-name, the input's name"""
-    src = low["input"]["name"]
-    by = {L["name"]: L for L in low["layers"]}
-    ins = {L["name"]: list(L["inputs"]) if "inputs" in L else [L["input"]] for L in low["layers"]}
-    cons = {}
-    for L in low["layers"]:
-        for i in ins[L["name"]]:
-            cons.setdefault(i, []).append(L["name"])
-    return ins, cons, by, src
+def _output(low, cons):
+    """the network's output layer: its only sink, else npu_output or the last layer"""
+    sinks = [L["name"] for L in low["layers"] if L["name"] not in cons]
+    return sinks[0] if len(sinks) == 1 else (low.get("npu_output") or low["layers"][-1]["name"])
 
 
 def exec_order(low):
-    """NPUC's layer order (the stream part's rule, cmdq.md 7c, V on its NODE ORDER logs): from the output back, a layer
-    is entered once every layer reading it is, its inputs in order (depth first); run in reverse. The WEIGHT memory
-    vectors follow it (V: every graph compile)."""
-    ins, cons, by, src = _graph(low)
-    sinks = [L["name"] for L in low["layers"] if L["name"] not in cons]
-    out = sinks[0] if len(sinks) == 1 else (low.get("npu_output") or low["layers"][-1]["name"])
-    seen, lst, stack = {out}, [out], [(out, 0)]
-    while stack:
-        n, i = stack.pop()
-        if i < len(ins[n]):
-            stack.append((n, i + 1))
-            t = ins[n][i]
-            if t != src and t not in seen and all(r in seen for r in cons.get(t, [])):
-                seen.add(t)
-                lst.append(t)
-                stack.append((t, 0))
-    return [by[n] for n in lst[::-1]]
-
-
-def _cat_in_sram(K, low, ins, cons, by):
-    """the stream part's rule (cmdq.md 7c, V): a concat lives in SRAM (one CONCAT_STORAGE chunk, each core holding
-    [input 1's planes, input 2's planes, ...]) when every input is a pool or a conv with a multiple of 16 channels, it
-    is not the network output, no eltwise reads it and it does not fork into branches an eltwise joins"""
-    sinks = [L["name"] for L in low["layers"] if L["name"] not in cons]
-    out = sinks[0] if len(sinks) == 1 else (low.get("npu_output") or low["layers"][-1]["name"])
-    if K["name"] == out:
-        return False
-    if not all(by[i]["kind"] == "pool" or (by[i]["kind"] == "conv" and by[i]["out_chw"][0] % 16 == 0)
-               for i in ins[K["name"]] if i in by) or any(i not in by for i in ins[K["name"]]):
-        return False
-    rd = cons.get(K["name"], [])
-    if any(by[r]["kind"] == "eltwise" for r in rd):
-        return False
-
-    def to_eltwise(t):
-        for r in cons.get(t, []):
-            if by[r]["kind"] == "eltwise" or (by[r]["kind"] in ("conv", "pool", "relu") and to_eltwise(r)):
-                return True
-        return False
-    return not (len(rd) > 1 and to_eltwise(K["name"]))
+    """the layers in NPUC's order (common.exec_order); the WEIGHT memory vectors follow it (V: every graph compile)"""
+    ins, cons, by, src = topology(low)
+    return [by[n] for n in _exec_names(_output(low, cons), ins, cons, src)]
 
 
 def _channels(name, low, by):
@@ -452,7 +397,7 @@ def _segments(name, low, ins, cons, by):
     L = by.get(name)
     if L is not None and L["kind"] == "pool" and len(cons.get(name, [])) == 1:
         return _segments(L["input"], low, ins, cons, by)
-    if L is not None and L["kind"] == "concat" and _cat_in_sram(L, low, ins, cons, by):
+    if L is not None and L["kind"] == "concat" and concat_in_sram(name, _output(low, cons), by, ins, cons):
         segs, base = [], 0
         for i in ins[name]:
             c = _channels(i, low, by)
@@ -465,8 +410,8 @@ def _segments(name, low, ins, cons, by):
 def _permuted_conv(L, segs):
     """a conv over a segmented input as an equivalent conv: per core the segments' own core splits back to back
     (absent channels at the zero point)"""
-    cpcs = [2 * _ceil(c, 2 * MAX_CORES) for _, c in segs]
-    ncores = max(_ceil(c, cp) for (_, c), cp in zip(segs, cpcs))
+    cpcs = [2 * cdiv(c, 2 * MAX_CORES) for _, c in segs]
+    ncores = max(cdiv(c, cp) for (_, c), cp in zip(segs, cpcs))
     cpc = sum(cpcs)
     order = []
     for core in range(ncores):
@@ -491,13 +436,13 @@ def eltwise_block(L, dram=False):
     lengths of input 1, input 2 and the output (lowered "fl"), one byte per channel of the core (C split evenly:
     ceil(C / cores) each, the rest on the last), each array padded to 4 bytes, the core's region to 32."""
     C = L["in_chw"][0]
-    planes = _ceil(C, 2)
-    ppc = _ceil(planes, MAX_CORES)
-    cores = _ceil(planes, ppc)
-    n = _ceil(C, cores)
+    planes = cdiv(C, 2)
+    ppc = cdiv(planes, MAX_CORES)
+    cores = cdiv(planes, ppc)
+    n = cdiv(C, cores)
     regions = MAX_CORES if C == 4 and dram else cores
-    arr = _ceil(n, 4) * 4
-    reg = _ceil(3 * arr, 32) * 32
+    arr = cdiv(n, 4) * 4
+    reg = cdiv(3 * arr, 32) * 32
     out = bytearray()
     for c in range(regions):
         cnt = max(0, min(n, C - c * n))
@@ -539,7 +484,7 @@ def relu_identity_block(C, quant_mode=1):
                     add = 4 * (_umod(o, q4) // 4)
                     key = _umod(o & 0xFFFFFFFC, q4)
                     vals = []
-                    for pos in range(_ceil(geo["cpc"], IL)):
+                    for pos in range(cdiv(geo["cpc"], IL)):
                         for ci in range(IL):
                             w = c * q4 + IL * pos + ci + add
                             if real and w == o and w < C:
@@ -548,7 +493,7 @@ def relu_identity_block(C, quant_mode=1):
                                 vals.append(zero)
                     body += _chunk(vals, zero)
                 groups.append(bytes([_lead(0, len(body))]) + bytes(body))
-    R = _ceil(max(len(x) for x in groups), ROW)
+    R = cdiv(max(len(x) for x in groups), ROW)
     return b"".join(x + bytes(R * ROW - len(x)) for x in groups)
 
 
@@ -558,19 +503,19 @@ def _relu_zero_conv(L):
             "stride": [1, 1], "w_zp": 128, "weights_oihw_u8": [128] * (c * c)}
 
 
-def layer_blocks(low, strict=True):
+def layer_blocks(low):
     """[(layer name, kind, WEIGHT block)] in the NCP's order"""
     q = low.get("quant_mode", 1)
-    if not _is_graph(low):
-        return [(L["name"], L["kind"], conv_block(L if L["kind"] == "conv" else _relu_zero_conv(L), q, strict)[1])
+    if not has_graph_ops(low):
+        return [(L["name"], L["kind"], conv_block(L if L["kind"] == "conv" else _relu_zero_conv(L), q)[1])
                 for L in low["layers"] if L["kind"] in ("conv", "relu")]
-    ins, cons, by, src = _graph(low)
+    ins, cons, by, src = topology(low)
     res = []
     for L in exec_order(low):
         k = L["kind"]
         if k == "conv":
             segs = _segments(L["input"], low, ins, cons, by)
-            res.append((L["name"], k, conv_block(L if len(segs) == 1 else _permuted_conv(L, segs), q, strict)[1]))
+            res.append((L["name"], k, conv_block(L if len(segs) == 1 else _permuted_conv(L, segs), q)[1]))
         elif k == "eltwise":
             # an operand its group loads from DRAM: the network input, or a concat (one an eltwise reads stays in DRAM)
             dram = any(i == src or (i in by and by[i]["kind"] == "concat") for i in ins[L["name"]])
@@ -582,7 +527,7 @@ def layer_blocks(low, strict=True):
             # the depthwise path; a ReLU of a ReLU takes the inner one's form (V: relu<concat zero, g555;
             # relu<eltwise, relu<pool identity, g002, g016); the network input: G (taken as the identity)
             if p is not None and p["kind"] in ("conv", "concat"):
-                res.append((L["name"], k, conv_block(_relu_zero_conv(L), q, strict)[1]))
+                res.append((L["name"], k, conv_block(_relu_zero_conv(L), q)[1]))
             else:
                 res.append((L["name"], k, relu_identity_block(L["cout"], q)))
     return res
@@ -604,15 +549,15 @@ def _mf_conv(L, chans):
     runs into the next input's channels when an input does not fill its rows); n = the IDPs assignForChannelCountCompact
     gives the whole concat (P = ceil(C/2) planes: ceil(P / ceil(P/4)))."""
     C = sum(chans)
-    P = _ceil(C, 2)
-    n = _ceil(P, _ceil(P, MAX_CORES))
+    P = cdiv(C, 2)
+    n = cdiv(P, cdiv(P, MAX_CORES))
     per = [[] for _ in range(n)]
     a = 0
     for c in chans:
-        b = _ceil(c, 2)
+        b = cdiv(c, 2)
         v = 2 * a
         for core in range(n):
-            for _ in range(_ceil(a, n), _ceil(a + b, n)):
+            for _ in range(cdiv(a, n), cdiv(a + b, n)):
                 for _e in range(IL):
                     per[core].append(v if v < C else -1)
                     v += 1
@@ -642,7 +587,7 @@ def _planner_concat(L, by, ins, low):
     return [_channels(i, low, by) for i in ins[p["name"]]]
 
 
-def weight_planning_sizes(low, strict=True):
+def weight_planning_sizes(low):
     """One per WEIGHT block, in the NCP's order: the size NPUC's planner computes for it (the log's compWeight, which
     sets the WEIGHT SRAM chunk the allocator asks for; weights.md section 7). Equal to the block except:
     - a conv whose first input is a concat (or a pool of one): the larger of the normal channel order's pack and the
@@ -656,21 +601,21 @@ def weight_planning_sizes(low, strict=True):
     def plan_len(L, blk):
         if L.get("stride", [1, 1]) == [1, 1]:
             return len(blk)
-        return len(conv_block(L, q, strict, True)[1])
+        return len(conv_block(L, q, True)[1])
 
-    if not _is_graph(low):
+    if not has_graph_ops(low):
         convs = [L for L in low["layers"] if L["kind"] == "conv"]
-        return [plan_len(L, b) for L, b in zip(convs, weight_blocks(low, strict))]
-    ins, cons, by, src = _graph(low)
+        return [plan_len(L, b) for L, b in zip(convs, weight_blocks(low))]
+    ins, cons, by, src = topology(low)
     out = []
-    for name, kind, blk in layer_blocks(low, strict):
+    for name, kind, blk in layer_blocks(low):
         L = by[name]
         if kind == "conv":
             segs = _segments(L["input"], low, ins, cons, by)
-            normal = plan_len(L, blk) if len(segs) == 1 else len(conv_block(L, q, strict, True)[1])
+            normal = plan_len(L, blk) if len(segs) == 1 else len(conv_block(L, q, True)[1])
             chans = _planner_concat(L, by, ins, low)
             if chans is not None and all(c % 2 == 0 for c in chans):
-                normal = max(normal, len(conv_block(_mf_conv(L, chans), q, False)[1]))
+                normal = max(normal, len(conv_block(_mf_conv(L, chans), q)[1]))
             out.append(normal)
         elif kind == "relu":
             p = _relu_source(L, by)
@@ -684,17 +629,17 @@ def weight_planning_sizes(low, strict=True):
     return out
 
 
-def weight_layer_info(low, strict=True):
+def weight_layer_info(low):
     """Per WEIGHT block in the NCP's order: {name, kind, size (the block), planning_size (the planner's, compWeight),
     and for a conv or ReLU the emitted block's geometry: ncores, nloads, rows_per_batch (R: io h = 2R), sub_batches,
     sub_channels, plus planning_rows = planning_size / (planning cores x nloads x 2 x 64)}."""
     q = low.get("quant_mode", 1)
-    lb = layer_blocks(low, strict)
-    ps = weight_planning_sizes(low, strict)
+    lb = layer_blocks(low)
+    ps = weight_planning_sizes(low)
     by = {L["name"]: L for L in low["layers"]}
-    graph = _is_graph(low)
+    graph = has_graph_ops(low)
     if graph:
-        ins, cons, _, src = _graph(low)
+        ins, cons, _, src = topology(low)
     out = []
     for (name, kind, blk), psz in zip(lb, ps):
         d = {"name": name, "kind": kind, "size": len(blk), "planning_size": psz}
@@ -707,7 +652,7 @@ def weight_layer_info(low, strict=True):
                 G = L if len(segs) == 1 else _permuted_conv(L, segs)
             else:
                 G = L
-            geo = conv_block(G, q, strict)[0]
+            geo = conv_block(G, q)[0]
             pc = MAX_CORES if kind == "relu" and psz != len(blk) else geo["ncores"]
             d.update({k: geo[k] for k in ("ncores", "nloads", "rows_per_batch", "sub_batches", "sub_channels")})
             d["planning_rows"] = psz // (pc * geo["nloads"] * 2 * ROW)
@@ -728,8 +673,9 @@ def weight_layers(low):
     return out
 
 
-def weight_block_sizes(low, strict=True):
-    return [len(b) for b in weight_blocks(low, strict)]
+def weight_block_sizes(low):
+    """the byte size of each WEIGHT block, in the NCP's order"""
+    return [len(b) for b in weight_blocks(low)]
 
 
 def weight_geometry(low):
@@ -748,23 +694,7 @@ def weight_geometry(low):
     return res
 
 
-# --- oracle side (reads a compiled NCP; used by check only) ---
-
-def ncp_weight_blocks(path):
-    """The WEIGHT blocks of an NCP in memory vector order: (mv index, av index, offset, bytes)."""
-    d = open(path, "rb").read()
-    h = struct.unpack_from("<32I", d, 0)
-    avo, avc, mvo, mvc = h[10:14]
-    av = [struct.unpack_from("<4I", d, avo + 16 * i) for i in range(avc)]
-    res = []
-    for i in range(mvc):
-        m = struct.unpack_from("<8I", d, mvo + 32 * i)
-        if m[0] == 7 and m[7] < len(av):
-            a = av[m[7]]
-            res.append((i, m[7], a[1], d[a[1]:a[1] + a[3]]))
-    return res
-
-
+# --- the check against NPUC's compiles ---
 WEIGHT_ASSERTS = ("NPULIRKernelPack", "NPULIRKernelMemoryData", "_strideWidth == _strideHeight")
 
 
@@ -779,7 +709,7 @@ def _oracle_refused(vd):
     return None, False
 
 
-def check(dirs, strict=True):
+def check(dirs):
     """Compare weight_blocks(lowered.json) with the WEIGHT blocks of each variant's net.ncp (no compiling here).
     A variant NPUC aborted on (no net.ncp, an assertion in log.txt) counts as matching when we refuse it too."""
     ok = bad = refused = skipped = 0
@@ -793,7 +723,7 @@ def check(dirs, strict=True):
             continue
         ncp = os.path.join(vd, "net.ncp")
         try:
-            gen, err = weight_blocks(low, strict), None
+            gen, err = weight_blocks(low), None
         except ValueError as e:
             gen, err = None, str(e)
         if not os.path.exists(ncp):
@@ -808,7 +738,7 @@ def check(dirs, strict=True):
                 skipped += 1
                 print("%-28s skip (no net.ncp: NPUC failed outside the weights%s)" % (name, ": " + why if why else ""))
             continue
-        ref = [b[3] for b in ncp_weight_blocks(ncp)]
+        ref = ncp_parts(open(ncp, "rb").read())["weights"]
         if err:
             bad += 1
             print("%-28s differs: we refuse (%s), NPUC compiled it" % (name, err))
@@ -831,18 +761,23 @@ def check(dirs, strict=True):
     return bad == 0
 
 
-def main(argv):
-    if len(argv) >= 2 and argv[0] == "check":
-        loose = "--loose" in argv
-        return 0 if check([a for a in argv[1:] if a != "--loose"], not loose) else 1
-    if len(argv) == 2 and argv[0] == "show":
-        low = json.load(open(argv[1]))
-        for g in weight_geometry(low):
-            print(json.dumps(g))
-        return 0
-    print(__doc__)
-    return 2
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="weights.py", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("check", help="our WEIGHT blocks against NPUC's compiles")
+    p.add_argument("dirs", nargs="+")
+    p.add_argument("--loose", action="store_true", help=argparse.SUPPRESS)  # no effect any more (old command lines)
+    p = sub.add_parser("show", help="the geometry and block sizes of each conv")
+    p.add_argument("lowered")
+    a = ap.parse_args(argv)
+    if a.cmd == "check":
+        return 0 if check(a.dirs) else 1
+    for g in weight_geometry(json.load(open(a.lowered))):
+        print(json.dumps(g))
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    from ncpgen import weights as _pkg    # the package's copy of this module (one copy of every module)
+    sys.exit(_pkg.main())

@@ -7,6 +7,7 @@ NPUC's Eltwise needs).
   stream_graphs.py write <dir>       <dir>/<name>.json for every variant
   stream_graphs.py compile <dir> [name...]   write, then npuc-local.sh each into <dir>/<name>/ (NPU_ROOT below)
 """
+import argparse
 import json
 import os
 import random
@@ -301,23 +302,31 @@ def random_net(name, seed):
     return n
 
 
-def main():
-    a = sys.argv[1:]
-    if len(a) >= 3 and a[0] == "random":       # stream_graphs.py random <dir> <first seed> [count]
-        V = {"g%03d" % s: random_net("g%03d" % s, s) for s in range(int(a[2]), int(a[2]) + int((a[3:] or [40])[0]))}
-        a = ["compile", a[1]]
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="stream_graphs.py", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("write", "compile"):
+        p = sub.add_parser(name)
+        p.add_argument("dir")
+        p.add_argument("names", nargs="*")
+    p = sub.add_parser("random", help="random graph networks g<seed>, compiled")
+    p.add_argument("dir")
+    p.add_argument("seed", type=int)
+    p.add_argument("count", type=int, nargs="?", default=40)
+    a = ap.parse_args(argv)
+    if a.cmd == "random":
+        V = {"g%03d" % s: random_net("g%03d" % s, s) for s in range(a.seed, a.seed + a.count)}
+        names = list(V)
     else:
-        V = None
-    if len(a) < 2 or a[0] not in ("write", "compile"):
-        sys.exit(__doc__)
-    d = a[1]
+        V = variants()
+        names = a.names or list(V)
+    d = a.dir
     os.makedirs(d, exist_ok=True)
-    V = V or variants()
-    names = a[2:] or list(V)
     for k in names:
         json.dump(V[k].g, open(os.path.join(d, k + ".json"), "w"))
-    if a[0] == "write":
-        return
+    if a.cmd == "write":
+        return 0
     env = dict(os.environ, NPU_ROOT=ROOT)
     procs = []
     for k in names:
@@ -332,7 +341,8 @@ def main():
     for k, p in procs:
         o = p.communicate()[0]
         print("%-16s %s" % (k, (o.strip().splitlines() or ["?"])[-1][:150]))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -37,52 +37,41 @@ its slope is 1 low whenever frac(m * 256) >= 0.5; this module computes its own.)
   grelu.py regs <lowered.json> [--fixed]   print grelu_regs() for each conv layer
   grelu.py selftest                    the model against facts read in the sweep (no compile)
 """
+import argparse
 import importlib.util
 import json
 import os
 import struct
 import sys
 
-GRELU_EN = 0x401E0050  # CMDQ: 1 before the table, 0 after (G: grants the CMDQ access to the NFU's GReLU registers)
-NFU_SEL = 0x40163800  # NFUBR: 0xff before, 0 after (G: a broadcast mask over 8 NFU units)
-TABLE = tuple(0x40163044 + 4 * k for k in range(16))
-T1, T2 = 0x40163084, 0x40163088
+if not __package__:     # run as a script: the package is this file's directory
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ncpgen.common import CMDQ, NFU, decode_isa, f32, multiplier, ncp_vectors, requant, scale_value, set_reg_addr  # noqa
+
+GRELU_EN = CMDQ + 0x50  # 1 before the table, 0 after (G: grants the CMDQ access to the NFU's GReLU registers)
+NFU_SEL = NFU + 0x3800  # NFUBR: 0xff before, 0 after (G: a broadcast mask over 8 NFU units)
+TABLE = tuple(NFU + 0x3044 + 4 * k for k in range(16))
+T1, T2 = NFU + 0x3084, NFU + 0x3088
 CORES, LANES = 4, 4
 
 MODE_NONE, MODE_RELU = 11, 10  # NPUC's NNActivationType for a conv without activation / with ReLU (soc 1..3)
 
 
-def f32(x):
-    return struct.unpack("<f", struct.pack("<f", x))[0]
-
-
-def f32bits(v):
-    """a lowered.json scale ("0x3c000000", or a number) -> float32 value"""
-    if isinstance(v, str):
-        return struct.unpack("<f", struct.pack("<I", int(v, 16)))[0]
-    return f32(v)
-
-
 def npuc_slope(in_s, w_s, out_s):
-    """(slope, shift) exactly as NPUC's ScaleONFiller::setScale: float32 arithmetic, fcvtas (round half away)"""
-    m = f32(f32(f32(in_s) * f32(w_s)) / f32(out_s))
+    """(slope, shift) exactly as NPUC's ScaleONFiller::setScale (common.requant); ValueError where NPUC asserts"""
+    m = multiplier(in_s, w_s, out_s)
     if not m > 0:
         raise ValueError("multiplier %r not > 0" % m)
-    n = 0
-    if m < 0.5:
-        while True:
-            m = m * 2
-            n += 1
-            if m >= 0.5 or n >= 7:
-                break
-    slope = int(m * 256.0 + 0.5)  # m * 256 is an exact float32; + 0.5 exact in double: round half away for m > 0
+    _, slope, shift = requant(m)
     if slope > 0xFFFF:
         raise ValueError("slope %d > 65535 (NPUC asserts)" % slope)
-    return slope, n + 8
+    return slope, shift
 
 
 def layer_slope(layer):
-    return npuc_slope(f32bits(layer["in_scale"]), f32bits(layer["w_scale"]), f32bits(layer["out_scale"]))
+    """(slope, shift) of a lowered conv layer"""
+    return npuc_slope(scale_value(layer["in_scale"]), scale_value(layer["w_scale"]), scale_value(layer["out_scale"]))
 
 
 def zp_byte(layer, quant_mode):
@@ -252,7 +241,7 @@ def relu6_pieces(layer, quant_mode, six=6.0):
     s, sh = layer_slope(layer)
     zp = zp_byte(layer, quant_mode)
     qmax = 127 if quant_mode == 3 else 255
-    top = min(qmax, zp + int(f32(six) / f32bits(layer["out_scale"]) + 0.5))
+    top = min(qmax, zp + int(f32(six) / scale_value(layer["out_scale"]) + 0.5))
     k = top - zp  # first acc whose output reaches top: A + rha(acc s / 2^sh) >= top  <=>  acc s >= (k - 1/2) 2^sh
     t2 = -(-((2 * k - 1) << (sh - 1)) // s) if k > 0 else 0
     return [(zp, 0), (zp, s), (top, 0)], 0, t2
@@ -271,19 +260,15 @@ def _load(name, file):
 
 
 def ncp_writes(data):
-    """every set_reg of every group's CMDQ stream: [(reg, value, file offset)] (ncp-isa.py's decoding)"""
-    h = struct.unpack_from("<32I", data, 0)
-    gvo, gvc, body = h[14], h[15], h[17]
-    bases = {0x8: 0x401E0000, 0x9: 0x40120000, 0xA: 0x40160000, 0xB: 0x40100000}
+    """every set_reg of every group's CMDQ stream: [(reg, value, file offset)]"""
+    h, _, _, gv = ncp_vectors(data)
     out = []
-    for g in range(gvc):
-        gv = struct.unpack_from("<10I", data, gvo + 40 * g)
-        off, size = body + gv[8], gv[9]
-        for i in range(size // 6):
-            o = off + 6 * i
-            val, op = struct.unpack_from("<IH", data, o)
-            if op >> 12 in bases and op >> 8 not in (0x3A, 0x2B):
-                out.append((bases[op >> 12] + (op & 0xFFF) * 4, val, o))
+    for g in gv:
+        off = h[17] + g[8]
+        for i, (op, val) in enumerate(decode_isa(data[off:off + g[9]])):
+            a = set_reg_addr(op)
+            if a is not None:
+                out.append((a, val, off + 6 * i))
     return out
 
 
@@ -439,26 +424,34 @@ def selftest():
     return 1 if bad else 0
 
 
-def main():
-    a = sys.argv[1:]
-    if not a:
-        sys.exit(__doc__)
-    if a[0] == "selftest":
-        sys.exit(selftest())
-    if a[0] == "check" and len(a) > 1:
-        sys.exit(check(a[1:]))
-    if a[0] == "table" and len(a) > 1:
-        for p in a[1:]:
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="grelu.py", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("selftest", help="the model against facts read in the sweep")
+    p = sub.add_parser("check", help="our tables against NPUC's compiles")
+    p.add_argument("dirs", nargs="+")
+    p = sub.add_parser("table", help="every GReLU block of NCPs")
+    p.add_argument("ncps", nargs="+")
+    p = sub.add_parser("regs", help="grelu_regs() of each conv layer")
+    p.add_argument("lowered")
+    p.add_argument("--fixed", action="store_true")
+    a = ap.parse_args(argv)
+    if a.cmd == "selftest":
+        return selftest()
+    if a.cmd == "check":
+        return check(a.dirs)
+    if a.cmd == "table":
+        for p in a.ncps:
             show_table(p)
-        return
-    if a[0] == "regs" and len(a) > 1:
-        low = json.load(open(a[1]))
-        for l in conv_layers(low):
-            for r, v in grelu_regs(l, int(low.get("quant_mode", 1)), "--fixed" in a):
-                print("%s %#010x = %#010x" % (l.get("name", "?"), r, v))
-        return
-    sys.exit(__doc__)
+        return 0
+    low = json.load(open(a.lowered))
+    for l in conv_layers(low):
+        for r, v in grelu_regs(l, int(low.get("quant_mode", 1)), a.fixed):
+            print("%s %#010x = %#010x" % (l.get("name", "?"), r, v))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    from ncpgen import grelu as _pkg    # the package's copy of this module (one copy of every module)
+    sys.exit(_pkg.main())

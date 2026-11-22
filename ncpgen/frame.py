@@ -33,12 +33,19 @@ the NCP's vector order (weights.py's weight_blocks; for graphs the execution ord
 Tags in comments: V = seen in the oracle's bytes/log or the disassembly, G = guess (consistent with all variants,
 not proven).
 """
+import argparse
+import itertools
 import json
 import os
 import struct
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if not __package__:     # run as a script: the package is this file's directory
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ncpgen import stream, weights  # noqa: E402
+from ncpgen.common import (MV_IM, MV_IN, MV_OT, MV_P0, MV_WT, cdiv, decode_isa, first_diff, is_graph,  # noqa: E402
+                           ncp_header, ncp_parts, ncp_vectors, rup)
 
 # ---- constants of the format (V: NCPObjectGenerator2020::PackingHeader, dossier/npu-compiler.md 1.2) ----------------
 MAGIC1, MAGIC2 = 0x0C0FFEE0, 0xC0DEC0DE
@@ -48,21 +55,12 @@ RQ_PER_IO = 360            # V: "rq vector size" = 360 x io count, the zero tail
 IDP = 4                    # V: four IDP SRAMs (OT_PIX0..3), each addressed 0x40000 apart, 1 MiB vector each
 IDP_STRIDE = 0x40000
 SRAM_VEC = 1 << 20         # V: av size of OT_PIX0..3
-MV_IN, MV_OT, MV_IM, MV_P0, MV_WT = 0, 1, 2, 3, 7
 FMT_CELL, FMT_CHW = 0x120, 0x110   # V: 288 = the NPU's cell format, 272 = dense CHW (output intrinsic)
 FW_TABLE = 0x1D000         # V: the firmware's intrinsic table (entries 3, 5, 8 used)
 SRAM_LIMIT = IDP_STRIDE    # V: a plan whose live chunks exceed one IDP's 256 KiB SRAM streams its weights through a
 #                            ring (a smaller WEIGHT chunk), or is tiled by NPUC
 SRAM_SAFE = 240 * 1024     # G: when weights.py cannot tell a conv's sub-batches (its PARTIAL_SUM chunk), a plan above
 #                            this may already overflow NPUC's count: refuse
-
-
-def cdiv(a, b):
-    return -(-a // b)
-
-
-def rup(a, b):
-    return cdiv(a, b) * b
 
 
 # ---- the data layout -------------------------------------------------------------------------------------------------
@@ -189,7 +187,6 @@ def _first_fit(chunks, placed=None, cap=None, overflow=False, ties_created=False
     (lexicographic, as std::next_permutation; V: r_c256co128's third try puts its PARTIAL_SUM before its PAD).
     Returns the placed chunks; when nothing fits, None, or with overflow=True the bigger-first placement (the caller
     sees the overflow). ties_created: equal sizes in creation order (NPUC's retry after a copy, _single_block)."""
-    import itertools
     fixed = list(placed or [])
     done = list(fixed)
     for grp in chunks:
@@ -551,7 +548,7 @@ def plan(low, weight_sizes=None, strict=True, fix_npuc=False):
     fix_npuc=True writes the two DMA strides NPUC gets wrong (G until run on the NPU, docs/format/frame.md
     'NPUC defects'): the gathered read-back of one-plane-per-IDP outputs (c_stride 0, not -2*plane) and the store of
     a conv whose input was widened (DRAM c_stride 0); default False = NPUC's bytes."""
-    if _is_graph(low):
+    if is_graph(low):
         return plan_graph(low, weight_sizes)
     layers = low["layers"]
     C0, H0, W0 = low["input"]["chw"]
@@ -694,7 +691,6 @@ def _cut_plan(low, layers, shapes, placed, ops, dmas, wsize, v_in, v_im, v_w, av
     by core, 4 per pass to the same slot, when the kernel passes 4 MiB: k3c64-ci512, s2c64), a store per chunk of its
     passes' planes (_range_store), the output read-back"""
     global _IN_STREAM
-    import stream
     _IN_STREAM = True
     try:
         dl = stream.plan_dmas(low)
@@ -772,37 +768,13 @@ def _cut_plan(low, layers, shapes, placed, ops, dmas, wsize, v_in, v_im, v_w, av
 
 
 # ---- graph networks (eltwise, concat, standalone ReLU; docs/format/cmdq.md 7c) -------------------------------
-def _is_graph(low):
-    prev = low["input"]["name"]
-    for L in low["layers"]:
-        if L["kind"] in ("eltwise", "concat", "relu") or L.get("input") != prev or len(L.get("inputs", [prev])) != 1:
-            return True
-        prev = L["name"]
-    return False
-
-
-def meta_block(L):
-    """the eltwise's META_DATA 'weights' (V: res, add2*, rc*, g*): per core a block of three byte arrays, the
-    fractional lengths of input 1, input 2 and the output (lowered.json "fl"), each one entry per channel slot of a
-    core (cpi = 2 ceil(C / 8)) padded with zeros to a multiple of 4 (A); a block is 32 B, 64 B when the three arrays
-    pass 32 (V: rc3, res 2 entries, rc12 4, res24 6, res40 10, res64 16); one block per core used (V: rc2, rc3 one,
-    res-c3, rc4 two, rc6, rc12 three)"""
-    C = L["out_chw"][0]
-    m = cell(*L["out_chw"])["cpi"]
-    A = rup(m, 4)
-    blk = b"".join(bytes([f & 0xFF] * m + [0] * (A - m)) for f in L["fl"])
-    blk += bytes((32 if 3 * A <= 32 else 64) - len(blk))
-    return blk * cell(*L["out_chw"])["n"]
-
-
 def plan_graph(low, weight_sizes=None):
     """the container of a graph network (docs/format/cmdq.md 7c; frame.md 6.8): the groups and DMAs are the
     stream part's (stream.Plan: NPUC's layer order, one group per layer but concats, the unflatten last; each DMA op
     with its tensor and SRAM offset); this builds their descriptors and the vectors: IN, OT, an IM per tensor stored
     to DRAM (in the order of their first store), one more IM per concat, a WEIGHT per conv and ReLU layer and a
     META_DATA per eltwise in execution order, IM 8x8x2. weight_sizes: the sizes of the WEIGHT blocks in that vector
-    order (weights.py's weight_blocks, META_DATA included; meta_block() gives the same bytes)."""
-    import stream
+    order (weights.py's weight_blocks, META_DATA included: weights.eltwise_block)."""
     layers = low["layers"]
     by = {L["name"]: L for L in layers}
     src = low["input"]["name"]
@@ -1708,10 +1680,6 @@ def _sub_batches(low):
     """{conv layer index: its weight sub-batch count} from weights.py (the weights part); None for a conv it cannot
     pack (then the PARTIAL_SUM chunk is unknown)"""
     out = {}
-    try:
-        import weights  # noqa: the weights part (ncpgen/weights.py), a sibling module
-    except ImportError:
-        weights = None
     for li, L in enumerate(low["layers"]):
         if L["kind"] != "conv":
             continue
@@ -1730,9 +1698,8 @@ def _sub_batches(low):
 
 def _weight_sizes(low):
     try:
-        import weights  # noqa: the weights part (ncpgen/weights.py), a sibling module
         return weights.weight_block_sizes(low)
-    except Exception:   # not there, or a packing it refuses: our estimate (sizes only steer the allocation)
+    except Exception:   # a packing weights.py refuses: an estimate (sizes only steer the allocation)
         return [_dense_weight_estimate(L) for L in low["layers"] if L["kind"] == "conv"]
 
 
@@ -1901,8 +1868,7 @@ def batches_from_streams(io, streams, capped=(), wvecs=()):
     loads)."""
     writes = []
     for g, st in enumerate(streams):
-        for k in range(len(st) // 6):
-            val, op = struct.unpack_from("<IH", st, 6 * k)
+        for op, val in decode_isa(st):
             if op == EV2SET_OP and val >> 16:
                 writes.append((g, val >> 16))
     bids, k, bid, prev = [], 0, 0, None
@@ -2001,21 +1967,9 @@ def frame(low, streams, intrinsics_, weights, fix_npuc=False):
 
 
 # ---- check: our frame around the oracle's own streams and weights ------------------------------------------------------
-def cut(ncp):
-    h = struct.unpack_from("<32I", ncp, 0)
-    avo, avc, mvo, mvc, gvo, gvc = h[10:16]
-    body = h[17]
-    av = [struct.unpack_from("<4I", ncp, avo + 16 * i) for i in range(avc)]
-    mv = [struct.unpack_from("<8I", ncp, mvo + 32 * i) for i in range(mvc)]
-    gv = [struct.unpack_from("<10I", ncp, gvo + 40 * i) for i in range(gvc)]
-    return {"streams": [ncp[body + g[8]:body + g[8] + g[9]] for g in gv],
-            "intrinsics": [ncp[body + g[6]:body + g[6] + g[7]] for g in gv],
-            "weights": [ncp[av[m[7]][1]:av[m[7]][1] + av[m[7]][3]] for m in mv if m[0] == MV_WT]}
-
-
 def region(ncp, off):
     """name the NCP region an offset falls in (for diff reports)"""
-    h = struct.unpack_from("<32I", ncp, 0)
+    h = ncp_header(ncp)
     avo, avc, mvo, mvc, gvo, gvc = h[10:16]
     iov, ioc = h[19], h[20]
     if off < 128:
@@ -2037,12 +1991,9 @@ def ncp_layout(low, ncp):
     ncp_layout (same dict; its ifm_addr(c, y, x, lay) with plane_h = Hp and plane_w = 2*Wp is this module's
     ifm_addr). Raises ValueError when the NCP's IN_FMAP / OT_FMAP vectors or its IFM DMAs are not the ones plan()
     predicts for this network (then the layout is not the one modelled)."""
-    h = struct.unpack_from("<32I", ncp, 0)
-    avo, avc, mvo, mvc = h[10:14]
-    av = [struct.unpack_from("<4I", ncp, avo + 16 * i) for i in range(avc)]
-    mv = [struct.unpack_from("<8I", ncp, mvo + 32 * i) for i in range(mvc)]
+    h, av, mv, _ = ncp_vectors(ncp)
     io = [list(struct.unpack_from("<31I", ncp, h[19] + 124 * i)) for i in range(h[20])]
-    parts = cut(ncp)
+    parts = ncp_parts(ncp)
     p = plan(low, [len(w) for w in parts["weights"]], strict=False)
     C, H, W = low["input"]["chw"]
     Co, Ho, Wo = low["layers"][-1]["out_chw"]
@@ -2113,7 +2064,7 @@ def check(dirs):
         n += 1
         low = json.load(open(lp))
         ref = open(np_, "rb").read()
-        parts = cut(ref)
+        parts = ncp_parts(ref)
         try:
             p = plan(low, [len(w) for w in parts["weights"]])
             intr = intrinsics(low, p)
@@ -2139,24 +2090,32 @@ def check(dirs):
     return 0 if n and ok == n else 2
 
 
-def main():
-    a = sys.argv[1:]
-    if not a:
-        sys.exit(__doc__)
-    if a[0] == "check":
-        sys.exit(check(a[1:]))
-    if a[0] == "selftest":
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="frame.py", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("check", help="our container around NPUC's own streams and weights")
+    p.add_argument("dirs", nargs="*")
+    sub.add_parser("selftest", help="the layout against the NPU-measured map, the A32 encoder")
+    p = sub.add_parser("plan", help="print the plan")
+    p.add_argument("src", help="a variant dir or a lowered.json")
+    p.add_argument("sizes", nargs="?", help="the WEIGHT block sizes, comma-separated")
+    p = sub.add_parser("layout", help="the IFM/OFM sizes, and the byte address of element (c, y, x)")
+    p.add_argument("dims", nargs="+", type=int, metavar="C H W [c y x]")
+    a = ap.parse_args(argv)
+    if a.cmd == "check":
+        return check(a.dirs)
+    if a.cmd == "selftest":
         selftest()
-        return
-    if a[0] == "plan" and len(a) >= 2:
-        src = a[1]
+    elif a.cmd == "plan":
+        src = a.src
         lp = os.path.join(src, "lowered.json") if os.path.isdir(src) else src
         low = json.load(open(lp))
         ws = None
         if os.path.isdir(src) and os.path.isfile(os.path.join(src, "net.ncp")):
-            ws = [len(w) for w in cut(open(os.path.join(src, "net.ncp"), "rb").read())["weights"]]
-        if len(a) > 2:
-            ws = [int(x) for x in a[2].split(",")]
+            ws = [len(w) for w in ncp_parts(open(os.path.join(src, "net.ncp"), "rb").read())["weights"]]
+        if a.sizes:
+            ws = [int(x) for x in a.sizes.split(",")]
         p = plan(low, ws)
         for c in p["chunks"]:
             print("chunk %-8s layer %2d live %s off %6d size %6d" % (c["kind"], c.get("layer", -1), c["live"], c["off"],
@@ -2164,24 +2123,23 @@ def main():
         for st in p.get("strata", []):
             print("stratum %s layers %s %s" % (st["kind"], st["layers"], " ".join(
                 "%s %s" % (k, st[k]) for k in ("nh", "nw", "rows", "cols", "ring") if k in st)))
-        for i, (a_, m) in enumerate(zip(p["av"], p["mv"])):
-            print("vec %2d type %d shape %s av size %d" % (i, m[0], m[2:5], a_[3]))
+        for i, (av, m) in enumerate(zip(p["av"], p["mv"])):
+            print("vec %2d type %d shape %s av size %d" % (i, m[0], m[2:5], av[3]))
         for x in p["io"]:
             print("io u%d b%d sg%d trig %#x src %s dst %s" % (x[0], x[1], x[2], x[4], x[9:20], x[20:31]))
         print("groups", [g["kind"] for g in p["groups"]], "unflatten", p["unflatten"])
-        return
-    if a[0] == "layout" and len(a) >= 4:
-        C, H, W = (int(x) for x in a[1:4])
+    else:
+        C, H, W = a.dims[:3]
         L = cell(C, H, W)
         print("IFM %dx%dx%d: %d B (%d IDP x %d planes x %d x %d), %d channels per IDP; OFM %d B dense CHW" % (
             C, H, W, L["size"], L["n"], L["pp"], L["Hp"], 2 * L["Wp"], L["cpi"], ofm_size(C, H, W)))
-        if len(a) >= 7:
-            c, y, x = (int(v) for v in a[4:7])
+        if len(a.dims) >= 6:
+            c, y, x = a.dims[3:6]
             print("element (%d, %d, %d): IFM byte %d, OFM byte %d" % (c, y, x, ifm_addr(c, y, x, C, H, W),
                                                                     ofm_addr(c, y, x, C, H, W)))
-        return
-    sys.exit(__doc__)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    from ncpgen import frame as _pkg    # the package's copy of this module (one copy of every module)
+    sys.exit(_pkg.main())

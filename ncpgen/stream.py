@@ -28,31 +28,30 @@ Uses the sibling modules when present: grelu.py (the activation table, grelu_reg
 batch and the sub-batch split, conv_block); without them it falls back on its own derivations (NPUC's table; batch
 sizes without sub-batches).
 """
+import argparse
 import json
 import os
-import struct
+import re
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-if HERE not in sys.path:
-    sys.path.insert(0, HERE)
+if not __package__:     # run as a script: the package is this file's directory
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ncpgen import frame, grelu, weights  # noqa: E402
+from ncpgen.common import (CMDQ, INTC, MTC, NFU, cdiv, concat_in_sram, decode_isa, encode_isa,  # noqa: E402
+                           exec_order, is_graph, multiplier, ncp_parts, requant, scale_value, set_reg_addr,
+                           set_reg_op, GRAPH_KINDS)
 
 
 class Unsupported(Exception):
-    pass
+    """a network this module cannot generate the streams of (not modelled: refused rather than guessed)"""
 
 
 class NeedsTiling(Unsupported):
-    pass
-
-
-def cdiv(a, b):
-    return -(-a // b)
+    """a layer NPUC tiles where the planner expected it whole"""
 
 
 # ---- instruction encoding -------------------------------------------------------------------------------------------
-BLOCKS = ((0x401E0000, 0x8), (0x40120000, 0x9), (0x40160000, 0xA), (0x40100000, 0xB))
-CMDQ, MTC, NFU, INTC = 0x401E0000, 0x40120000, 0x40160000, 0x40100000
 R = {i: CMDQ + 0x100 + 4 * i for i in range(1, 16)}       # r1..r15 (V: names in NPUC's log)
 EV2SET, EV2, SWI = CMDQ + 0x2024, CMDQ + 0x2028, CMDQ + 0x180
 GRELU_GUARD = CMDQ + 0x50
@@ -65,11 +64,8 @@ class Code:
         self.ins = []
 
     def w(self, addr, val):
-        for base, blk in BLOCKS:
-            if base <= addr < base + 0x4000:
-                self.ins.append((blk << 12 | (addr - base) >> 2, val & 0xFFFFFFFF))
-                return
-        raise ValueError("no block for %#x" % addr)
+        """set_reg addr = val"""
+        self.ins.append((set_reg_op(addr), val & 0xFFFFFFFF))
 
     def nop(self, n=1):
         self.ins.extend([(0, 0)] * n)
@@ -91,7 +87,7 @@ class Code:
             self.nop(4)
 
     def bytes(self):
-        return b"".join(struct.pack("<IH", v, op) for op, v in self.ins)
+        return encode_isa(self.ins)
 
 
 # ---- how NPUC spreads channels over the 4 cores ----------------------------------------------------------------------
@@ -113,112 +109,38 @@ def cells(h, w):
 
 
 # ---- the GReLU hook ----------------------------------------------------------------------------------------------
-def _f32(x):
-    return struct.unpack("<f", struct.pack("<f", x))[0]
+def layer_shift(layer):
+    """the requantisation shift of a conv (NPUC's ScaleONFiller::setScale, common.requant)"""
+    return requant(multiplier(*(scale_value(layer[k]) for k in ("in_scale", "w_scale", "out_scale"))))[2]
 
 
-def _scale(v):
-    return struct.unpack("<f", struct.pack("<I", int(v, 16)))[0] if isinstance(v, str) else _f32(v)
+def grelu_writes(layer, quant_mode, p, fixed=False):
+    """the activation table's writes for pass p of a conv, CMDQ 0x401e0050 = 1 ... = 0 included: grelu.grelu_regs
+    (every pass's block), split here at the 0x401e0050 brackets"""
+    regs = list(grelu.grelu_regs(layer, quant_mode, fixed=fixed))
+    blocks, cur = [], None
+    guard = any(a == GRELU_GUARD for a, v in regs)
+    start = (GRELU_GUARD, 1) if guard else (NFU + 0x3800, 0xFF)
+    end = (GRELU_GUARD, 0) if guard else (NFU + 0x3800, 0)
+    for a, v in regs:
+        if (a, v) == start:
+            cur = []
+        cur.append((a, v))
+        if (a, v) == end:
+            blocks.append(cur if guard else [(GRELU_GUARD, 1)] + cur + [(GRELU_GUARD, 0)])
+            cur = None
+    if p >= len(blocks):
+        raise Unsupported("grelu.py gave %d blocks, pass %d wanted" % (len(blocks), p))
+    return blocks[p]
 
 
-def npuc_slope(layer):
-    """(slope, shift) as NPUC's ScaleONFiller::setScale computes them: m = f32(f32(in * w) / out), doubled while < 0.5
-    (at most 7 times), slope = round half away (m * 256) (fcvtas; the grelu agent's reading, grelu.md), shift =
-    doublings + 8"""
-    m = _f32(_f32(_scale(layer["in_scale"]) * _scale(layer["w_scale"])) / _scale(layer["out_scale"]))
-    n = 0
-    while m < 0.5 and n < 7:
-        m *= 2
-        n += 1
-    return int(m * 256.0 + 0.5), n + 8
-
-
-def grelu_writes(layer, quant_mode, p, slots, fixed=False):
-    """the activation table's writes for pass p of a conv, CMDQ 0x401e0050 = 1 ... = 0 included. From ncpgen/grelu.py
-    when it exists (grelu_regs(layer, quant_mode, fixed): every pass's block, split here at the 0x401e0050 brackets),
-    else NPUC's own values (V, sweep co1..co64, relu/none, quant 1/3): entry n (core n // 4, lane n % 4) = out zp |
-    slope << 16 for a live slot, 0 otherwise; with ReLU NPUC zeroes the slope of entries 0 and 1 (its defect,
-    dossier 9.15 and grelu.md); 0x..84 = 0x..88 = 0."""
-    try:
-        import grelu  # noqa: the grelu agent's module (ncpgen/grelu.py)
-    except ImportError:
-        grelu = None
-    if grelu is not None:
-        regs = list(grelu.grelu_regs(layer, quant_mode, fixed=fixed))
-        blocks, cur = [], None
-        guard = any(a == GRELU_GUARD for a, v in regs)
-        start = (GRELU_GUARD, 1) if guard else (NFU + 0x3800, 0xFF)
-        end = (GRELU_GUARD, 0) if guard else (NFU + 0x3800, 0)
-        for a, v in regs:
-            if (a, v) == start:
-                cur = []
-            cur.append((a, v))
-            if (a, v) == end:
-                blocks.append(cur if guard else [(GRELU_GUARD, 1)] + cur + [(GRELU_GUARD, 0)])
-                cur = None
-        if p >= len(blocks):
-            raise Unsupported("grelu.py gave %d blocks, pass %d wanted" % (len(blocks), p))
-        return blocks[p]
-    if fixed:
-        raise Unsupported("fixed GReLU table needs ncpgen/grelu.py")
-    zp = (layer["out_zp"] - 128) & 0xFF if quant_mode == 3 else layer["out_zp"]
-    slope, _ = npuc_slope(layer)
-    regs = [(GRELU_GUARD, 1), (NFU + 0x3800, 0xFF)]
-    for n, ch in enumerate(slots):
-        v = 0
-        if ch is not None:
-            v = zp if (layer.get("act") == 1 and n < 2) else (slope << 16 | zp)
-        regs.append((NFU + 0x3044 + 4 * n, v))
-    regs += [(NFU + 0x3084, 0), (NFU + 0x3088, 0), (NFU + 0x3800, 0), (GRELU_GUARD, 0)]
-    return regs
-
-
-# ---- compressed weight blocks (only their sizes matter here) ---------------------------------------------------------
-def weight_block_units(L, din, dout, passes, s2d=1):
-    """size in 64-byte lines of every weight block of a conv: all blocks are as large as the largest (V: co9, co17
-    weight blobs). A block = 1 header byte + 8 units (output cores 2j, 2j+1 x plane slot 0, 1 x channel 0, 1); a unit =
-    a 2-byte header, a bitmap of ceil(n / 8) bytes and its non-zero bytes, over the input core's 2*ppc channels x kh x
-    kw (zero = the zero point 128; weights.md has the exact format).
-    Stride 2 (s2d = 2): the space-to-depth input has 4x the channels and a ceil(k/2) kernel; the non-zero weights of
-    a core are the same ones, redistributed (V: s2* variants)."""
-    cin, cout = L["in_chw"][0], L["cout"]
-    kh, kw = L["k"]
-    wts = L["weights_oihw_u8"]
-    nw = 2 * din.ppc * s2d * s2d * cdiv(kh, s2d) * cdiv(kw, s2d)
-    if nw > 511:        # a unit could pass 511 non-zero values: NPUC then splits it in sub-batches (weights.py)
-        raise Unsupported("weight sub-batches possible (%d positions per unit): needs ncpgen/weights.py" % nw)
-    bm = cdiv(nw, 8)
-    best = 0
-    for p in range(passes):
-        for k in range(din.cores):
-            chans = [i for i in range(2 * din.ppc * k, 2 * din.ppc * (k + 1)) if i < cin]
-            for j in range(2):
-                used = 1
-                for s in range(2):
-                    oc = 2 * j + s
-                    for slot in range(2):
-                        for c in range(2):
-                            o = out_channel(dout, oc, p, slot, c)
-                            nz = 0
-                            if o is not None:
-                                for i in chans:
-                                    b = (o * cin + i) * kh * kw
-                                    nz += sum(1 for v in wts[b:b + kh * kw] if v != 128)
-                            used += 2 + bm + nz
-                best = max(best, cdiv(used, 64))
-    return best
-
-
-def weight_rows(L, q, din, dout, passes, s2d):
-    """rows (64 B) per weight batch: from ncpgen/weights.py (the weights agent's exact packing, sub-batches
-    included) when present, else our own estimate (exact without sub-batches)"""
-    try:
-        import weights  # noqa: the weights agent's module (ncpgen/weights.py)
-    except ImportError:
-        return weight_block_units(L, din, dout, passes, s2d), 1, (8 if s2d == 2 else 2) * din.ppc
+# ---- the weight blocks' geometry -------------------------------------------------------------------------------------
+def weight_rows(L, q):
+    """(rows of 64 B per weight batch, sub-batches, channels per sub-batch) of a conv: weights.py's packing (a packing
+    it refuses is refused here)"""
     try:
         geo = weights.conv_block(L, q)[0]
-    except ValueError as e:                     # a packing weights.py refuses: so do we
+    except ValueError as e:
         raise Unsupported("weights.py: %s" % e)
     return geo["rows_per_batch"], geo["sub_batches"], geo["sub_channels"][0]
 
@@ -310,20 +232,6 @@ def unflatten_tiles(d, ho, wo):
 
 
 # ---- planning: groups, IR elements, events, SRAM ---------------------------------------------------------------------
-GRAPH_KINDS = ("eltwise", "concat", "relu")
-
-
-def is_graph(low):
-    """a network the graph planner takes: one with an eltwise, a concat or a standalone ReLU, or whose layers do not
-    form a chain (npuc-net 2)"""
-    prev = low["input"]["name"]
-    for L in low["layers"]:
-        if L["kind"] in GRAPH_KINDS or L.get("input") != prev or len(L.get("inputs", [prev])) != 1:
-            return True
-        prev = L["name"]
-    return False
-
-
 class Op:
     def __init__(self, kind, **kw):
         self.kind = kind
@@ -443,20 +351,15 @@ class Plan:
         if fp is not None:
             self.from_frame(fp)
             return
-        self.segments = self.segment(layers)
-        last = None
-        for seg in self.segments:
-            if seg[0] == "run":
-                run = seg[1]
-                self.layout(run, final=seg is self.segments[-1], inp=seg[2])
-                for li, L in enumerate(run):
-                    if "copy" in self.info[li]:
-                        self.groups.append(self.copy_group(self.info[li]))
-                    ev0 = self.ev
-                    self.groups += self.cut(self.layer_group(li, L, first=li == 0, last=li == len(run) - 1), ev0)
-                last = self.info[-1]
-            else:
-                last = self.tiled_conv(seg[1], seg[2], seg[3])
+        # untiled: one SRAM-forwarded run of every layer, loading from and storing to DRAM (a layer NPUC tiles raises
+        # NeedsTiling: frame.plan tiles every network NPUC tiles)
+        self.layout(layers, final=True, inp=tuple(low["input"]["chw"]))
+        for li, L in enumerate(layers):
+            if "copy" in self.info[li]:
+                self.groups.append(self.copy_group(self.info[li]))
+            ev0 = self.ev
+            self.groups += self.cut(self.layer_group(li, L, first=li == 0, last=li == len(layers) - 1), ev0)
+        last = self.info[-1]
         nu = unflatten_tiles(last, last["ho"], last["wo"])
         dout = last["dout"]
         self.out_chw = (dout.c, last["ho"], last["wo"])     # NPUC's own output size (the read-back's profile)
@@ -470,45 +373,19 @@ class Plan:
 
     # ---- tiled plans from the frame part (ncpgen/frame.py) -----------------------------------------------------
     def frame_plan(self):
-        """frame.plan(low) when frame.py is present and NPUC tiles this network: the frame part's tiling decisions
-        (strata, tiles, back-propagated ranges, SRAM chunks; V on its sweep), so that both halves of the NCP agree.
-        None (our own planner) when frame.py is absent or the network is not tiled."""
-        try:
-            import frame  # noqa: the frame part's module (ncpgen/frame.py)
-        except ImportError:
-            return None
+        """frame.plan(low) when NPUC tiles this network: frame.py's tiling decisions (strata, tiles, back-propagated
+        ranges, SRAM chunks; V on its sweep), so that both halves of the NCP agree. None (the planner below) when
+        frame.plan refuses the network or does not tile it."""
         try:
             fp = frame.plan(self.low)
         except Exception:
             return None
         if not fp.get("tiled"):
             return None
-        # since frame.md 6.10 the strata are NPUC's own (its policy, read from its code): halo pools (final-chains
-        # f012, tiling2 g*), convs with weight sub-batches (f002, f059; their PARTIAL_SUM chunks in st["chunks"])
-        # and tiled weight rings included
-        self._frame = frame
+        # the strata are NPUC's own (its policy, read from its code; frame.md 6.10): halo pools (final-chains f012,
+        # tiling2 g*), convs with weight sub-batches (f002, f059; their PARTIAL_SUM chunks in st["chunks"]) and tiled
+        # weight rings included
         return fp
-
-    def frame_tiling(self, L):
-        """frame.plan's tiling of a conv our own planner tiles (a stratum frame_plan refuses, e.g. with weight
-        sub-batches): row and column tile counts, the weight ring R, its slot step and chunk size (frame.md: NPUC's
-        memory requirement picks the tile count and R), or None"""
-        try:
-            import frame  # noqa
-            fp = getattr(self, "_fpall", None) or frame.plan(self.low)
-        except Exception:
-            return None
-        self._fpall = fp
-        li = self.low["layers"].index(L)
-        for st in fp.get("strata", []):
-            if st["kind"] != "tiled" or li not in st["layers"]:
-                continue
-            rows = sorted(set(t["out"][0] for t in st["tiles"]))
-            cols = sorted(set(t["out"][2] for t in st["tiles"]))
-            w = [c for c in st["chunks"] if c["kind"] == "WEIGHT" and c.get("layer", li) == li]
-            return {"n_h": len(rows), "n_w": len(cols), "ring": st.get("ring", {}).get(li),
-                    "step": st.get("wstep", {}).get(li), "wsize": w[0]["size"] if w else None}
-        return None
 
     def from_frame(self, fp):
         layers = self.low["layers"]
@@ -546,10 +423,10 @@ class Plan:
         sweeps, frame/fs/*, final-chains, tiling2); tiles reaching the output's end as tile_to_end extends them"""
         layers = self.low["layers"]
         lis = st["layers"]
-        tiles = [self.tile_to_end(t, lis, shapes) for t in st["tiles"]]
+        tiles = st["tiles"]
+        if any(self.tile_to_end(t, lis, shapes) != t for t in tiles):
+            raise Unsupported("a tile that frame.plan does not extend to the end of the output")
         chunks = st["chunks"]
-        if tiles != st["tiles"]:
-            chunks = self.stratum_chunks(st, tiles, shapes) or chunks
         ch = {}
         wch = []
         for c in chunks:
@@ -633,7 +510,7 @@ class Plan:
                     pending = []
                     src, hin, win, kin = ref, hr, wr, 8 * din.ppc
                 passes = cdiv(dout.ppc, 2)
-                wunits, nsub, cpb = weight_rows(L, self.q, din, dout, passes, s2d)
+                wunits, nsub, cpb = weight_rows(L, self.q)
                 # the weights: all resident (loaded by tile 0, kept), or a ring of R slots every tile reloads, pass p
                 # into slot p mod R, `wstep` bytes apart (frame.md 6.6; V: c512, r_c384, t-32x32-256-512)
                 r = ring.get(li) or passes
@@ -667,7 +544,8 @@ class Plan:
         rounding left-over of each layer (0 <= d < s) to the last tile (frame.md 6.10), so a layer whose output is
         not fully read by the next one (a VALID pool on an odd size) is still computed whole there; an untiled axis
         is one such tile (V: tiling2 e03, e04: 2x2 pools on 27 x 31 after a 3x3 conv: pool 2 computes 31 columns, the
-        stride-2 conv before pads 128 columns to 129)"""
+        stride-2 conv before pads 128 columns to 129). frame.plan's tiles are already extended (frame_stratum checks
+        it: its chunks are sized on them)."""
         layers = self.low["layers"]
         out_end = (shapes[lis[-1]]["out"][1] - 1, shapes[lis[-1]]["out"][2] - 1)
         o = t["out"]
@@ -690,234 +568,6 @@ class Plan:
         l0, l1, m0, m1 = t["load"]
         i0, i1, j0, j1 = per[lis[0]]["in"]
         return dict(t, layers=per, load=(l0, max(l1, i1), m0, max(m1, j1)))
-
-    def stratum_chunks(self, st, tiles, shapes):
-        """the stratum's SRAM chunks again on the tiles of tile_to_end (their largest tile can grow: V, tiling2 e04's
-        PAD chunk), with frame.py's own op sizes and allocator (frame.md 6.5); None when frame.py lacks them"""
-        fr = getattr(self, "_frame", None)
-        if fr is None or not all(hasattr(fr, f) for f in ("_stratum_ops", "_stratum_alloc", "_ps_size")):
-            return None
-        layers = self.low["layers"]
-        lis = st["layers"]
-        trim = any(o["op"] == "TRIM" for o in st["ops"])
-        ops = [fr._stratum_ops(layers, shapes, lis, t, trim) for t in tiles]
-        mx = [dict(o, size=max(x[k]["size"] for x in ops)) for k, o in enumerate(ops[0])]
-        ws = [c["size"] for c in st["chunks"] if c["kind"] == "WEIGHT"]
-        ps = {}
-        for c in st["chunks"]:
-            if c["kind"] == "PARTIAL_SUM":
-                li = c["layer"]
-                sz = 0
-                for t in tiles:
-                    i0, i1, j0, j1 = t["layers"][li]["in"]
-                    sz = max(sz, fr._ps_size({"in": (0, i1 - i0 + 1, j1 - j0 + 1)},
-                                             dict(layers[li], pads=list(t["layers"][li]["pads"]))))
-                ps[li] = sz
-        return fr._stratum_alloc(layers, lis, mx, ws, ps)
-
-    def segment(self, layers):
-        """split the chain at tiled convs: ("tile", conv, fused pool or None, input chw) for a conv NPUC tiles (an
-        output side > 255, or more than 256 KiB alone), ("run", layers, input chw) for the layers between, each run
-        an SRAM-forwarded chain loading from and storing to DRAM (V: tw320cc, w300pool)"""
-        segs, run = [], []
-        c, h, w = self.low["input"]["chw"]
-        run_in = (c, h, w)
-        i = 0
-        while i < len(layers):
-            L = layers[i]
-            tiled = False
-            if L["kind"] == "conv":
-                try:
-                    self.layout([L], final=False, inp=(c, h, w))
-                except NeedsTiling:
-                    tiled = True
-            if tiled:
-                if run:
-                    segs.append(("run", run, run_in))
-                    run = []
-                P = None
-                if i + 1 < len(layers) and layers[i + 1]["kind"] == "pool" \
-                        and layers[i + 1]["k"] == layers[i + 1]["stride"] and not any(layers[i + 1]["pads"]):
-                    P = layers[i + 1]
-                segs.append(("tile", L, P, (c, h, w)))
-                i += 2 if P else 1
-                last = P or L
-                c, h, w = last["out_chw"]
-                if P:
-                    h, w = L["out_chw"][1] // P["stride"][0], L["out_chw"][2] // P["stride"][1]
-                run_in = (c, h, w)
-                continue
-            if not run:
-                run_in = (c, h, w)
-            run.append(L)
-            c, h, w = L["out_chw"]
-            i += 1
-        if run:
-            segs.append(("run", run, run_in))
-        return segs
-
-    # ---- one tiled conv (V: the tile sweep, $NCPGEN_WORK/sweep/tile) ----------------------------------------------
-    def tiled_conv(self, L, P, inp):
-        """NPUC's tiling of a conv layer: n_w = ceil(Wo / 255) column tiles of round_up(ceil(Wo / n_w), 8) and
-        n_h row tiles of round_up(ceil(Ho / n_h), 4), n_h = ceil(Ho / 255) raised until a tile's SRAM fits 256 KiB.
-        One NCP group per tile: load the tile's input region (start aligned down to a cell), trim it to the rows and
-        columns the tile needs (NFU copy) when the conv pads, pad its outer edges, conv (weights loaded in the first
-        tile only, kept), store; then the unflatten group(s)."""
-        cin, h, w = inp
-        cout = L["out_chw"][0]
-        if L["stride"] != [1, 1]:
-            raise Unsupported("tiled conv with stride %s" % L["stride"])
-        kh, kw = L["k"]
-        pt, pb, pl, pr = L["pads"]
-        ho, wo = h + pt + pb - kh + 1, w + pl + pr - kw + 1
-        din, dout = Dist(cin), Dist(cout)
-        passes = cdiv(dout.ppc, 2)
-        wunits, nsub, cpb = weight_rows(L, self.q, din, dout, passes, 1)
-        haspad = any(L["pads"])
-        ofm_planes = cdiv(cdiv(cout, 16) * 16, 8)
-        n_w, n_h = cdiv(wo, 255), cdiv(ho, 255)
-        slot = 2 * wunits * 64
-        wstep = slot
-        fst = self.frame_tiling(L)          # frame.plan's tile counts and weight ring for this conv, when it has them
-        if fst:
-            n_h, n_w = fst["n_h"], fst["n_w"]
-        while True:
-            tw, th = cdiv(cdiv(wo, n_w), 8) * 8, cdiv(cdiv(ho, n_h), 4) * 4
-            if P:       # a fused pool: the tiles are cut on the pool's output (V: tch3, 150 -> 80 + 70)
-                ph, pw = P["stride"]
-                tw = cdiv(cdiv(wo // pw, n_w), 8) * 8 * pw
-                th = cdiv(cdiv(ho // ph, n_h), 4) * 4 * ph
-            tiles = []
-            for oy0 in range(0, ho, th):
-                for ox0 in range(0, wo, tw):
-                    t = {"oy0": oy0, "oy1": min(ho, oy0 + th), "ox0": ox0, "ox1": min(wo, ox0 + tw)}
-                    t["iy0"], t["iy1"] = max(0, oy0 - pt), min(h, t["oy1"] - 1 + kh - pt)
-                    t["ix0"], t["ix1"] = max(0, ox0 - pl), min(w, t["ox1"] - 1 + kw - pl)
-                    t["ly0"], t["lx0"] = t["iy0"] // 4 * 4, t["ix0"] // 8 * 8
-                    t["hl"], t["wl"] = t["iy1"] - t["ly0"], t["ix1"] - t["lx0"]
-                    t["hn"], t["wn"] = t["iy1"] - t["iy0"], t["ix1"] - t["ix0"]
-                    t["pads"] = [max(0, pt - oy0), max(0, t["oy1"] - 1 + kh - pt - h),
-                                 max(0, pl - ox0), max(0, t["ox1"] - 1 + kw - pl - w)]
-                    t["hp"], t["wp"] = t["hn"] + t["pads"][0] + t["pads"][1], t["wn"] + t["pads"][2] + t["pads"][3]
-                    t["ho"], t["wo"] = t["oy1"] - oy0, t["ox1"] - ox0
-                    if P:
-                        ph, pw = P["stride"]
-                        t["pho"], t["pwo"] = t["ho"] // ph, t["wo"] // pw
-                    tiles.append(t)
-            chunks = []
-            split = Chunk(0, "SPLIT", max(din.ppc * cells(t["hl"], t["wl"]) * 64 for t in tiles), [1, 1], 0)
-            chunks.append(split)
-            o = 1
-            trim = pad = None
-            if haspad:
-                trim = Chunk(len(chunks), "TRIM", max(din.ppc * cells(t["hn"], t["wn"]) * 64 for t in tiles),
-                             [1, 2], 1)
-                pad = Chunk(len(chunks) + 1, "PAD", max(din.ppc * cells(t["hp"], t["wp"]) * 64 for t in tiles),
-                            [2, 3], 1)
-                chunks += [trim, pad]
-                o = 3
-            conv = Chunk(len(chunks), "CONV", max(ofm_planes * cells(t["ho"], t["wo"]) * 64 for t in tiles),
-                         [o, o + 1 if P else o], 1)
-            chunks.append(conv)
-            pool = None
-            if P:
-                pool = Chunk(len(chunks), "POOL", max(dout.ppc * cells(t["pho"], t["pwo"]) * 64 for t in tiles),
-                             [o + 1, o + 1], 2)
-                chunks.append(pool)
-            # the weights live from the tile's first op to the end of its chain (V: th300p) and are a "first
-            # citizen" (placed before everything) when that is longer than the conv itself (V: tw256, ts208,
-            # w256pool vs tw300k1, tw320v)
-            weight = Chunk(len(chunks), "WEIGHT", passes * slot, [1, o + 1 if P else o],
-                           -1 if haspad or P else 1)
-            chunks.append(weight)
-            ps = None
-            if nsub > 1:
-                ps = Chunk(len(chunks), "PARTIAL_SUM",
-                           max(2 * 7 * cells(t["hp"] if haspad else t["hn"], t["wp"] if haspad else t["wn"]) * 64
-                               for t in tiles), [o, o], 1, tail=True)
-                chunks.append(ps)
-            # weights: all passes when they can ever fit beside a tile (more row tiles until they do, V:
-            # r_c256h40); else a ring of R slots, R the largest divisor of the passes that fits beside the tile's
-            # feature maps (G: r_c384 6 of 24, r_c448 4 of 28, c512 2 of 32)
-            ring = passes
-            if fst and fst["ring"]:         # NPUC's memory requirement, frame.py's rule (balanced ring; V: t-32x32
-                ring, wstep = fst["ring"], fst["step"] or slot      # 11 of 32, c512 2 of 32)
-                weight.size = fst["wsize"] or ring * slot
-            elif passes * slot >= SRAM_LIMIT:
-                fm = (pad or split).size + conv.size + (ps.size if ps else 0)
-                rmax = (SRAM_LIMIT - fm) // slot
-                ring = max([r for r in range(1, passes + 1) if passes % r == 0 and r <= rmax] or [0])
-                weight.size = ring * slot
-            allocate(chunks)
-            need = max(c.off + c.size for c in chunks)
-            if fst or (ring and need <= SRAM_LIMIT):
-                break
-            if th <= 4:
-                raise Unsupported("tiling: no row tiling fits")
-            n_h += 1
-        self.tiles = tiles
-        self.chunks = chunks
-        self.info = [{"din": din, "dout": dout, "h": h, "w": w, "ho": ho, "wo": wo, "full": True, "conv": True}]
-        for ti, t in enumerate(tiles):
-            ops = []
-            nl = din.cores if din.ppc > 1 else 1
-            for k in range(nl):                     # per core when the tile has several planes per core
-                ops.append(Op("load", what="ifm", flag=self.event(), tile=ti, core=k if nl > 1 else None,
-                              sram=split.off, region=(t["ly0"], t["iy1"], t["lx0"], t["ix1"])))
-            loads = list(range(nl))
-            src = split.off // 64
-            hin, win = t["hn"], t["wn"]
-            if haspad:
-                for sl in range(din.ppc):
-                    for rc, pc in nfu_grid(t["hl"], t["hn"], 1, 1, -(t["iy0"] - t["ly0"]), 0,
-                                           t["wl"], t["wn"], 1, 1, -(t["ix0"] - t["lx0"]), 0):
-                        ops.append(Op("trim", L=L, din=din, hl=t["hl"], wl=t["wl"], hn=t["hn"], wn=t["wn"], rc=rc,
-                                      skiph=t["iy0"] - t["ly0"], pc=pc,
-                                      src=src + sl * cells(t["hl"], t["wl"]),
-                                      dst=trim.off // 64 + sl * cells(t["hn"], t["wn"]), deps=loads, cm=din.mask,
-                                      one_layer=P is None))
-                if any(t["pads"]):
-                    tpl, tpr = t["pads"][2:]
-                    for sl in range(din.ppc):
-                        for rc, pc in nfu_grid(t["hn"], t["hp"], 1, 1, t["pads"][0], t["pads"][1],
-                                               t["wn"], t["wp"], 1, 1, tpl, tpr):
-                            ops.append(Op("pad", L=L, din=din, h=t["hn"], w=t["wn"], hp=t["hp"], wp=t["wp"], pc=pc,
-                                          rc=rc,
-                                          tpads=t["pads"], src=trim.off // 64 + sl * cells(t["hn"], t["wn"]),
-                                          dst=pad.off // 64 + sl * cells(t["hp"], t["wp"]), deps=[], cm=din.mask))
-                    src, hin, win = pad.off // 64, t["hp"], t["wp"]
-                else:
-                    src = trim.off // 64
-            for p in range(passes):
-                deps = [] if haspad else list(loads)
-                if ti == 0 or ring < passes:            # a ring reloads every pass in every tile (V: c512)
-                    ops.append(Op("load", what="weight", flag=self.event(), layer=L["name"], p=p,
-                                  sram=weight.off + (p % ring) * wstep))
-                    deps.append(len(ops) - 1)
-                ops.append(Op("conv", L=L, din=din, dout=dout, p=p, passes=passes, hin=hin, win=win,
-                              kin=2 * din.ppc, k=[kh, kw], ho=t["ho"], wo=t["wo"], src=src, ofm=conv.off // 64,
-                              wbase=weight.off // 64, wunits=wunits, nsub=nsub, cpb=cpb, wslot=p % ring,
-                              ps=ps.off // 64 if ps else None, deps=deps))
-            if P:
-                full = dout.planes == dout.cores * dout.ppc
-                for sl in range(dout.ppc):
-                    for rc, pc in nfu_grid(t["ho"], t["pho"], P["k"][0], P["stride"][0], 0, 0,
-                                           t["wo"], t["pwo"], P["k"][1], P["stride"][1], 0, 0):
-                        ops.append(Op("pool", L=P, din=dout, h=t["ho"], w=t["wo"], ho=t["pho"], wo=t["pwo"], pc=pc,
-                                      rc=rc,
-                                      src=conv.off // 64 + sl * cells(t["ho"], t["wo"]),
-                                      dst=pool.off // 64 + sl * cells(t["pho"], t["pwo"]), deps=[],
-                                      pads=[0, 0, 0, 0], cm=self.slot_mask(dout, sl, full)))
-            ns = dout.cores if dout.ppc > 1 else 1
-            ops.append(Op("store", flags=[self.event() for _ in range(ns)], tile=ti,
-                          sram=(pool or conv).off, region=(t["oy0"], t["oy1"], t["ox0"], t["ox1"]) if not P else
-                          (t["oy0"] // P["stride"][0], t["oy0"] // P["stride"][0] + t["pho"],
-                           t["ox0"] // P["stride"][1], t["ox0"] // P["stride"][1] + t["pwo"])))
-            self.groups.append(ops)
-        if P:
-            self.info.append({"din": dout, "dout": dout, "h": ho, "w": wo, "ho": ho // P["stride"][0],
-                              "wo": wo // P["stride"][1], "full": True})
-        return self.info[-1]
 
     def event(self):
         """DMA n of the network signals event 1 << (n mod 16) (V: io trig_flag of co224..co255)"""
@@ -965,7 +615,7 @@ class Plan:
                 d["hp"], d["wp"] = h + pt + pb, w + pl + pr
                 d["passes"] = cdiv(d["dout"].ppc, 2)
                 d["s2d"] = s2d = L["stride"][0]
-                d["wunits"], d["nsub"], d["cpb"] = weight_rows(L, self.q, d["din"], d["dout"], d["passes"], s2d)
+                d["wunits"], d["nsub"], d["cpb"] = weight_rows(L, self.q)
                 if d["haspad"]:
                     d["pad"] = Chunk(len(chunks), "PAD", d["din"].ppc * cells(d["hp"], d["wp"]) * 64,
                                      [order, order + 1], li + 1)
@@ -1028,7 +678,6 @@ class Plan:
         fits) when frame.py is present and the whole network is this one block: every chunk's offset and size, the
         ring and step of each WEIGHT chunk, the copy (a TRIM chunk) before a layer"""
         try:
-            import frame  # noqa
             fp = frame.plan(self.low)
         except Exception:
             return
@@ -1369,29 +1018,12 @@ class Plan:
             chs[n], hw[n] = cout, (ho, wo)
             geo[n] = (c, h, w, cout, ho, wo, pads)
         unfl = pos
-        winfo = {}
         try:
-            import weights  # noqa: the weights part's module
-            if hasattr(weights, "weight_layer_info"):
-                winfo = {x["name"]: x for x in weights.weight_layer_info(low) if x["kind"] == "conv"}
-        except ImportError:
-            pass
+            winfo = {x["name"]: x for x in weights.weight_layer_info(low) if x["kind"] == "conv"}
         except ValueError as e:
             raise Unsupported("weights.py: %s" % e)
         cats = [L["name"] for L in order if L["kind"] == "concat"]
-
-        def to_eltwise(t):
-            # t, or the one-input layers below it, read by an eltwise
-            for r in cons.get(t, []):
-                if by[r]["kind"] == "eltwise" or (by[r]["kind"] in ("conv", "pool", "relu") and to_eltwise(r)):
-                    return True
-            return False
-
-        # a concat read by an eltwise, or forking into branches that an eltwise joins, stays in DRAM (V: g029,
-        # g144; in SRAM: g012, a concat whose one reader forks)
-        scats = [kn for kn in cats if kn != out and cat_in_sram(by[kn], by, ins)
-                 and not any(by[r]["kind"] == "eltwise" for r in cons[kn])
-                 and not (len(cons[kn]) > 1 and to_eltwise(kn))]
+        scats = [kn for kn in cats if concat_in_sram(kn, out, by, ins, cons)]
         # tensors their readers load from DRAM: the network input, a concat's buffer
         dsrc = [src] + [kn for kn in cats if kn not in scats and kn != out]
         eltd = {L["name"] for L in order if L["kind"] == "eltwise" and any(i in dsrc for i in ins[L["name"]])}
@@ -1502,7 +1134,7 @@ class Plan:
                     d["wunits"], d["nsub"], d["cpb"] = wi["rows_per_batch"], wi["sub_batches"], wi["sub_channels"][0]
                     d["prows"] = wi["planning_rows"]
                 else:
-                    d["wunits"], d["nsub"], d["cpb"] = weight_rows(L, self.q, d["din"], d["dout"], d["passes"], s2d)
+                    d["wunits"], d["nsub"], d["cpb"] = weight_rows(L, self.q)
                 if d["haspad"]:
                     d["pad"] = chunk("PAD", d["din"].ppc * cells(d["hp"], d["wp"]) * 64, [at, at + 1], bt)
                     at += 1
@@ -1534,7 +1166,7 @@ class Plan:
                 R = {"kind": "conv", "name": n, "cout": c, "in_chw": [c, 1, 1], "k": [1, 1], "stride": [1, 1],
                      "w_zp": 128, "weights_oihw_u8": [128] * (c * c)}
                 d["passes"] = cdiv(d["dout"].ppc, 2)
-                d["wunits"], d["nsub"], d["cpb"] = weight_rows(R, self.q, d["din"], d["dout"], d["passes"], 1)
+                d["wunits"], d["nsub"], d["cpb"] = weight_rows(R, self.q)
                 d["out"] = chunk("CONV", cdiv(cdiv(cout, 16) * 16, 8) * cells(ho, wo) * 64, [at, end_of(n)], bt)
                 d["weight"] = chunk("WEIGHT", 0, [at, at], bt)
                 d["ps"] = None
@@ -1741,35 +1373,6 @@ class Plan:
         return ops
 
 
-def exec_order(out, ins, cons, src):
-    """NPUC's layer order (V: the NODE ORDER of add2, cat3, cat-pool, cat-chain, res-two): from the output back, a
-    layer entered once every layer reading it is, its inputs in order (depth first); run in reverse"""
-    seen, lst = set(), []
-    stack = [(out, 0)]
-    seen.add(out)
-    lst.append(out)
-    while stack:
-        n, i = stack.pop()
-        if i < len(ins[n]):
-            stack.append((n, i + 1))
-            t = ins[n][i]
-            if t != src and t not in seen and all(r in seen for r in cons[t]):
-                seen.add(t)
-                lst.append(t)
-                stack.append((t, 0))
-    return lst[::-1]
-
-
-def cat_in_sram(K, by, ins):
-    """NPUC builds a concat in SRAM (its producers write their channels straight into one CONCAT_STORAGE chunk at the
-    top of SRAM) when every input is a pool or a conv with a multiple of 16 channels (a conv writes 16-channel OFMs;
-    V: g118, pools of 8 and 16) and the concat is not the network output
-    nor read by an eltwise (V: cat16, cat16-3, cat16-chain, cat16-relu, cat-32-16, g021; DRAM: cat2, cat-8-16, cat-4-12,
-    cat-16-8, cat16-pool, cat16-out, g029); the caller checks the readers"""
-    return all(by[i]["kind"] == "pool" or (by[i]["kind"] == "conv" and by[i]["out_chw"][0] % 16 == 0)
-               for i in ins[K["name"]])
-
-
 # ---- emission ----------------------------------------------------------------------------------------------------
 def emit_pad(c, op, q, tail):
     L, din = op.L, op.din
@@ -1950,8 +1553,7 @@ def emit_conv(c, op, q, fixed, tail):
     c.w(MTC + 0x580, 0xFFFFFF)
     c.w(MTC + 0x048, 0xFFFF)
     c.w(MTC + 0x04C, 0xFFFF)
-    slots = [out_channel(dout, k, p, j, cc) for k in range(4) for j in range(2) for cc in range(2)]
-    for a, v in (grelu_writes(L, q, p, slots, fixed) if table else []):
+    for a, v in (grelu_writes(L, q, p, fixed) if table else []):
         c.w(a, v)
     c.w(MTC + 0x200, op.nsub << 16 | op.cpb)    # weight sub-batches x channels each (V: ci128s2, ci256)
     c.w(MTC + 0x0B0, cdiv(op.wo, 8) << 16)
@@ -1959,7 +1561,7 @@ def emit_conv(c, op, q, fixed, tail):
     for k in range(4):
         for j in range(2):
             c.w(MTC + 0x700 + 8 * k + 4 * j, op.ofm + (2 * p + j) * oc)
-    sc = 0 if relu else shift_code(npuc_slope(L)[1])
+    sc = 0 if relu else shift_code(layer_shift(L))
     for k in range(4):
         for j in range(2):
             v = 0
@@ -2191,7 +1793,6 @@ def plan_dmas(low, fixed=False):
 # `events` replays it on the profile NPUC logs ("IRIndex: n", "<op> n Pushes SRAM: a, b", "<op> Refers a, b").
 def _profile(block):
     """the elements of one group's memory profile: index, op name, reads and writes (inclusive byte ranges)"""
-    import re
     els, cur = [], None
     for line in ("IRIndex: 0 \n" + block).splitlines():
         if "IRIndex" not in line and "SRAM" not in line and "Refers" not in line and "Event Summary" not in line:
@@ -2729,7 +2330,6 @@ def events(dirs):
     """replay NPUC's event schedule from each compile's logged memory profile and compare its ev2set lines and waits
     (position, mask) with NPUC's streams; ARM groups (eltwise) keep the firmware's events: after one the network's
     cursor continues at stream.py's own next flag"""
-    import re
     ok = tot = 0
     for d in dirs:
         try:
@@ -2775,29 +2375,25 @@ def _fmt_lines(lw):
 
 
 # ---- reading the oracle's NCP --------------------------------------------------------------------------------------
+REG_NAMES = {CMDQ: "CMDQ", MTC: "MTC", NFU: "NFUBR", INTC: "INTCOM"}
+
+
 def ncp_streams(ncp):
-    h = struct.unpack_from("<32I", ncp, 0)
-    gvo, gvc, body = h[14], h[15], h[17]
-    out = []
-    for g in range(gvc):
-        gv = struct.unpack_from("<10I", ncp, gvo + 40 * g)
-        out.append(ncp[body + gv[8]:body + gv[8] + gv[9]])
-    return out
+    """the isa bytes of each group of an NCP"""
+    return ncp_parts(ncp)["streams"]
 
 
 def fmt(op, v):
-    blk = op >> 12
-    names = {0x8: "CMDQ", 0x9: "MTC", 0xA: "NFUBR", 0xB: "INTCOM"}
-    if blk in names and op >> 8 not in (0x3A, 0x2B):
-        base = {0x8: CMDQ, 0x9: MTC, 0xA: NFU, 0xB: INTC}[blk]
-        return "%-6s %#010x = %#010x" % (names[blk], base + (op & 0xFFF) * 4, v)
+    """one instruction as text"""
+    a = set_reg_addr(op)
+    if a is not None:
+        return "%-6s %#010x = %#010x" % (REG_NAMES[a & ~0x3FFF], a, v)
     if op == 0 and v == 0:
         return "nop"
     return "op%04x %#010x" % (op, v)
 
 
-def decode(b):
-    return [struct.unpack_from("<IH", b, 6 * i)[::-1] for i in range(len(b) // 6)]
+decode = decode_isa
 
 
 def check(dirs):
@@ -2852,20 +2448,27 @@ def show(d, diff=False):
                 print("g%d %4d %-36s   NPUC %s" % (g, i, "-", fmt(*db[i])))
 
 
-def main():
-    a = sys.argv[1:]
-    if not a:
-        sys.exit(__doc__)
-    if a[0] == "check" and len(a) > 1:
-        sys.exit(0 if check(a[1:]) else 1)
-    if a[0] == "show" and len(a) > 1:
-        show(a[1], "--diff" in a)
-        return
-    if a[0] == "events" and len(a) > 1:
-        events(a[1:])
-        return
-    sys.exit(__doc__)
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="stream.py", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("check", help="our streams against NPUC's compiles")
+    p.add_argument("dirs", nargs="+")
+    p = sub.add_parser("show", help="our streams as text")
+    p.add_argument("dir")
+    p.add_argument("--diff", action="store_true", help="only the instructions that differ from NPUC's")
+    p = sub.add_parser("events", help="NPUC's event schedule replayed from its logs")
+    p.add_argument("dirs", nargs="+")
+    a = ap.parse_args(argv)
+    if a.cmd == "check":
+        return 0 if check(a.dirs) else 1
+    if a.cmd == "show":
+        show(a.dir, a.diff)
+    else:
+        events(a.dirs)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    from ncpgen import stream as _pkg    # the package's copy of this module (one copy of every module)
+    sys.exit(_pkg.main())

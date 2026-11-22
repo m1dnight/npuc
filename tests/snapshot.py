@@ -2,8 +2,8 @@
 """Proof that a change to ncpgen's code changes none of its outputs: a snapshot of everything the code makes of the
 compiled corpus in the work folder ($NCPGEN_WORK/sweep), recorded once with a trusted version and compared after.
 
-  tests/snapshot.py record <snapshot.json.gz> [--jobs N] [--only KIND,...] [--code <repo>]
-  tests/snapshot.py compare <snapshot.json.gz> [--jobs N] [--only KIND,...] [--code <repo>]
+  tests/snapshot.py record <snapshot.json.gz> [--jobs N] [--only KIND,...] [--sample K] [--code <repo>]
+  tests/snapshot.py compare <snapshot.json.gz> [--jobs N] [--only KIND,...] [--sample K] [--code <repo>]
 
 Kinds (all by default):
   gen    every variant directory with a lowered.json: the generated parts and whole NCP (sha256) with NPUC's and the
@@ -15,7 +15,8 @@ Kinds (all by default):
   misc   selftests, examples, listings (stream.py show, frame.py plan, weights.py show, grelu.py regs/table,
          frame_sweep.py list/policy, stream_graphs.py write) and the gen command line on a sample
 The snapshot holds hashes, our own messages and our own listings; it belongs in the work folder (it names vendor
-compiles). --code runs another checkout (default: this one). Exit 0 when compare finds no difference.
+compiles). --code runs another checkout (default: this one); --sample K takes every K-th task only (a quick check;
+compare then reads only those entries). Exit 0 when compare finds no difference.
 """
 import argparse
 import gzip
@@ -28,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.environ.get("NCPGEN_WORK") or os.path.join(REPO, "work")
@@ -204,6 +206,27 @@ def task_gencli(v, opts):
         shutil.rmtree(tmp)
 
 
+def changed(rel, since):
+    """a variant dir or source gone, or a file of it modified after `since` (another sweep writing there)"""
+    p = os.path.join(SWEEP, rel)
+    if not os.path.exists(p):
+        return True
+    fs = [os.path.join(p, f) for f in os.listdir(p)] if os.path.isdir(p) else [p]
+    return any(os.path.getmtime(f) > since for f in fs if os.path.isfile(f))
+
+
+def touched(t):
+    """the variant dirs and sources (relative) a task reads"""
+    out = set()
+    for a in t[2]:
+        for x in (a if isinstance(a, list) else [a]):
+            if isinstance(x, str):
+                r = os.path.relpath(x, SWEEP) if os.path.isabs(x) else x
+                out.add(r)
+                out.add(os.path.dirname(r))
+    return out
+
+
 def cost(t):
     """a rough cost (bytes of lowered.json behind the task: the weights dominate) to start the heavy tasks first"""
     paths = [a for a in t[2] if isinstance(a, str)] + [x for a in t[2] if isinstance(a, list) for x in a]
@@ -224,8 +247,21 @@ def call(t):
 
 
 # ---- the tasks ----------------------------------------------------------------------------------------------------
-def tasks(kinds):
-    vds = variant_dirs()
+def sources():
+    """every network source in the sweeps: TFLite files and npu-net/1 JSONs, relative, sorted"""
+    srcs = []
+    for root, dirs, files in os.walk(SWEEP):
+        dirs.sort()
+        for f in sorted(files):
+            p = os.path.join(root, f)
+            if f.endswith(".tflite") or (f.endswith(".json") and f not in ("lowered.json", "net.json")
+                                         and '"npu-net/1"' in open(p, errors="replace").read(400)):
+                srcs.append(os.path.relpath(p, SWEEP))
+    return srcs
+
+
+def tasks(kinds, vds, srcs):
+    """(key, worker function, arguments) of every entry, over the variant dirs vds and the sources srcs"""
     S = lambda v: os.path.join(SWEEP, v)
     out = []
     if "gen" in kinds:
@@ -248,14 +284,6 @@ def tasks(kinds):
                     out.append(("check:ncpgen-fixed:" + k, "task_cmd", ("ncpgen.py", ["check", "--grelu", "fixed"]
                                                                         + dirs)))
     if "lower" in kinds:
-        srcs = []
-        for root, dirs, files in os.walk(SWEEP):
-            dirs.sort()
-            for f in sorted(files):
-                p = os.path.join(root, f)
-                if f.endswith(".tflite") or (f.endswith(".json") and f not in ("lowered.json", "net.json")
-                                             and '"npu-net/1"' in open(p, errors="replace").read(400)):
-                    srcs.append(os.path.relpath(p, SWEEP))
         out += [("lower:" + s, "task_lower", (s,)) for s in srcs]
     if "ref" in kinds:
         for v in vds:
@@ -303,10 +331,30 @@ def main():
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--only", default=",".join(KINDS))
     ap.add_argument("--code", default=REPO)
+    ap.add_argument("--sample", type=int, default=1)
+    ap.add_argument("--since", type=float, help="compare: skip dirs changed after this time (default: the baseline's)")
     a = ap.parse_args()
     kinds = set(a.only.split(","))
     code = os.path.abspath(a.code)
-    todo = tasks(kinds)
+    t0 = time.time()
+    ref, skip = None, set()
+    if a.mode == "compare":
+        # the work folder is shared and grows: the baseline's own lists of dirs and sources, minus what changed since
+        ref = json.load(gzip.open(a.file, "rt"))
+        if "meta:dirs" in ref:
+            vds, srcs = ref["meta:dirs"], ref["meta:sources"]
+        elif a.sample == 1:     # an older snapshot: its complete entries list them
+            vds = sorted(k[4:] for k in ref if k.startswith("gen:"))
+            srcs = sorted(k[6:] for k in ref if k.startswith("lower:"))
+        else:
+            vds, srcs = variant_dirs(), sources()
+        since = a.since or ref.get("meta:t0") or os.path.getmtime(a.file)
+        skip = {x for x in vds + srcs if changed(x, since)}
+    else:
+        vds, srcs = variant_dirs(), sources()
+    todo = tasks(kinds, vds, srcs)[::a.sample]
+    dropped = [t[0] for t in todo if touched(t) & skip]
+    todo = [t for t in todo if not touched(t) & skip]
     todo.sort(key=lambda t: (-cost(t), t[0]))
     res = {}
     with multiprocessing.Pool(a.jobs, initializer=init, initargs=(code,)) as pool:
@@ -320,19 +368,21 @@ def main():
             old = json.load(gzip.open(a.file, "rt"))
             old = {k: v for k, v in old.items() if k.split(":", 1)[0] not in kinds}
         old.update(res)
+        old.update({"meta:dirs": vds, "meta:sources": srcs, "meta:t0": t0})
         with gzip.open(a.file, "wt") as f:
             json.dump(dict(sorted(old.items())), f, sort_keys=True)
         errs = [k for k, v in res.items() if isinstance(v, dict) and "snapshot-error" in v]
         print("snapshot: recorded %d entries (%s) in %s%s" % (len(res), ",".join(sorted(kinds)), a.file,
                                                             "; snapshot errors: %s" % errs[:5] if errs else ""))
         return 0
-    ref = json.load(gzip.open(a.file, "rt"))
-    ref = {k: v for k, v in ref.items() if k.split(":", 1)[0] in kinds}
+    ref = {k: v for k, v in ref.items() if k.split(":", 1)[0] in kinds and (a.sample == 1 or k in res)
+           and k not in dropped and not k.startswith("meta:")}
     diff = sorted(k for k in set(ref) | set(res) if ref.get(k) != res.get(k))
     for k in diff[:40]:
         print("DIFF %s\n  was %s\n  now %s" % (k, json.dumps(ref.get(k))[:600], json.dumps(res.get(k))[:600]))
-    print("snapshot: %d entries compared (%s): %s" % (len(res), ",".join(sorted(kinds)),
-                                                    "IDENTICAL" if not diff else "%d DIFFER" % len(diff)))
+    print("snapshot: %d entries compared (%s)%s: %s" % (
+        len(res), ",".join(sorted(kinds)), ", %d skipped (their dirs changed since the baseline)" % len(dropped)
+        if dropped else "", "IDENTICAL" if not diff else "%d DIFFER" % len(diff)))
     return 1 if diff else 0
 
 

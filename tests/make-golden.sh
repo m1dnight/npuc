@@ -7,9 +7,10 @@ set -euo pipefail
 . "$(dirname "$0")/../oracle/env.sh"
 cd "$NCPGEN" && python3 -I - "$NCPGEN_WORK" <<'PY'
 import hashlib, os, sys
-sys.path.insert(0, 'ncpgen'); import ncpgen
+sys.path.insert(0, '.')
+from ncpgen.ncpgen import CORPUS
 W = sys.argv[1]; rows = []
-for name, spec, opts in ncpgen.CORPUS:
+for name, spec, opts in CORPUS:
     d = os.path.join(W, 'sweep/corpus', name, 'net.ncp')
     if os.path.exists(d): rows.append((name, spec, opts, hashlib.sha256(open(d, 'rb').read()).hexdigest()))
 for line in open(os.path.join(W, 'sweep/final-chains/specs.txt')):

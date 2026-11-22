@@ -55,6 +55,7 @@ NPUC's arithmetic, as far as it is known (dossier/npu-compiler.md section 9.12):
   - standalone ReLU (G): max(x, zp). NPUC makes it a 1x1 dummy conv with all-zero weights, GReLU mode 1 and no table
     (docs/format/grelu.md 7, weights.md); compare also tries the identity and a constant zero point.
 """
+import argparse
 import hashlib
 import json
 import math
@@ -63,6 +64,11 @@ import random
 import struct
 import sys
 from fractions import Fraction
+
+if not __package__:     # run as a script, or loaded from its path (the porting kit's npu/npunet.py): the package is
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))    # this file's directory
+
+from ncpgen.common import f32, f32_hex, has_graph_ops, hex_f32, multiplier, ncp_header, requant  # noqa: E402
 
 ROUNDINGS = ("half_away", "half_even", "half_up")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -78,36 +84,18 @@ class Refused(Exception):
 
 
 # ---- float32 ------------------------------------------------------------------------------------------------------
-def f32(x):
-    return struct.unpack("<f", struct.pack("<f", x))[0]
-
-
-def f32bits(x):
-    return "0x%08x" % struct.unpack("<I", struct.pack("<f", x))[0]
-
-
-def bits2f32(s):
-    return struct.unpack("<f", struct.pack("<I", int(s, 16)))[0]
-
-
 def npuc_multiplier(in_s, w_s, out_s):
-    """(slope, shift) as NPUC's NNGraphNodeScaleONFiller::setScale computes them (V, decompiled)"""
-    m = f32(f32(f32(in_s) * f32(w_s)) / f32(out_s))  # two float32 operations, each rounded (exact in double first)
+    """(slope, shift) as NPUC's NNGraphNodeScaleONFiller::setScale computes them (V, decompiled; common.requant);
+    Refused where NPUC asserts, or where the slope would be 0"""
+    m = multiplier(in_s, w_s, out_s)
     if not m > 0:
         raise Refused("multiplier %r is not > 0 (NPUC asserts real_multiplier > 0)" % m)
-    n = 0
-    if m < 0.5:
-        while True:
-            m = m * 2
-            n += 1
-            if m >= 0.5 or n >= 7:
-                break
-    slope = int(m * 256.0 + 0.5)  # fcvtas (round to nearest, ties away) of the float32 product (V, frontend 0x9dd40)
+    m, slope, shift = requant(m)
     if slope > 65535:
         raise Refused("multiplier %r: slope %d > 65535 (NPUC asserts q <= uint16 max)" % (m, slope))
     if slope == 0:
         raise Refused("multiplier in*w/out = %.3g is below 2^-16: NPUC's slope would be 0" % (f32(in_s) * f32(w_s) / f32(out_s)))
-    return slope, n + 8
+    return slope, shift
 
 
 def pow2_fl(s):
@@ -617,7 +605,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
     zp_in = _u8zp(dtype, int(io["zero_point"]))
     sc = f32(float(io["scale"]))
     low = {"format": "npu-lowered/1", "name": g.get("name", "net"), "quant_mode": quant, "soc": soc,
-           "io_dtype": dtype, "input": {"name": "data0", "chw": [C, H, W], "scale": f32bits(sc), "zp": zp_in,
+           "io_dtype": dtype, "input": {"name": "data0", "chw": [C, H, W], "scale": f32_hex(sc), "zp": zp_in,
                                         "nhwc": [1, H, W, C]},
            "layers": [], "cpu_tail": [], "warnings": [], "unproven": []}
     ents, inkey, fwarn, show = _resolve(g)
@@ -630,7 +618,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
         """a standalone ReLU layer (npuc-net 2 "relu"): NPUC's 1x1 dummy conv, the input's quantisation kept"""
         low["layers"].append({"kind": "relu", "name": name, "type": "ReLU", "from": frm, "src_name": src_name,
                               "input": src["name"], "in_chw": list(src["chw"]), "cout": src["chw"][0],
-                              "in_scale": f32bits(src["scale"]), "in_zp": src["zp"], "out_scale": f32bits(src["scale"]),
+                              "in_scale": f32_hex(src["scale"]), "in_zp": src["zp"], "out_scale": f32_hex(src["scale"]),
                               "out_zp": src["zp"], "act": 1, "pads": [0, 0, 0, 0], "out_chw": list(src["chw"])})
         low["unproven"].append("%s: standalone ReLU (NPUC: a 1x1 dummy conv with all-zero weights, GReLU mode 1, no table; "
                                "not run on the NPU): the reference is max(x, zero point); compare also tries the identity "
@@ -741,8 +729,8 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
             lay = {"kind": "conv", "name": name, "from": op, "src_name": L.get("name", ""), "input": cur["name"],
                    "in_chw": [Cc, Hc, Wc], "cout": cout, "k": [kh, kw], "stride": [sh, sw], "padding": pad.upper(),
                    "pads": [pt, pb, pl, pr], "act": 1 if act == "relu" else 0,
-                   "in_scale": f32bits(cur["scale"]), "in_zp": cur["zp"], "w_scale": f32bits(ws), "w_zp": 128,
-                   "out_scale": f32bits(os_), "out_zp": oz, "slope": slope, "shift": shift,
+                   "in_scale": f32_hex(cur["scale"]), "in_zp": cur["zp"], "w_scale": f32_hex(ws), "w_zp": 128,
+                   "out_scale": f32_hex(os_), "out_zp": oz, "slope": slope, "shift": shift,
                    "weights_oihw_u8": wu8, "bias": bias, "out_chw": [cout, ho, wo]}
             if act == "none":
                 low["warnings"].append("%s: no activation (GRELU_BYPASS_ONDEVICE: the byte 0 wherever acc >= 0, V)" % name)
@@ -783,7 +771,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
             low["layers"].append({"kind": "pool", "name": name, "type": ptype, "src_name": L.get("name", ""),
                                   "input": cur["name"], "in_chw": [Cc, Hc, Wc], "k": [kh, kw], "stride": [sh, sw],
                                   "padding": pad.upper(), "pads": [pt, pb, pl, pr], "act": 1 if act == "relu" else 0,
-                                  "in_scale": f32bits(cur["scale"]), "in_zp": cur["zp"], "out_scale": f32bits(os_),
+                                  "in_scale": f32_hex(cur["scale"]), "in_zp": cur["zp"], "out_scale": f32_hex(os_),
                                   "out_zp": oz, "out_chw": [Cc, ho, wo]})
             blobs[key] = {"name": name, "chw": [Cc, ho, wo], "scale": os_, "zp": oz}
         elif op == "add":
@@ -815,8 +803,8 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
             act = _fused_act(name, "ADD", L.get("activation", "none"), oz, os_, low)
             low["layers"].append({"kind": "eltwise", "name": name, "op": "Add", "from": "add", "src_name": L.get("name", ""),
                                   "input": a["name"], "inputs": [a["name"], b["name"]], "in_chw": list(a["chw"]),
-                                  "in_scales": [f32bits(a["scale"]), f32bits(b["scale"])], "in_zps": [a["zp"], b["zp"]],
-                                  "fl": fl, "out_scale": f32bits(os_), "out_zp": oz, "act": 0, "pads": [0, 0, 0, 0],
+                                  "in_scales": [f32_hex(a["scale"]), f32_hex(b["scale"])], "in_zps": [a["zp"], b["zp"]],
+                                  "fl": fl, "out_scale": f32_hex(os_), "out_zp": oz, "act": 0, "pads": [0, 0, 0, 0],
                                   "out_chw": list(a["chw"])})
             low["unproven"].append("%s: ADD as NPUC's Eltwise (compiles; not run on the NPU): the reference is the harness's "
                                    "guess sat_s8(round(in1 x 2^%d + in2 x 2^%d)) (fractional lengths %d, %d -> %d), rounding "
@@ -854,7 +842,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
             chw = [sum(b["chw"][0] for b in srcs)] + list(srcs[0]["chw"][1:])
             low["layers"].append({"kind": "concat", "name": name, "from": "concat", "src_name": L.get("name", ""),
                                   "input": srcs[0]["name"], "inputs": [b["name"] for b in srcs], "axis": 1,
-                                  "in_chws": [list(b["chw"]) for b in srcs], "out_scale": f32bits(os_), "out_zp": oz,
+                                  "in_chws": [list(b["chw"]) for b in srcs], "out_scale": f32_hex(os_), "out_zp": oz,
                                   "act": 0, "pads": [0, 0, 0, 0], "out_chw": chw})
             low["unproven"].append("%s: CONCATENATION of channels (compiles; not run on the NPU): the reference places the "
                                    "inputs' channels in order" % name)
@@ -898,8 +886,8 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
                 raise Refused("softmax %s reads %r: the CPU part must be a chain at the end" % (name, show[ins[0]]))
             tail = key
             outq = L["output"]
-            low["cpu_tail"].append({"op": "softmax", "beta": float(L.get("beta", 1.0)), "in_scale": f32bits(cur["scale"]),
-                                    "in_zp": cur["zp"], "out_scale": f32bits(f32(float(outq["scale"]))),
+            low["cpu_tail"].append({"op": "softmax", "beta": float(L.get("beta", 1.0)), "in_scale": f32_hex(cur["scale"]),
+                                    "in_zp": cur["zp"], "out_scale": f32_hex(f32(float(outq["scale"]))),
                                     "out_zp": _u8zp(dtype, int(outq["zero_point"]))})
             blobs[key] = dict(cur, tail=True)
         else:
@@ -954,12 +942,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
     return low
 
 
-GRAPH_KINDS = ("eltwise", "concat", "relu")
-
-
-def is_graph(low):
-    """a network with a layer only "npuc-net 2" files carry"""
-    return any(l["kind"] in GRAPH_KINDS for l in low["layers"])
+is_graph = has_graph_ops     # a network with a layer only "npuc-net 2" files carry
 
 
 def npuc_text(low):
@@ -1179,8 +1162,8 @@ def cpu_tail(low, y_chw):
     y = bytes(y_chw[(c * H + h) * W + w] for h in range(H) for w in range(W) for c in range(C))
     for t in low["cpu_tail"]:
         if t["op"] == "softmax":
-            si, zi = bits2f32(t["in_scale"]), t["in_zp"]
-            so, zo = bits2f32(t["out_scale"]), t["out_zp"]
+            si, zi = hex_f32(t["in_scale"]), t["in_zp"]
+            so, zo = hex_f32(t["out_scale"]), t["out_zp"]
             n = C if (H, W) != (1, 1) else len(y)
             out = bytearray()
             for b in range(0, len(y), n):
@@ -1232,32 +1215,15 @@ def ncp_parse(d):
     return av, mv, io
 
 
-_FRAME = []
-
-
-def frame_module():
-    """frame.py next to this file (the NCP's data layout, docs/format/frame.md 8), or None when it cannot be imported
-    (npunet then uses its own, narrower check)"""
-    if not _FRAME:
-        try:
-            if HERE not in sys.path:
-                sys.path.insert(0, HERE)
-            import frame as fr
-            _FRAME.append(fr if callable(getattr(fr, "ncp_layout", None)) else None)
-        except Exception:  # any failure to import: the fallback check
-            _FRAME.append(None)
-    return _FRAME[0]
-
-
 def ncp_layout(low, ncp):
     """{"ifm": {...}, "ofm": {...}} from the NCP; Refused when the format is not one this tool knows how to write.
     A conv/pool chain: frame.ncp_layout (the NCP's IN_FMAP/OT_FMAP vectors and IFM DMAs checked against frame.plan():
     every single-tile shape, any C, NPUC's split IFM loads; frame.md 8.4). A graph network, a plan frame.py does not
     model (tiled, streamed weights), or frame.py missing: ncp_layout_basic (one IFM format, 2 channels per plane)."""
     ncp_parse(ncp)  # an NCP v22, or Refused
-    fr = None if is_graph(low) else frame_module()
-    why = "a graph network" if is_graph(low) else "frame.py not importable"
-    if fr is not None:
+    why = "a graph network"
+    if not is_graph(low):
+        from ncpgen import frame as fr     # imported here: lowering and the reference do not need the generator
         try:
             lay = fr.ncp_layout(low, ncp)
             lay["checked_by"] = "ncpgen/frame.py"
@@ -1977,108 +1943,119 @@ def selftest_graph():
 
 
 # ---- commands -------------------------------------------------------------------------------------------------------
-def opt(args, name, default=None, flag=False):
-    if name in args:
-        i = args.index(name)
-        if flag:
-            del args[i]
-            return True
-        v = args[i + 1]
-        del args[i:i + 2]
-        return v
-    return False if flag else default
+def cmd_lower(a):
+    """lowered.json and net.npuc for a model, and a line per layer"""
+    low = load_model(a.model, a.quant, a.fold_per_channel, a.allow_none)
+    os.makedirs(a.dir, exist_ok=True)
+    json.dump(low, open(os.path.join(a.dir, "lowered.json"), "w"), indent=1)
+    open(os.path.join(a.dir, "net.npuc"), "w").write(npuc_text(low))
+    for l in low["layers"]:
+        if l["kind"] == "conv":
+            print("lower: %-22s conv %dx%d s%d %s %d->%d act %s, multiplier %d/2^%d, out %s" % (
+                l["name"], l["k"][0], l["k"][1], l["stride"][0], l["padding"], l["in_chw"][0], l["cout"],
+                "relu" if l["act"] else "none", l["slope"], l["shift"], "x".join(map(str, l["out_chw"]))))
+        elif l["kind"] == "pool":
+            print("lower: %-22s %s %dx%d s%d %s, out %s" % (l["name"], l["type"], l["k"][0], l["k"][1],
+                                                             l["stride"][0], l["padding"], "x".join(map(str, l["out_chw"]))))
+        elif l["kind"] == "eltwise":
+            print("lower: %-22s eltwise %s %s + %s, fractional lengths %d %d -> %d, out %s" % (
+                l["name"], l["op"], l["inputs"][0], l["inputs"][1], l["fl"][0], l["fl"][1], l["fl"][2],
+                "x".join(map(str, l["out_chw"]))))
+        elif l["kind"] == "concat":
+            print("lower: %-22s concat (channels) %s, out %s" % (l["name"], " + ".join(l["inputs"]),
+                                                                 "x".join(map(str, l["out_chw"]))))
+        else:
+            print("lower: %-22s %s of %s, out %s" % (l["name"], l["type"], l["input"], "x".join(map(str, l["out_chw"]))))
+    for t in low["cpu_tail"]:
+        print("lower: CPU tail: %s" % t["op"])
+    for w in low["warnings"]:
+        print("lower: warning: " + w)
+    for u in low["unproven"]:
+        print("lower: unproven: " + u)
+    print("lower: PASS: %s (%s %s): input NHWC %s %s, %d NPU layers, output %s %s, quant mode %d -> %s/lowered.json, net.npuc%s"
+          % (low["name"], low["source"]["kind"], low["source"]["sha256"][:8], low["input"]["nhwc"], low["io_dtype"],
+             len(low["layers"]), low["output"]["shape"], low["io_dtype"], a.quant, a.dir,
+             " (npuc-net 2: a graph; compile with a harness that reads it, e.g. $NCPGEN_WORK/n3/root-current)"
+             if is_graph(low) else ""))
 
 
-def main():
-    a = sys.argv[1:]
-    if not a:
-        sys.exit(__doc__)
-    cmd = a.pop(0)
+def cmd_ref(a):
+    low = json.load(open(a.lowered))
+    y = reference(low, open(a.input, "rb").read())
+    open(a.output, "wb").write(y)
+    print("ref: %s -> %s: %d B sha256 %s" % (a.input, a.output, len(y), hashlib.sha256(y).hexdigest()))
+
+
+def cmd_layout(a):
+    low = json.load(open(a.lowered))
+    lay = ncp_layout(low, open(a.ncp, "rb").read())
+    json.dump(lay, open(a.layout, "w"), indent=1)
+    print("layout: IFM %s, %d B (%d planes of %dx%d)%s; OFM %s %d B%s" % (
+        lay["ifm"]["format"], lay["ifm"]["size"], lay["ifm"]["planes"], lay["ifm"]["plane_h"], lay["ifm"]["plane_w"],
+        "" if lay["ifm"]["proven"] else " (rule extrapolated to this shape)", lay["ofm"]["format"], lay["ofm"]["size"],
+        "" if lay["ofm"]["proven"] else " (from the descriptor, this shape not measured yet)") +
+          ("" if "frame.py" in lay.get("checked_by", "") else "; %s" % lay.get("checked_by", "")))
+
+
+def cmd_to_npu(a):
+    low, lay = json.load(open(a.lowered)), json.load(open(a.layout))
+    b = to_npu(low, lay, model_in_to_chw(low, open(a.input, "rb").read()))
+    open(a.out, "wb").write(b)
+    print("to-npu: %s -> %s: %d B sha256 %s" % (a.input, a.out, len(b), hashlib.sha256(b).hexdigest()))
+
+
+def cmd_from_npu(a):
+    low, lay = json.load(open(a.lowered)), json.load(open(a.layout))
+    y = out_to_model(low, cpu_tail(low, from_npu(low, lay, open(a.ofm, "rb").read())))
+    open(a.out, "wb").write(y)
+    print("from-npu: %s -> %s: %d B sha256 %s" % (a.ofm, a.out, len(y), hashlib.sha256(y).hexdigest()))
+
+
+def cmd_compare(a):
+    low, lay = json.load(open(a.lowered)), json.load(open(a.layout))
+    pairs = [(open(p.split(":", 1)[0], "rb").read(), open(p.split(":", 1)[1], "rb").read()) for p in a.pairs]
+    v, why = compare(low, lay, pairs)
+    print("compare: %s (%s)" % (v, why))
+    return 0 if v in ("bit-exact", "within 1 LSB") else 2
+
+
+def main(argv=None):
+    """the commands of the module docstring. Exits (SystemExit) with the command's status: the porting kit's
+    npu/npunet.py loads this file and calls main() as its whole program."""
+    ap = argparse.ArgumentParser(prog="npunet.py", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("lower", help="lowered.json and net.npuc for a model")
+    p.add_argument("model")
+    p.add_argument("dir")
+    p.add_argument("--quant", type=int, default=1)
+    p.add_argument("--fold-per-channel", action="store_true")
+    p.add_argument("--allow-none", action="store_true")
+    p.set_defaults(fn=cmd_lower)
+    for name, fn, args in (("ref", cmd_ref, ("lowered", "input", "output")),
+                           ("layout", cmd_layout, ("lowered", "ncp", "layout")),
+                           ("to-npu", cmd_to_npu, ("lowered", "layout", "input", "out")),
+                           ("from-npu", cmd_from_npu, ("lowered", "layout", "ofm", "out"))):
+        p = sub.add_parser(name)
+        for x in args:
+            p.add_argument(x)
+        p.set_defaults(fn=fn)
+    p = sub.add_parser("compare", help="the NPU's output against the CPU reference")
+    p.add_argument("lowered")
+    p.add_argument("layout")
+    p.add_argument("pairs", nargs="+", metavar="input.bin:ofm.bin")
+    p.set_defaults(fn=cmd_compare)
+    for name, fn in (("example", cmd_example), ("example-residual", cmd_example_residual), ("variants", cmd_variants)):
+        p = sub.add_parser(name)
+        p.add_argument("dir")
+        p.set_defaults(fn=lambda a, fn=fn: fn(a.dir))
+    sub.add_parser("selftest").set_defaults(fn=lambda a: selftest())
+    a = ap.parse_args(argv)
     try:
-        if cmd == "selftest":
-            sys.exit(selftest())
-        if cmd == "example" and len(a) == 1:
-            sys.exit(cmd_example(a[0]))
-        if cmd == "example-residual" and len(a) == 1:
-            sys.exit(cmd_example_residual(a[0]))
-        if cmd == "variants" and len(a) == 1:
-            sys.exit(cmd_variants(a[0]))
-        if cmd == "lower":
-            quant = int(opt(a, "--quant", 1))
-            fold = opt(a, "--fold-per-channel", flag=True)
-            alln = opt(a, "--allow-none", flag=True)
-            if len(a) != 2:
-                sys.exit(__doc__)
-            low = load_model(a[0], quant, fold, alln)
-            os.makedirs(a[1], exist_ok=True)
-            json.dump(low, open(os.path.join(a[1], "lowered.json"), "w"), indent=1)
-            open(os.path.join(a[1], "net.npuc"), "w").write(npuc_text(low))
-            for l in low["layers"]:
-                if l["kind"] == "conv":
-                    print("lower: %-22s conv %dx%d s%d %s %d->%d act %s, multiplier %d/2^%d, out %s" % (
-                        l["name"], l["k"][0], l["k"][1], l["stride"][0], l["padding"], l["in_chw"][0], l["cout"],
-                        "relu" if l["act"] else "none", l["slope"], l["shift"], "x".join(map(str, l["out_chw"]))))
-                elif l["kind"] == "pool":
-                    print("lower: %-22s %s %dx%d s%d %s, out %s" % (l["name"], l["type"], l["k"][0], l["k"][1],
-                                                                     l["stride"][0], l["padding"], "x".join(map(str, l["out_chw"]))))
-                elif l["kind"] == "eltwise":
-                    print("lower: %-22s eltwise %s %s + %s, fractional lengths %d %d -> %d, out %s" % (
-                        l["name"], l["op"], l["inputs"][0], l["inputs"][1], l["fl"][0], l["fl"][1], l["fl"][2],
-                        "x".join(map(str, l["out_chw"]))))
-                elif l["kind"] == "concat":
-                    print("lower: %-22s concat (channels) %s, out %s" % (l["name"], " + ".join(l["inputs"]),
-                                                                         "x".join(map(str, l["out_chw"]))))
-                else:
-                    print("lower: %-22s %s of %s, out %s" % (l["name"], l["type"], l["input"], "x".join(map(str, l["out_chw"]))))
-            for t in low["cpu_tail"]:
-                print("lower: CPU tail: %s" % t["op"])
-            for w in low["warnings"]:
-                print("lower: warning: " + w)
-            for u in low["unproven"]:
-                print("lower: unproven: " + u)
-            print("lower: PASS: %s (%s %s): input NHWC %s %s, %d NPU layers, output %s %s, quant mode %d -> %s/lowered.json, net.npuc%s"
-                  % (low["name"], low["source"]["kind"], low["source"]["sha256"][:8], low["input"]["nhwc"], low["io_dtype"],
-                     len(low["layers"]), low["output"]["shape"], low["io_dtype"], quant, a[1],
-                     " (npuc-net 2: a graph; compile with a harness that reads it, e.g. $NCPGEN_WORK/n3/root-current)"
-                     if is_graph(low) else ""))
-            return
-        if cmd == "ref" and len(a) == 3:
-            low = json.load(open(a[0]))
-            y = reference(low, open(a[1], "rb").read())
-            open(a[2], "wb").write(y)
-            print("ref: %s -> %s: %d B sha256 %s" % (a[1], a[2], len(y), hashlib.sha256(y).hexdigest()))
-            return
-        if cmd == "layout" and len(a) == 3:
-            low = json.load(open(a[0]))
-            lay = ncp_layout(low, open(a[1], "rb").read())
-            json.dump(lay, open(a[2], "w"), indent=1)
-            print("layout: IFM %s, %d B (%d planes of %dx%d)%s; OFM %s %d B%s" % (
-                lay["ifm"]["format"], lay["ifm"]["size"], lay["ifm"]["planes"], lay["ifm"]["plane_h"], lay["ifm"]["plane_w"],
-                "" if lay["ifm"]["proven"] else " (rule extrapolated to this shape)", lay["ofm"]["format"], lay["ofm"]["size"],
-                "" if lay["ofm"]["proven"] else " (from the descriptor, this shape not measured yet)") +
-                  ("" if "frame.py" in lay.get("checked_by", "") else "; %s" % lay.get("checked_by", "")))
-            return
-        if cmd == "to-npu" and len(a) == 4:
-            low, lay = json.load(open(a[0])), json.load(open(a[1]))
-            b = to_npu(low, lay, model_in_to_chw(low, open(a[2], "rb").read()))
-            open(a[3], "wb").write(b)
-            print("to-npu: %s -> %s: %d B sha256 %s" % (a[2], a[3], len(b), hashlib.sha256(b).hexdigest()))
-            return
-        if cmd == "from-npu" and len(a) == 4:
-            low, lay = json.load(open(a[0])), json.load(open(a[1]))
-            y = out_to_model(low, cpu_tail(low, from_npu(low, lay, open(a[2], "rb").read())))
-            open(a[3], "wb").write(y)
-            print("from-npu: %s -> %s: %d B sha256 %s" % (a[2], a[3], len(y), hashlib.sha256(y).hexdigest()))
-            return
-        if cmd == "compare" and len(a) >= 3:
-            low, lay = json.load(open(a[0])), json.load(open(a[1]))
-            pairs = [(open(p.split(":", 1)[0], "rb").read(), open(p.split(":", 1)[1], "rb").read()) for p in a[2:]]
-            v, why = compare(low, lay, pairs)
-            print("compare: %s (%s)" % (v, why))
-            sys.exit(0 if v in ("bit-exact", "within 1 LSB") else 2)
+        rc = a.fn(a)
     except Refused as e:
         die(str(e))
-    sys.exit(__doc__)
+    sys.exit(rc or 0)
 
 
 if __name__ == "__main__":
