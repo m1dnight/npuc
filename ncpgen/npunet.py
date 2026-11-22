@@ -593,7 +593,319 @@ def _global_avg_as_conv(L, cur, dtype, low):
             "bias": [0] * C, "output": {"scale": cur["scale"], "zero_point": zpm}}
 
 
+class _Lowering:
+    """lower()'s state: the lowered network being built, the options, and the NPU blob of each graph tensor (its
+    lowered name, CHW, float32 scale and u8 zero point)"""
+
+    def __init__(self, low, dtype, quant, fold, allow_none, ents, show):
+        self.low, self.dtype, self.quant, self.fold, self.allow_none = low, dtype, quant, fold, allow_none
+        self.ents, self.show = ents, show
+        self.blobs = {}
+        self.tail = None        # the key of the last CPU-tail op
+
+    def u8zp(self, zp):
+        return _u8zp(self.dtype, zp)
+
+    def relu_layer(self, name, src, frm, src_name):
+        """a standalone ReLU layer (npuc-net 2 "relu"): NPUC's 1x1 dummy conv, the input's quantisation kept"""
+        low = self.low
+        low["layers"].append({"kind": "relu", "name": name, "type": "ReLU", "from": frm, "src_name": src_name,
+                              "input": src["name"], "in_chw": list(src["chw"]), "cout": src["chw"][0],
+                              "in_scale": f32_hex(src["scale"]), "in_zp": src["zp"], "out_scale": f32_hex(src["scale"]),
+                              "out_zp": src["zp"], "act": 1, "pads": [0, 0, 0, 0], "out_chw": list(src["chw"])})
+        low["unproven"].append("%s: standalone ReLU (NPUC: a 1x1 dummy conv with all-zero weights, GReLU mode 1, no table; "
+                               "not run on the NPU): the reference is max(x, zero point); compare also tries the identity "
+                               "and a constant zero point" % name)
+        return {"name": name, "chw": list(src["chw"]), "scale": src["scale"], "zp": src["zp"]}
+
+
+# lower()'s steps, one per op: each appends its layer(s) to lw.low and returns the blob of its output
+def _lower_conv(lw, idx, L, op, name, key, ins, srcs):
+    """CONV_2D, or FULLY_CONNECTED as a conv whose kernel covers its input: OIHW uint8 weights with one scale and
+    zero point 128, NPUC's multiplier, TFLite's output size and pads"""
+    cur = srcs[0]
+    wt = L["weights"]
+    wd = wt["dtype"]
+    wsc = [f32(float(v)) for v in (wt["scale"] if isinstance(wt["scale"], list) else [wt["scale"]])]
+    wzp = [int(v) for v in (wt.get("zero_point", [0]) if isinstance(wt.get("zero_point", [0]), list) else [wt["zero_point"]])]
+    data = list(wt["data"])
+    bias = [int(v) for v in L["bias"]]
+    Cc, Hc, Wc = cur["chw"]
+    if op == "conv2d":
+        cout = int(L["filters"])
+        kh, kw = L["kernel"]
+        sh, sw = L.get("strides", [1, 1])
+        pad = L.get("padding", "same").lower()
+        if wt.get("layout", "OHWI") != "OHWI":
+            raise Refused("conv %s: weights layout %s (OHWI wanted)" % (name, wt.get("layout")))
+        if len(data) != cout * kh * kw * Cc:
+            raise Refused("conv %s: %d weights for %d x %d x %d x %d" % (name, len(data), cout, kh, kw, Cc))
+        # OHWI -> OIHW
+        oihw = [data[((o * kh + i) * kw + j) * Cc + c] for o in range(cout) for c in range(Cc) for i in range(kh) for j in range(kw)]
+    else:
+        cout = int(L["units"])
+        K = Cc * Hc * Wc
+        if len(data) != cout * K:
+            raise Refused("fully_connected %s: %d weights for %d x %d" % (name, len(data), cout, K))
+        # TFLite flattens NHWC: k = (h * W + w) * C + c; the lowered conv's kernel covers H x W (VALID)
+        kh, kw, sh, sw, pad = Hc, Wc, 1, 1, "valid"
+        oihw = [data[o * K + (i * Wc + j) * Cc + c] for o in range(cout) for c in range(Cc) for i in range(kh) for j in range(kw)]
+        lw.low["unproven"].append("%s: FULLY_CONNECTED lowered to a %dx%d VALID conv (not yet run on the NPU)" % (name, kh, kw))
+    if len(bias) != cout:
+        raise Refused("%s: %d biases for %d outputs" % (name, len(bias), cout))
+    # weights to uint8 with one zero point 128 and one scale
+    if wd == "int8":
+        if any(z != 0 for z in wzp):
+            raise Refused("%s: int8 weights with zero point %s (symmetric 0 wanted)" % (name, wzp))
+        wu8 = [v + 128 for v in oihw]
+    elif wd == "uint8":
+        if any(z != 128 for z in wzp):
+            raise Refused("%s: uint8 weights with zero point %s: NPUC's on-device path is validated with 128 only" % (name, wzp))
+        wu8 = list(oihw)
+    else:
+        raise Refused("%s: weights dtype %s" % (name, wd))
+    if len(set(wsc)) > 1:
+        if not lw.fold:
+            raise Refused("%s: %d per-channel weight scales: NPUC's on-device filler uses one scale per layer "
+                          "(wScale[0]); --fold-per-channel rescales the weights to the largest (lossy)" % (name, len(wsc)))
+        smax = max(wsc)
+        kper = len(wu8) // cout
+        worst = 0
+        for o in range(cout):
+            r = Fraction(wsc[o]) / Fraction(smax)
+            for t in range(o * kper, (o + 1) * kper):
+                nv = rnd((wu8[t] - 128) * r, "half_away")
+                worst = max(worst, abs(Fraction(wu8[t] - 128) * r - nv))
+                wu8[t] = nv + 128
+            bias[o] = rnd(bias[o] * r, "half_away")
+        lw.low["warnings"].append("%s: per-channel weight scales folded into %g (rounding error up to %.2f LSB of the new scale)" % (name, smax, float(worst)))
+        wsc = [smax]
+    elif len(wsc) != 1 and len(wsc) != cout:
+        raise Refused("%s: %d weight scales" % (name, len(wsc)))
+    ws = wsc[0]
+    outq = L["output"]
+    os_ = f32(float(outq["scale"]))
+    oz = lw.u8zp(int(outq["zero_point"]))
+    act = L.get("activation", "none")
+    if act == "relu6":
+        q6 = oz + 6.0 / os_
+        if q6 >= 255:
+            lw.low["warnings"].append("%s: RELU6 taken as RELU (6.0 is above the output range: the clamp is a no-op)" % name)
+            act = "relu"
+        else:
+            raise Refused("%s: RELU6 clamps inside the output range (NPUC: 'Unsupported FusedActivation type' 3)" % name)
+    if act == "none" and not lw.allow_none:
+        raise Refused("%s: no fused activation: NPUC compiles it to GRELU_BYPASS_ONDEVICE, which writes the byte 0 "
+                      "wherever the accumulator is >= 0 (dossier/npu-compiler.md section 9.11); use RELU, or "
+                      "--allow-none to compile it anyway" % name)
+    if act not in ("none", "relu"):
+        raise Refused("%s: activation %s (none or relu)" % (name, act))
+    slope, shift = npuc_multiplier(cur["scale"], ws, os_)
+    ho, pt, pb = _out_shape(Hc, kh, sh, pad)
+    wo, pl, pr = _out_shape(Wc, kw, sw, pad)
+    if ho < 1 or wo < 1:
+        raise Refused("%s: output %dx%d" % (name, ho, wo))
+    for b in bias:
+        if not -2 ** 31 <= b < 2 ** 31:
+            raise Refused("%s: bias %d out of int32" % (name, b))
+    lay = {"kind": "conv", "name": name, "from": op, "src_name": L.get("name", ""), "input": cur["name"],
+           "in_chw": [Cc, Hc, Wc], "cout": cout, "k": [kh, kw], "stride": [sh, sw], "padding": pad.upper(),
+           "pads": [pt, pb, pl, pr], "act": 1 if act == "relu" else 0,
+           "in_scale": f32_hex(cur["scale"]), "in_zp": cur["zp"], "w_scale": f32_hex(ws), "w_zp": 128,
+           "out_scale": f32_hex(os_), "out_zp": oz, "slope": slope, "shift": shift,
+           "weights_oihw_u8": wu8, "bias": bias, "out_chw": [cout, ho, wo]}
+    if act == "none":
+        lw.low["warnings"].append("%s: no activation (GRELU_BYPASS_ONDEVICE: the byte 0 wherever acc >= 0, V)" % name)
+    if slope & (slope - 1):
+        lw.low["unproven"].append("%s: multiplier %d/2^%d is not a power of two: NPUC's slope rounds it (%.4g vs %.4g asked); "
+                               "the rounding of acc x slope is proven only for a power of two" % (
+                                   name, slope, shift, slope / 2 ** shift, f32(cur["scale"]) * ws / os_))
+    if (sh, sw) != (1, 1):
+        lw.low["unproven"].append("%s: stride %dx%d (only stride 1 run on the NPU so far)" % (name, sh, sw))
+    lw.low["layers"].append(lay)
+    return {"name": name, "chw": [cout, ho, wo], "scale": os_, "zp": oz}
+
+
+def _lower_pool(lw, idx, L, op, name, key, ins, srcs):
+    """MAX/AVERAGE_POOL_2D (NFU strides up to 3, the input's quantisation kept)"""
+    cur = srcs[0]
+    Cc, Hc, Wc = cur["chw"]
+    kh, kw = L["pool"]
+    sh, sw = L.get("strides", [kh, kw])
+    if max(sh, sw) > 3:
+        # V (the oracle, 2026-11-21): stride 4 -> "ncp_nfu_pooling: StrideH (4) exceed limited value", stride 8
+        # -> assertion "IFM.valid()" in PolicyMaker; kernels up to 5 with strides 1..3 compile
+        raise Refused("%s: pooling stride %dx%d: NPUC's NFU pooling takes a stride of at most 3 (it refuses 4, "
+                      "aborts on 8); a global average pool can be split into pools of stride <= 3" % (name, sh, sw))
+    pad = L.get("padding", "valid").lower()
+    act = L.get("activation", "none")
+    outq = L.get("output", {"scale": None, "zero_point": None})
+    os_ = f32(float(outq["scale"])) if outq.get("scale") is not None else cur["scale"]
+    oz = lw.u8zp(int(outq["zero_point"])) if outq.get("zero_point") is not None else cur["zp"]
+    if (os_, oz) != (cur["scale"], cur["zp"]):
+        raise Refused("%s: pooling with a different output quantisation (%g, %d) than its input (%g, %d)" % (name, os_, oz, cur["scale"], cur["zp"]))
+    if act not in ("none", "relu"):
+        raise Refused("%s: pooling activation %s" % (name, act))
+    ho, pt, pb = _out_shape(Hc, kh, sh, pad)
+    wo, pl, pr = _out_shape(Wc, kw, sw, pad)
+    ptype = "MaxPool" if op == "max_pool2d" else "AvgPool"
+    if ptype == "AvgPool":
+        lw.low["unproven"].append("%s: AVERAGE_POOL_2D (the NPU's division and rounding are not measured yet; the "
+                               "reference uses TFLite's: round half up of sum / count of valid inputs)" % name)
+    if pad == "same" and (pt or pb or pl or pr):
+        lw.low["unproven"].append("%s: padded pooling (not run on the NPU yet)" % name)
+    lw.low["layers"].append({"kind": "pool", "name": name, "type": ptype, "src_name": L.get("name", ""),
+                          "input": cur["name"], "in_chw": [Cc, Hc, Wc], "k": [kh, kw], "stride": [sh, sw],
+                          "padding": pad.upper(), "pads": [pt, pb, pl, pr], "act": 1 if act == "relu" else 0,
+                          "in_scale": f32_hex(cur["scale"]), "in_zp": cur["zp"], "out_scale": f32_hex(os_),
+                          "out_zp": oz, "out_chw": [Cc, ho, wo]})
+    return {"name": name, "chw": [Cc, ho, wo], "scale": os_, "zp": oz}
+
+
+def _lower_add(lw, idx, L, op, name, key, ins, srcs):
+    """ADD as NPUC's Eltwise: quant 3, every scale 2^-n (its fractional lengths), no broadcasting; a fused RELU
+    becomes a relu layer"""
+    if len(ins) != 2:
+        raise Refused("add %s: %d inputs (two)" % (name, len(ins)))
+    a, b = srcs
+    if a["name"] == b["name"]:
+        raise Refused("add %s: both inputs are %r: x + x is not supported (NPUC's policy maker asserts, PGraph::clone "
+                      "\"this->equals(graph)\": docs/harness-ops.md 3.1)" % (name, lw.show[ins[0]]))
+    if a["chw"] != b["chw"]:
+        raise Refused("add %s: inputs %s and %s (C x H x W): broadcasting is not supported (NPUC's Eltwise adds two "
+                      "tensors of the same shape)" % (name, "x".join(map(str, a["chw"])), "x".join(map(str, b["chw"]))))
+    if lw.quant != 3:
+        raise Refused("add %s: ADD needs --quant 3 (native s8, every zero point int8 0): NPUC's Eltwise has no "
+                      "zero-point term (docs/harness-ops.md 3.1)" % name)
+    outq = L["output"]
+    os_ = f32(float(outq["scale"]))
+    oz = lw.u8zp(int(outq["zero_point"]))
+    fl = []
+    for what, s_ in (("input 1 (%s)" % lw.show[ins[0]], a["scale"]), ("input 2 (%s)" % lw.show[ins[1]], b["scale"]), ("output", os_)):
+        n_ = pow2_fl(s_)
+        if n_ is None:
+            raise Refused("add %s: %s scale %.9g is not 2^-n (n 0..31): NPUC's Eltwise aligns its inputs by powers "
+                          "of two only and cannot rescale (docs/harness-ops.md 3.1); quantise the model with "
+                          "power-of-two scales for the ADD's inputs and output" % (name, what, s_))
+        fl.append(n_)
+    if not a["zp"] == b["zp"] == oz:
+        raise Refused("add %s: zero points %d, %d, %d (u8) differ: NPUC's Eltwise has no zero-point term" % (name, a["zp"], b["zp"], oz))
+    act = _fused_act(name, "ADD", L.get("activation", "none"), oz, os_, lw.low)
+    lw.low["layers"].append({"kind": "eltwise", "name": name, "op": "Add", "from": "add", "src_name": L.get("name", ""),
+                          "input": a["name"], "inputs": [a["name"], b["name"]], "in_chw": list(a["chw"]),
+                          "in_scales": [f32_hex(a["scale"]), f32_hex(b["scale"])], "in_zps": [a["zp"], b["zp"]],
+                          "fl": fl, "out_scale": f32_hex(os_), "out_zp": oz, "act": 0, "pads": [0, 0, 0, 0],
+                          "out_chw": list(a["chw"])})
+    lw.low["unproven"].append("%s: ADD as NPUC's Eltwise (compiles; not run on the NPU): the reference is the harness's "
+                           "guess sat_s8(round(in1 x 2^%d + in2 x 2^%d)) (fractional lengths %d, %d -> %d), rounding "
+                           "half away; compare also tries floor, half even/up and rounding each term" % (
+                               name, fl[2] - fl[0], fl[2] - fl[1], fl[0], fl[1], fl[2]))
+    blob = {"name": name, "chw": list(a["chw"]), "scale": os_, "zp": oz}
+    if act == "relu":
+        blob = lw.relu_layer("l%d_%s" % (len(lw.low["layers"]) + 1, _clean(L.get("name", op) + "_relu")), blob, "add",
+                          L.get("name", ""))
+    return blob
+
+
+def _lower_concat(lw, idx, L, op, name, key, ins, srcs):
+    """CONCATENATION of channels, every input already in the output's quantisation"""
+    axis = int(L.get("axis", 3))
+    if axis not in (3, -1):
+        raise Refused("concat %s: axis %d of NHWC: NPUC concatenates channels only (axis 3 / -1)" % (name, axis))
+    if not 2 <= len(ins) <= 64:
+        raise Refused("concat %s: %d inputs (2 to 64)" % (name, len(ins)))
+    if len(set(b["name"] for b in srcs)) != len(srcs):
+        raise Refused("concat %s: the same tensor twice (not supported)" % name)
+    outq = L["output"]
+    os_ = f32(float(outq["scale"]))
+    oz = lw.u8zp(int(outq["zero_point"]))
+    for k, b in zip(ins, srcs):
+        if b["name"] == "data0":
+            raise Refused("concat %s: input %r is the network input: NPUC writes it straight into a channel slice "
+                          "and its policy maker asserts (\"DataNode id isn't found in the NNGraph inputs\", "
+                          "docs/harness-ops.md 3.2); a layer must come before it" % (name, lw.show[k]))
+        if (b["scale"], b["zp"]) != (os_, oz):
+            raise Refused("concat %s: input %r is scale %.9g zp %d, the output scale %.9g zp %d: NPUC places the bytes "
+                          "as they are (no rescale on this path); every input must already be in the output's "
+                          "quantisation" % (name, lw.show[k], b["scale"], b["zp"], os_, oz))
+        if b["chw"][1:] != srcs[0]["chw"][1:]:
+            raise Refused("concat %s: input %r is %dx%d (H x W), %r is %dx%d" % (
+                name, lw.show[k], b["chw"][1], b["chw"][2], lw.show[ins[0]], srcs[0]["chw"][1], srcs[0]["chw"][2]))
+    act = _fused_act(name, "CONCATENATION", L.get("activation", "none"), oz, os_, lw.low)
+    chw = [sum(b["chw"][0] for b in srcs)] + list(srcs[0]["chw"][1:])
+    lw.low["layers"].append({"kind": "concat", "name": name, "from": "concat", "src_name": L.get("name", ""),
+                          "input": srcs[0]["name"], "inputs": [b["name"] for b in srcs], "axis": 1,
+                          "in_chws": [list(b["chw"]) for b in srcs], "out_scale": f32_hex(os_), "out_zp": oz,
+                          "act": 0, "pads": [0, 0, 0, 0], "out_chw": chw})
+    lw.low["unproven"].append("%s: CONCATENATION of channels (compiles; not run on the NPU): the reference places the "
+                           "inputs' channels in order" % name)
+    blob = {"name": name, "chw": chw, "scale": os_, "zp": oz}
+    if act == "relu":
+        blob = lw.relu_layer("l%d_%s" % (len(lw.low["layers"]) + 1, _clean(L.get("name", op) + "_relu")), blob, "concat",
+                          L.get("name", ""))
+    return blob
+
+
+def _lower_relu(lw, idx, L, op, name, key, ins, srcs):
+    """a standalone RELU (RELU6 when its clamp is a no-op): NPUC's relu layer"""
+    cur = srcs[0]
+    outq = L.get("output") or {}
+    if outq.get("scale") is not None:
+        os_ = f32(float(outq["scale"]))
+        oz = lw.u8zp(int(outq["zero_point"]))
+        if (os_, oz) != (cur["scale"], cur["zp"]):
+            raise Refused("%s %s: output scale %.9g zp %d, its input scale %.9g zp %d: NPUC's ReLU layer keeps its "
+                          "input's quantisation" % (op.upper(), name, os_, oz, cur["scale"], cur["zp"]))
+    if op == "relu6":
+        _fused_act(name, "RELU6", "relu6", cur["zp"], cur["scale"], lw.low)
+    return lw.relu_layer(name, cur, op, L.get("name", ""))
+
+
+def _lower_reshape(lw, idx, L, op, name, key, ins, srcs):
+    """RESHAPE: kept for a FULLY_CONNECTED that reads it, else a CPU-tail op"""
+    cur = srcs[0]
+    n = 1
+    for v in L["shape"]:
+        n *= v
+    if n != cur["chw"][0] * cur["chw"][1] * cur["chw"][2]:
+        raise Refused("reshape %s to %s: %d elements, the tensor has %d" % (name, L["shape"], n, cur["chw"][0] * cur["chw"][1] * cur["chw"][2]))
+    nxt = lw.ents[idx + 1] if idx + 1 < len(lw.ents) else None
+    if nxt is not None and nxt[0]["op"] == "fully_connected" and nxt[2] == [key]:
+        return dict(cur, flat=True)
+    else:
+        if lw.tail is None and lw.low["layers"] and cur["name"] != lw.low["layers"][-1]["name"]:
+            raise Refused("reshape %s reads %r: the CPU part (RESHAPE, SOFTMAX) must read the NPU part's last output" % (name, lw.show[ins[0]]))
+        if lw.tail is not None and ins[0] != lw.tail:
+            raise Refused("reshape %s reads %r: the CPU part must be a chain at the end" % (name, lw.show[ins[0]]))
+        lw.tail = key
+        lw.low["cpu_tail"].append({"op": "reshape", "shape": L["shape"]})
+        return dict(cur, tail=True)
+
+
+def _lower_softmax(lw, idx, L, op, name, key, ins, srcs):
+    """SOFTMAX: a CPU-tail op"""
+    cur = srcs[0]
+    if lw.tail is None and lw.low["layers"] and cur["name"] != lw.low["layers"][-1]["name"]:
+        raise Refused("softmax %s reads %r: the CPU part (RESHAPE, SOFTMAX) must read the NPU part's last output" % (name, lw.show[ins[0]]))
+    if lw.tail is not None and ins[0] != lw.tail:
+        raise Refused("softmax %s reads %r: the CPU part must be a chain at the end" % (name, lw.show[ins[0]]))
+    lw.tail = key
+    outq = L["output"]
+    lw.low["cpu_tail"].append({"op": "softmax", "beta": float(L.get("beta", 1.0)), "in_scale": f32_hex(cur["scale"]),
+                            "in_zp": cur["zp"], "out_scale": f32_hex(f32(float(outq["scale"]))),
+                            "out_zp": lw.u8zp(int(outq["zero_point"]))})
+    return dict(cur, tail=True)
+
+
+LOWER_OPS = {"conv2d": _lower_conv, "fully_connected": _lower_conv, "max_pool2d": _lower_pool,
+             "average_pool2d": _lower_pool, "add": _lower_add, "concat": _lower_concat, "relu": _lower_relu,
+             "relu6": _lower_relu, "reshape": _lower_reshape, "softmax": _lower_softmax}
+
+
 def lower(g, quant=1, fold=False, allow_none=False, soc=2):
+    """an npu-net/1 graph -> lowered.json's dict: every layer as NPUC computes it (uint8 asymmetric, OIHW weights,
+    NPUC's multipliers and pads), the CPU tail, the warnings and what is not proven on the NPU; Refused for what NPUC
+    or this path cannot take (the module docstring)"""
     if g.get("format") != "npu-net/1":
         raise Refused("not an npu-net/1 graph (format %r)" % g.get("format"))
     io = g["input"]
@@ -610,289 +922,28 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2):
            "layers": [], "cpu_tail": [], "warnings": [], "unproven": []}
     ents, inkey, fwarn, show = _resolve(g)
     low["warnings"] += fwarn
-    # graph tensor key -> the NPU blob holding it: lowered name, CHW, scale (float32), zero point (u8)
-    blobs = {inkey: {"name": "data0", "chw": [C, H, W], "scale": sc, "zp": zp_in}}
-    tail = None  # the key of the last CPU-tail op
-
-    def relu_layer(name, src, frm, src_name):
-        """a standalone ReLU layer (npuc-net 2 "relu"): NPUC's 1x1 dummy conv, the input's quantisation kept"""
-        low["layers"].append({"kind": "relu", "name": name, "type": "ReLU", "from": frm, "src_name": src_name,
-                              "input": src["name"], "in_chw": list(src["chw"]), "cout": src["chw"][0],
-                              "in_scale": f32_hex(src["scale"]), "in_zp": src["zp"], "out_scale": f32_hex(src["scale"]),
-                              "out_zp": src["zp"], "act": 1, "pads": [0, 0, 0, 0], "out_chw": list(src["chw"])})
-        low["unproven"].append("%s: standalone ReLU (NPUC: a 1x1 dummy conv with all-zero weights, GReLU mode 1, no table; "
-                               "not run on the NPU): the reference is max(x, zero point); compare also tries the identity "
-                               "and a constant zero point" % name)
-        return {"name": name, "chw": list(src["chw"]), "scale": src["scale"], "zp": src["zp"]}
-
+    lw = _Lowering(low, dtype, quant, fold, allow_none, ents, show)
+    lw.blobs[inkey] = {"name": "data0", "chw": [C, H, W], "scale": sc, "zp": zp_in}
     for idx, (L, key, ins) in enumerate(ents):
         op = L["op"]
         name = "l%d_%s" % (len(low["layers"]) + 1, _clean(L.get("name", op)))
-        if tail is not None and op not in ("reshape", "softmax"):
+        if lw.tail is not None and op not in ("reshape", "softmax"):
             raise Refused("%s after a CPU op: only RESHAPE and SOFTMAX may follow the NPU part" % op)
         if op not in ("add", "concat") and len(ins) != 1:
             raise Refused("%s %s: %d inputs (one)" % (op, name, len(ins)))
-        srcs = [blobs[k] for k in ins]
+        srcs = [lw.blobs[k] for k in ins]
         for k, b in zip(ins, srcs):
             if b.get("flat") and op != "fully_connected":
-                raise Refused("%s %s reads %r, a RESHAPE kept for a FULLY_CONNECTED: only a FULLY_CONNECTED may read it" % (op, name, show[k]))
-        cur = srcs[0]
+                raise Refused("%s %s reads %r, a RESHAPE kept for a FULLY_CONNECTED: only a FULLY_CONNECTED may read it"
+                              % (op, name, show[k]))
         if op == "average_pool2d":
-            gap = _global_avg_as_conv(L, cur, dtype, low)
+            gap = _global_avg_as_conv(L, srcs[0], dtype, low)
             if gap is not None:
                 L, op = gap, "conv2d"
-        if op in ("conv2d", "fully_connected"):
-            wt = L["weights"]
-            wd = wt["dtype"]
-            wsc = [f32(float(v)) for v in (wt["scale"] if isinstance(wt["scale"], list) else [wt["scale"]])]
-            wzp = [int(v) for v in (wt.get("zero_point", [0]) if isinstance(wt.get("zero_point", [0]), list) else [wt["zero_point"]])]
-            data = list(wt["data"])
-            bias = [int(v) for v in L["bias"]]
-            Cc, Hc, Wc = cur["chw"]
-            if op == "conv2d":
-                cout = int(L["filters"])
-                kh, kw = L["kernel"]
-                sh, sw = L.get("strides", [1, 1])
-                pad = L.get("padding", "same").lower()
-                if wt.get("layout", "OHWI") != "OHWI":
-                    raise Refused("conv %s: weights layout %s (OHWI wanted)" % (name, wt.get("layout")))
-                if len(data) != cout * kh * kw * Cc:
-                    raise Refused("conv %s: %d weights for %d x %d x %d x %d" % (name, len(data), cout, kh, kw, Cc))
-                # OHWI -> OIHW
-                oihw = [data[((o * kh + i) * kw + j) * Cc + c] for o in range(cout) for c in range(Cc) for i in range(kh) for j in range(kw)]
-            else:
-                cout = int(L["units"])
-                K = Cc * Hc * Wc
-                if len(data) != cout * K:
-                    raise Refused("fully_connected %s: %d weights for %d x %d" % (name, len(data), cout, K))
-                # TFLite flattens NHWC: k = (h * W + w) * C + c; the lowered conv's kernel covers H x W (VALID)
-                kh, kw, sh, sw, pad = Hc, Wc, 1, 1, "valid"
-                oihw = [data[o * K + (i * Wc + j) * Cc + c] for o in range(cout) for c in range(Cc) for i in range(kh) for j in range(kw)]
-                low["unproven"].append("%s: FULLY_CONNECTED lowered to a %dx%d VALID conv (not yet run on the NPU)" % (name, kh, kw))
-            if len(bias) != cout:
-                raise Refused("%s: %d biases for %d outputs" % (name, len(bias), cout))
-            # weights to uint8 with one zero point 128 and one scale
-            if wd == "int8":
-                if any(z != 0 for z in wzp):
-                    raise Refused("%s: int8 weights with zero point %s (symmetric 0 wanted)" % (name, wzp))
-                wu8 = [v + 128 for v in oihw]
-            elif wd == "uint8":
-                if any(z != 128 for z in wzp):
-                    raise Refused("%s: uint8 weights with zero point %s: NPUC's on-device path is validated with 128 only" % (name, wzp))
-                wu8 = list(oihw)
-            else:
-                raise Refused("%s: weights dtype %s" % (name, wd))
-            if len(set(wsc)) > 1:
-                if not fold:
-                    raise Refused("%s: %d per-channel weight scales: NPUC's on-device filler uses one scale per layer "
-                                  "(wScale[0]); --fold-per-channel rescales the weights to the largest (lossy)" % (name, len(wsc)))
-                smax = max(wsc)
-                kper = len(wu8) // cout
-                worst = 0
-                for o in range(cout):
-                    r = Fraction(wsc[o]) / Fraction(smax)
-                    for t in range(o * kper, (o + 1) * kper):
-                        nv = rnd((wu8[t] - 128) * r, "half_away")
-                        worst = max(worst, abs(Fraction(wu8[t] - 128) * r - nv))
-                        wu8[t] = nv + 128
-                    bias[o] = rnd(bias[o] * r, "half_away")
-                low["warnings"].append("%s: per-channel weight scales folded into %g (rounding error up to %.2f LSB of the new scale)" % (name, smax, float(worst)))
-                wsc = [smax]
-            elif len(wsc) != 1 and len(wsc) != cout:
-                raise Refused("%s: %d weight scales" % (name, len(wsc)))
-            ws = wsc[0]
-            outq = L["output"]
-            os_ = f32(float(outq["scale"]))
-            oz = _u8zp(dtype, int(outq["zero_point"]))
-            act = L.get("activation", "none")
-            if act == "relu6":
-                q6 = oz + 6.0 / os_
-                if q6 >= 255:
-                    low["warnings"].append("%s: RELU6 taken as RELU (6.0 is above the output range: the clamp is a no-op)" % name)
-                    act = "relu"
-                else:
-                    raise Refused("%s: RELU6 clamps inside the output range (NPUC: 'Unsupported FusedActivation type' 3)" % name)
-            if act == "none" and not allow_none:
-                raise Refused("%s: no fused activation: NPUC compiles it to GRELU_BYPASS_ONDEVICE, which writes the byte 0 "
-                              "wherever the accumulator is >= 0 (dossier/npu-compiler.md section 9.11); use RELU, or "
-                              "--allow-none to compile it anyway" % name)
-            if act not in ("none", "relu"):
-                raise Refused("%s: activation %s (none or relu)" % (name, act))
-            slope, shift = npuc_multiplier(cur["scale"], ws, os_)
-            ho, pt, pb = _out_shape(Hc, kh, sh, pad)
-            wo, pl, pr = _out_shape(Wc, kw, sw, pad)
-            if ho < 1 or wo < 1:
-                raise Refused("%s: output %dx%d" % (name, ho, wo))
-            for b in bias:
-                if not -2 ** 31 <= b < 2 ** 31:
-                    raise Refused("%s: bias %d out of int32" % (name, b))
-            lay = {"kind": "conv", "name": name, "from": op, "src_name": L.get("name", ""), "input": cur["name"],
-                   "in_chw": [Cc, Hc, Wc], "cout": cout, "k": [kh, kw], "stride": [sh, sw], "padding": pad.upper(),
-                   "pads": [pt, pb, pl, pr], "act": 1 if act == "relu" else 0,
-                   "in_scale": f32_hex(cur["scale"]), "in_zp": cur["zp"], "w_scale": f32_hex(ws), "w_zp": 128,
-                   "out_scale": f32_hex(os_), "out_zp": oz, "slope": slope, "shift": shift,
-                   "weights_oihw_u8": wu8, "bias": bias, "out_chw": [cout, ho, wo]}
-            if act == "none":
-                low["warnings"].append("%s: no activation (GRELU_BYPASS_ONDEVICE: the byte 0 wherever acc >= 0, V)" % name)
-            if slope & (slope - 1):
-                low["unproven"].append("%s: multiplier %d/2^%d is not a power of two: NPUC's slope rounds it (%.4g vs %.4g asked); "
-                                       "the rounding of acc x slope is proven only for a power of two" % (
-                                           name, slope, shift, slope / 2 ** shift, f32(cur["scale"]) * ws / os_))
-            if (sh, sw) != (1, 1):
-                low["unproven"].append("%s: stride %dx%d (only stride 1 run on the NPU so far)" % (name, sh, sw))
-            low["layers"].append(lay)
-            blobs[key] = {"name": name, "chw": [cout, ho, wo], "scale": os_, "zp": oz}
-        elif op in ("max_pool2d", "average_pool2d"):
-            Cc, Hc, Wc = cur["chw"]
-            kh, kw = L["pool"]
-            sh, sw = L.get("strides", [kh, kw])
-            if max(sh, sw) > 3:
-                # V (the oracle, 2026-11-21): stride 4 -> "ncp_nfu_pooling: StrideH (4) exceed limited value", stride 8
-                # -> assertion "IFM.valid()" in PolicyMaker; kernels up to 5 with strides 1..3 compile
-                raise Refused("%s: pooling stride %dx%d: NPUC's NFU pooling takes a stride of at most 3 (it refuses 4, "
-                              "aborts on 8); a global average pool can be split into pools of stride <= 3" % (name, sh, sw))
-            pad = L.get("padding", "valid").lower()
-            act = L.get("activation", "none")
-            outq = L.get("output", {"scale": None, "zero_point": None})
-            os_ = f32(float(outq["scale"])) if outq.get("scale") is not None else cur["scale"]
-            oz = _u8zp(dtype, int(outq["zero_point"])) if outq.get("zero_point") is not None else cur["zp"]
-            if (os_, oz) != (cur["scale"], cur["zp"]):
-                raise Refused("%s: pooling with a different output quantisation (%g, %d) than its input (%g, %d)" % (name, os_, oz, cur["scale"], cur["zp"]))
-            if act not in ("none", "relu"):
-                raise Refused("%s: pooling activation %s" % (name, act))
-            ho, pt, pb = _out_shape(Hc, kh, sh, pad)
-            wo, pl, pr = _out_shape(Wc, kw, sw, pad)
-            ptype = "MaxPool" if op == "max_pool2d" else "AvgPool"
-            if ptype == "AvgPool":
-                low["unproven"].append("%s: AVERAGE_POOL_2D (the NPU's division and rounding are not measured yet; the "
-                                       "reference uses TFLite's: round half up of sum / count of valid inputs)" % name)
-            if pad == "same" and (pt or pb or pl or pr):
-                low["unproven"].append("%s: padded pooling (not run on the NPU yet)" % name)
-            low["layers"].append({"kind": "pool", "name": name, "type": ptype, "src_name": L.get("name", ""),
-                                  "input": cur["name"], "in_chw": [Cc, Hc, Wc], "k": [kh, kw], "stride": [sh, sw],
-                                  "padding": pad.upper(), "pads": [pt, pb, pl, pr], "act": 1 if act == "relu" else 0,
-                                  "in_scale": f32_hex(cur["scale"]), "in_zp": cur["zp"], "out_scale": f32_hex(os_),
-                                  "out_zp": oz, "out_chw": [Cc, ho, wo]})
-            blobs[key] = {"name": name, "chw": [Cc, ho, wo], "scale": os_, "zp": oz}
-        elif op == "add":
-            if len(ins) != 2:
-                raise Refused("add %s: %d inputs (two)" % (name, len(ins)))
-            a, b = srcs
-            if a["name"] == b["name"]:
-                raise Refused("add %s: both inputs are %r: x + x is not supported (NPUC's policy maker asserts, PGraph::clone "
-                              "\"this->equals(graph)\": docs/harness-ops.md 3.1)" % (name, show[ins[0]]))
-            if a["chw"] != b["chw"]:
-                raise Refused("add %s: inputs %s and %s (C x H x W): broadcasting is not supported (NPUC's Eltwise adds two "
-                              "tensors of the same shape)" % (name, "x".join(map(str, a["chw"])), "x".join(map(str, b["chw"]))))
-            if quant != 3:
-                raise Refused("add %s: ADD needs --quant 3 (native s8, every zero point int8 0): NPUC's Eltwise has no "
-                              "zero-point term (docs/harness-ops.md 3.1)" % name)
-            outq = L["output"]
-            os_ = f32(float(outq["scale"]))
-            oz = _u8zp(dtype, int(outq["zero_point"]))
-            fl = []
-            for what, s_ in (("input 1 (%s)" % show[ins[0]], a["scale"]), ("input 2 (%s)" % show[ins[1]], b["scale"]), ("output", os_)):
-                n_ = pow2_fl(s_)
-                if n_ is None:
-                    raise Refused("add %s: %s scale %.9g is not 2^-n (n 0..31): NPUC's Eltwise aligns its inputs by powers "
-                                  "of two only and cannot rescale (docs/harness-ops.md 3.1); quantise the model with "
-                                  "power-of-two scales for the ADD's inputs and output" % (name, what, s_))
-                fl.append(n_)
-            if not a["zp"] == b["zp"] == oz:
-                raise Refused("add %s: zero points %d, %d, %d (u8) differ: NPUC's Eltwise has no zero-point term" % (name, a["zp"], b["zp"], oz))
-            act = _fused_act(name, "ADD", L.get("activation", "none"), oz, os_, low)
-            low["layers"].append({"kind": "eltwise", "name": name, "op": "Add", "from": "add", "src_name": L.get("name", ""),
-                                  "input": a["name"], "inputs": [a["name"], b["name"]], "in_chw": list(a["chw"]),
-                                  "in_scales": [f32_hex(a["scale"]), f32_hex(b["scale"])], "in_zps": [a["zp"], b["zp"]],
-                                  "fl": fl, "out_scale": f32_hex(os_), "out_zp": oz, "act": 0, "pads": [0, 0, 0, 0],
-                                  "out_chw": list(a["chw"])})
-            low["unproven"].append("%s: ADD as NPUC's Eltwise (compiles; not run on the NPU): the reference is the harness's "
-                                   "guess sat_s8(round(in1 x 2^%d + in2 x 2^%d)) (fractional lengths %d, %d -> %d), rounding "
-                                   "half away; compare also tries floor, half even/up and rounding each term" % (
-                                       name, fl[2] - fl[0], fl[2] - fl[1], fl[0], fl[1], fl[2]))
-            blob = {"name": name, "chw": list(a["chw"]), "scale": os_, "zp": oz}
-            if act == "relu":
-                blob = relu_layer("l%d_%s" % (len(low["layers"]) + 1, _clean(L.get("name", op) + "_relu")), blob, "add",
-                                  L.get("name", ""))
-            blobs[key] = blob
-        elif op == "concat":
-            axis = int(L.get("axis", 3))
-            if axis not in (3, -1):
-                raise Refused("concat %s: axis %d of NHWC: NPUC concatenates channels only (axis 3 / -1)" % (name, axis))
-            if not 2 <= len(ins) <= 64:
-                raise Refused("concat %s: %d inputs (2 to 64)" % (name, len(ins)))
-            if len(set(b["name"] for b in srcs)) != len(srcs):
-                raise Refused("concat %s: the same tensor twice (not supported)" % name)
-            outq = L["output"]
-            os_ = f32(float(outq["scale"]))
-            oz = _u8zp(dtype, int(outq["zero_point"]))
-            for k, b in zip(ins, srcs):
-                if b["name"] == "data0":
-                    raise Refused("concat %s: input %r is the network input: NPUC writes it straight into a channel slice "
-                                  "and its policy maker asserts (\"DataNode id isn't found in the NNGraph inputs\", "
-                                  "docs/harness-ops.md 3.2); a layer must come before it" % (name, show[k]))
-                if (b["scale"], b["zp"]) != (os_, oz):
-                    raise Refused("concat %s: input %r is scale %.9g zp %d, the output scale %.9g zp %d: NPUC places the bytes "
-                                  "as they are (no rescale on this path); every input must already be in the output's "
-                                  "quantisation" % (name, show[k], b["scale"], b["zp"], os_, oz))
-                if b["chw"][1:] != srcs[0]["chw"][1:]:
-                    raise Refused("concat %s: input %r is %dx%d (H x W), %r is %dx%d" % (
-                        name, show[k], b["chw"][1], b["chw"][2], show[ins[0]], srcs[0]["chw"][1], srcs[0]["chw"][2]))
-            act = _fused_act(name, "CONCATENATION", L.get("activation", "none"), oz, os_, low)
-            chw = [sum(b["chw"][0] for b in srcs)] + list(srcs[0]["chw"][1:])
-            low["layers"].append({"kind": "concat", "name": name, "from": "concat", "src_name": L.get("name", ""),
-                                  "input": srcs[0]["name"], "inputs": [b["name"] for b in srcs], "axis": 1,
-                                  "in_chws": [list(b["chw"]) for b in srcs], "out_scale": f32_hex(os_), "out_zp": oz,
-                                  "act": 0, "pads": [0, 0, 0, 0], "out_chw": chw})
-            low["unproven"].append("%s: CONCATENATION of channels (compiles; not run on the NPU): the reference places the "
-                                   "inputs' channels in order" % name)
-            blob = {"name": name, "chw": chw, "scale": os_, "zp": oz}
-            if act == "relu":
-                blob = relu_layer("l%d_%s" % (len(low["layers"]) + 1, _clean(L.get("name", op) + "_relu")), blob, "concat",
-                                  L.get("name", ""))
-            blobs[key] = blob
-        elif op in ("relu", "relu6"):
-            outq = L.get("output") or {}
-            if outq.get("scale") is not None:
-                os_ = f32(float(outq["scale"]))
-                oz = _u8zp(dtype, int(outq["zero_point"]))
-                if (os_, oz) != (cur["scale"], cur["zp"]):
-                    raise Refused("%s %s: output scale %.9g zp %d, its input scale %.9g zp %d: NPUC's ReLU layer keeps its "
-                                  "input's quantisation" % (op.upper(), name, os_, oz, cur["scale"], cur["zp"]))
-            if op == "relu6":
-                _fused_act(name, "RELU6", "relu6", cur["zp"], cur["scale"], low)
-            blobs[key] = relu_layer(name, cur, op, L.get("name", ""))
-        elif op == "reshape":
-            n = 1
-            for v in L["shape"]:
-                n *= v
-            if n != cur["chw"][0] * cur["chw"][1] * cur["chw"][2]:
-                raise Refused("reshape %s to %s: %d elements, the tensor has %d" % (name, L["shape"], n, cur["chw"][0] * cur["chw"][1] * cur["chw"][2]))
-            nxt = ents[idx + 1] if idx + 1 < len(ents) else None
-            if nxt is not None and nxt[0]["op"] == "fully_connected" and nxt[2] == [key]:
-                blobs[key] = dict(cur, flat=True)
-            else:
-                if tail is None and low["layers"] and cur["name"] != low["layers"][-1]["name"]:
-                    raise Refused("reshape %s reads %r: the CPU part (RESHAPE, SOFTMAX) must read the NPU part's last output" % (name, show[ins[0]]))
-                if tail is not None and ins[0] != tail:
-                    raise Refused("reshape %s reads %r: the CPU part must be a chain at the end" % (name, show[ins[0]]))
-                tail = key
-                low["cpu_tail"].append({"op": "reshape", "shape": L["shape"]})
-                blobs[key] = dict(cur, tail=True)
-        elif op == "softmax":
-            if tail is None and low["layers"] and cur["name"] != low["layers"][-1]["name"]:
-                raise Refused("softmax %s reads %r: the CPU part (RESHAPE, SOFTMAX) must read the NPU part's last output" % (name, show[ins[0]]))
-            if tail is not None and ins[0] != tail:
-                raise Refused("softmax %s reads %r: the CPU part must be a chain at the end" % (name, show[ins[0]]))
-            tail = key
-            outq = L["output"]
-            low["cpu_tail"].append({"op": "softmax", "beta": float(L.get("beta", 1.0)), "in_scale": f32_hex(cur["scale"]),
-                                    "in_zp": cur["zp"], "out_scale": f32_hex(f32(float(outq["scale"]))),
-                                    "out_zp": _u8zp(dtype, int(outq["zero_point"]))})
-            blobs[key] = dict(cur, tail=True)
-        else:
+        if op not in LOWER_OPS:
             raise Refused("op %s is not supported (conv2d, fully_connected, max_pool2d, average_pool2d, add, concat, relu; "
                           "reshape and softmax at the end)" % op)
+        lw.blobs[key] = LOWER_OPS[op](lw, idx, L, op, name, key, ins, srcs)
     if not low["layers"]:
         raise Refused("no layer runs on the NPU")
     if not any(l["kind"] == "conv" for l in low["layers"]):
