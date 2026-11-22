@@ -1,4 +1,4 @@
-# name | npuc-variant.py arguments, or zoo:<model> (models/zoo.py) | lowering options | sha256 of the NCP Samsung's NPUC 1.36.1.a compiled for it
+# name | npuc-variant.py arguments, zoo:<model> (models/zoo.py) or restride:<case> (tests/rewrite_ref.py) | lowering options | sha256 of the NCP Samsung's NPUC 1.36.1.a compiled for it
 # (our own seeded networks; ncpgen gen --grelu npuc must write the same bytes). Made by tests/make-golden.sh.
 f1-k1|--in 16,16,8 --conv 8,1||b43b51c4ec06af15b7b692ec32015ef35f797654aa3ca959e7d23e71db142671
 f1-k3|--in 16,16,8 --conv 8,3||b8dc7fb3a9d60ec00dd5390a71c3dabba1aa1af266a14fbafed02f7c83c4d5d8
@@ -122,10 +122,13 @@ zoo-tf-cifar-cnn|zoo:tf-cifar-cnn|--allow-none|bf2830264607ed1ab5bfa81769f253c9e
 zoo-vgg-cifar|zoo:vgg-cifar|--allow-none|86ea5e943b581e8801786498754ffe1c2b141f979c2600786e2eeb3560448583
 zoo-resnet8|zoo:resnet8|--quant 3 --allow-none|e4805a2518a369eb8675c1c2a3161988b6833348534052d692aecf91f14609ea
 zoo-ad-autoencoder|zoo:ad-autoencoder|--allow-none|9a7e9f10c28c007b143abe281c6520f5ea0e23031c58e5ddf07e5862bacfb20d
+zoo-kws-cnn|zoo:kws-cnn|--allow-none|31cc2eb2b852c5cb24336fadcb72dfa000a6de3f79fdcd0032a81d310ccd9b93
 zoo-kws-cnn-npu|zoo:kws-cnn-npu|--allow-none|31cc2eb2b852c5cb24336fadcb72dfa000a6de3f79fdcd0032a81d310ccd9b93
+zoo-magic-wand|zoo:magic-wand|--allow-none|4ea01a0020cd1b2c36d8913fdab6989879c5eb9a7b632a168f5c7ac1bc0c28fa
 zoo-magic-wand-npu|zoo:magic-wand-npu|--allow-none|4ea01a0020cd1b2c36d8913fdab6989879c5eb9a7b632a168f5c7ac1bc0c28fa
 zoo-hello-world|zoo:hello-world|--allow-none|5f69e8bc53828a6a67a0e70642d91af8acd7356cb5290f5ca68d3204632c6210
 zoo-squeezenet11-96|zoo:squeezenet11-96||5a9694211af75a9c568de0f9e7a23e3e7130e50465cbae976b1c06af00512074
+zoo-alexnet-96|zoo:alexnet-96|--allow-none|dbb85cfb46a51958c5228e4ee1e1f297824cc1aff87bed08a287a9c6ad382f6c
 zoo-alexnet-96-npu|zoo:alexnet-96-npu|--allow-none|dbb85cfb46a51958c5228e4ee1e1f297824cc1aff87bed08a287a9c6ad382f6c
 zoo-vgg11-64|zoo:vgg11-64|--allow-none|c912ada5d9a8ac97bbd724434afdae902a8677c222a3de356f5b4f0be2c2c80b
 zoo-yolov2-tiny-128|zoo:yolov2-tiny-128|--allow-none|43210e9516d32f0c743d14f95ffb34982b1bd07fc44faa3f04f1b38376da1826
@@ -135,3 +138,12 @@ zoo-mobilenet-v2-035|zoo:mobilenet-v2-035|--quant 3 --allow-none|63fa4fb0928d750
 zoo-mobilenet-v2-035-dense|zoo:mobilenet-v2-035-dense|--quant 3 --allow-none|63fa4fb0928d750ff2b5742b4638222dfbf584b36a288f606df8d4cef0b8a590
 zoo-ds-cnn|zoo:ds-cnn|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
 zoo-ds-cnn-dense|zoo:ds-cnn-dense|--allow-none|13b5e5527129d88ead05c54f6501c6b4571a47640c7a10c8ee83e265ab94462a
+restride-s-conv2x1-fc|restride:s-conv2x1-fc|--allow-none|5d3a8bda7bc46578996776bd6e151cef3df381ecf89e06f1868e2b57e1dd191e
+restride-s-conv1x3-fc|restride:s-conv1x3-fc|--allow-none|dd96df281f1fb8bae7f7d7700cbc0e2a6ec012df30ed92bb3e6cda54d68eae14
+restride-s-conv3-fc|restride:s-conv3-fc|--allow-none|cbd3e6dbdc0be6b81461a918ec2afc11350e9fd1dffe2e1a916e8f552ae3565e
+restride-s-conv4same-fc|restride:s-conv4same-fc|--allow-none|63d36386220399063fe9aa19cee4b40a7f854554b6ad17bc9e2f4fcaa92a3006
+restride-s-pool3x1-fc|restride:s-pool3x1-fc|--allow-none|517abc75a5c2cbc83cd6d6b3d4bb6d918e1258e9a994f1a06d2a435e61678d19
+restride-s-pool2s3-fc|restride:s-pool2s3-fc|--allow-none|4bf4db6fedce3a1c3c25e61e325e2d59c257684acf9d81e39f25ea302d228925
+restride-s-conv4-conv|restride:s-conv4-conv|--allow-none|8c34562f8cc0086d51918a76ad84b5c9f74b11d629847d6dc4790ae1ef99a6c2
+restride-s-pool4-conv|restride:s-pool4-conv|--allow-none|a75961fe3ca59685f465839e011084700b7065022fbbdf258adff6124404b69e
+restride-s-pool1s2-conv|restride:s-pool1s2-conv||f3d1f32778bcbcea97a1b7733c878e46ca6cd142540e1d1b5c91d997ce755637

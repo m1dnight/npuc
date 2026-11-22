@@ -18,11 +18,12 @@ int8 distribution and per-layer scales that keep every activation inside its ran
   zoo.py golden                               tests/golden.txt rows (tests/make-golden.sh) for the models whose
                                               NCP ncpgen generates exactly: name|zoo:<model>|options|sha256 of NPUC's NCP
 
-Every model is a function below (MODELS, in order). Variants named <model>-npu are the published model rewritten to
-something NPUC compiles, computing the same function (their CPU references equal the published model's byte for
-byte where npunet lowers both); -dense variants replace each depthwise convolution by the dense convolution with
-block-diagonal weights (the same function, C times the weights). Weights, biases and the reference input depend
-only on the model family and the layer's name (shake_256), so a variant shares them with its published model.
+Every model is a function below (MODELS, in order). Variants named <model>-npu are the published model rewritten by
+hand to something NPUC compiles, computing the same function (their CPU references equal the published model's byte
+for byte); npunet now makes those rewrites itself (its stride rewrites: the published model lowers to the -npu
+variant's network), and the variants remain as the cross-check. -dense variants replace each depthwise convolution
+by the dense convolution with block-diagonal weights (the same function, C times the weights). Weights, biases and
+the reference input depend only on the model family and the layer's name (shake_256), so a variant shares them with its published model.
 """
 import array
 import hashlib
@@ -480,12 +481,12 @@ KWS_SRC = ("Hello Edge CNN (Zhang et al. 2017, 'Hello Edge: Keyword Spotting on 
            "CNN-S: conv 28 10x4 s1, conv 30 10x4 s2x1, linear 16, FC 128, 12 classes)")
 
 
-@model("kws-cnn", "kws-cnn", KWS_SRC, "keyword spotting, 49x10 MFCC, 12 classes", adapt=COMMON[1:],
-       gaps=["conv stride 2x1: NPUC fails ('Couldn't find a correct processing strategy for a single node' here; "
-             "'_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain on a 40x7x28 probe); npunet refuses it "
-             "up front, naming the exact rewrite of kws-cnn-npu (an FC reads the conv); applying it automatically is "
-             "not done"],
-       expect="refused")
+@model("kws-cnn", "kws-cnn", KWS_SRC, "keyword spotting, 49x10 MFCC, 12 classes",
+       adapt=COMMON[1:] + ["the linear layers (no activation): --allow-none",
+                           "npunet rewrites conv2's stride 2x1 (NPUC fails on unequal strides: 'Couldn't find a correct "
+                           "processing strategy for a single node' here, '_strideWidth == _strideHeight' on a 40x7x28 "
+                           "probe) exactly and by itself: conv2 at stride 1, the linear layer's weights on its even rows "
+                           "and zeros on the odd ones (kws-cnn-npu's network, the same NCP)"])
 def _kws(n):
     _kws_cnn(n, False)
 
@@ -529,10 +530,12 @@ def _wand(n, npu):
 WAND_SRC = "TensorFlow Lite Micro magic_wand gesture CNN (conv 8 4x3, max pool 3x3, conv 16 4x1, max pool 3x1, FC 16, FC 4)"
 
 
-@model("magic-wand", "magic-wand", WAND_SRC, "gestures, 128 accelerometer samples x 3 axes, 4 classes", adapt=COMMON[1:],
-       gaps=["max pool 3x1 stride 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) on unequal pool "
-             "strides (vertical > horizontal); npunet refuses it up front, naming the exact rewrite of magic-wand-npu "
-             "(an FC reads the pool); applying it automatically is not done"], expect="refused")
+@model("magic-wand", "magic-wand", WAND_SRC, "gestures, 128 accelerometer samples x 3 axes, 4 classes",
+       adapt=COMMON[1:] + ["the output FC: --allow-none",
+                           "npunet rewrites the 3x1 stride-3x1 max pool (NPUC asserts 'absDiff < stride', "
+                           "PoolNodeTileBackPropagator, on a larger vertical stride) exactly and by itself: the pool at "
+                           "stride 1 VALID (40x1), the first FC's weights on rows 0, 3, ..., 39 and zeros elsewhere "
+                           "(magic-wand-npu's network, the same NCP)"])
 def _wand_pub(n):
     _wand(n, False)
 
@@ -612,11 +615,12 @@ ALEX_AD = COMMON[1:] + ["LRN dropped (torchvision's AlexNet has none)", "FC 4096
                         "explicit padding -> TFLite VALID/SAME (no PAD op)"]
 
 
-@model("alexnet-96", "alexnet-96", ALEX_SRC, "96x96x3 images (STL-10), 10 classes", adapt=ALEX_AD,
-       gaps=["conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::"
-             "IterateOverAllValues); npunet refuses it up front, naming the exact rewrite of alexnet-96-npu; applying it "
-             "automatically is not done"],
-       expect="refused")
+@model("alexnet-96", "alexnet-96", ALEX_SRC, "96x96x3 images (STL-10), 10 classes",
+       adapt=ALEX_AD + ["the output FC: --allow-none",
+                        "npunet rewrites conv1's stride 4 (NPUC asserts 'Stride > 2 is not supported here!', "
+                        "NPULIRKernelMemoryData::IterateOverAllValues) exactly and by itself: conv1 at stride 2 VALID, "
+                        "then a 1x1 stride-2 VALID conv with identity weights and multiplier 1 keeping every other row "
+                        "and column (alexnet-96-npu's network, the same NCP)"])
 def _alex_pub(n):
     _alex(n, False)
 

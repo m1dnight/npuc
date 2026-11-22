@@ -27,9 +27,10 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
   Eltwise aligns by shifts and has no zero-point term), ReLU for activations the NPU path lacks (tanh, leaky ReLU),
   `--allow-none` for layers without activation (ncpgen's corrected GReLU table, its default, makes them right on the
   NPU; NPUC's own table is right only when ceil(Cout/8) is even: docs/format/grelu.md).
-- **Variants.** `<model>-npu`: the published model rewritten so NPUC compiles it, computing the **same function** (its
-  CPU reference equals the published model's byte for byte wherever npunet lowers both: kws-cnn, magic-wand,
-  alexnet-96). `<model>-dense`: each depthwise convolution written as the dense convolution with block-diagonal
+- **Variants.** `<model>-npu`: the published model rewritten by hand so NPUC compiles it, computing the **same
+  function**. npunet now makes these rewrites itself (its stride rewrites, item 7): kws-cnn, magic-wand and alexnet-96
+  lower to their `-npu` variant's network, which NPUC compiles to the same NCP, so the `-npu` variants remain as the
+  cross-check (their CPU reference is the published network's byte for byte, `tests/rewrite_ref.py`). `<model>-dense`: each depthwise convolution written as the dense convolution with block-diagonal
   weights (the same function). NPUC itself compiles a depthwise layer exactly this way on the device path, its weight
   format skipping the zeros with bitmaps (docs/format/depthwise.md), and npunet now lowers DEPTHWISE_CONV_2D to it:
   the `-dense` variants remain as the cross-check (their NCP is their depthwise model's, byte for byte).
@@ -40,13 +41,14 @@ python3 -I models/zoo.py golden                          # tests/golden.txt rows
 
 ## Status (2026-11-22, NPUC root-314e61a6)
 
-**24 models: 20 exact, 1 fails in NPUC, 3 refused by npunet** (up front, where NPUC would assert, naming the exact
-rewrite). Every model npunet lowers has its CPU reference (`npunet.py ref`, 0.1 to 18 s). The three `-npu`
-rewrites give byte for byte the reference of the published model, and the depthwise models the reference of their
-`-dense` form. Every NCP NPUC compiled is regression data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: every
-one exact), and the 20 exact ones are rows of `tests/golden.txt`, so `tests/run.sh` regenerates them with no vendor
-file. The NPUC column's time includes
-npunet's lowering and was measured under a parallel load.
+**24 models: 23 exact, 1 fails in NPUC.** kws-cnn, magic-wand and alexnet-96 are exact as published since npunet
+rewrites the strides NPUC refuses (item 7; compiled with root-fd659af2): each lowers to its `-npu` variant's network,
+NPUC compiles it to that variant's NCP byte for byte, and its CPU reference is the published network's
+(`tests/rewrite_ref.py`, against a direct reference of the original graph on random inputs). Every model has its CPU
+reference (`npunet.py ref`, 0.1 to 18 s); the depthwise models give the reference of their `-dense` form. Every NCP
+NPUC compiled is regression data in `$NCPGEN_WORK/sweep/zoo/` (`tests/regress.sh zoo`: every one exact), and the 23
+exact ones are rows of `tests/golden.txt`, so `tests/run.sh` regenerates them with no vendor file. The NPUC column's
+time includes npunet's lowering and was measured under a parallel load.
 
 | model | input | options | lowering | NPUC | ncpgen check | CPU reference |
 |---|---|---|---|---|---|---|
@@ -57,14 +59,14 @@ npunet's lowering and was measured under a parallel load.
 | vgg-cifar | 32x32x3 | --allow-none | ok, 11 NPU layers | PASS, 685 KB, 24.5 s | **EXACT** (3 s) | c5c997d7131b, 10 B, 3.8 s |
 | resnet8 | 32x32x3 | --quant 3 --allow-none | ok, 17 NPU layers | PASS, 202 KB, 2.5 s | **EXACT** (0 s) | 29f02bf6832a, 10 B, 1.1 s |
 | ad-autoencoder | 1x1x640 | --allow-none | ok, 10 NPU layers | PASS, 463 KB, 4.5 s | **EXACT** (0 s) | 533c72a18436, 640 B, 0.2 s |
-| kws-cnn | 49x10x1 | --allow-none | refused: l2_conv2: conv strides 2x1: NPUC wants equal strides (it asserts '_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain, or finds no processing strategy); when only a FULLY_CONNECTED reads it, the same function is the conv at stride 1 with the FC's weights on every 2-th row, zeros elsewhere (models/README.md, kws-cnn-npu) | - | - | - |
+| kws-cnn | 49x10x1 | --allow-none | ok, 5 NPU layers (stride 2x1 rewritten) | PASS, 116 KB, 10.6 s | **EXACT** (0 s) | 7a44e7c3827a, 12 B, 0.5 s |
 | kws-cnn-npu | 49x10x1 | --allow-none | ok, 5 NPU layers | PASS, 116 KB, 3.2 s | **EXACT** (0 s) | 7a44e7c3827a, 12 B, 0.4 s |
 | micro-speech | 49x40x1 | --allow-none | ok, 2 NPU layers | FAIL: (nzvSize & 0xFE00) == 0 | - | 0336eae2a362, 4 B, 0.1 s |
-| magic-wand | 128x3x1 | --allow-none | refused: l4_pool2: pooling strides 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) when the vertical stride is the larger; when only a FULLY_CONNECTED reads it, the same function is the pool at vertical stride 1 with the FC's weights on every 3-th row, zeros elsewhere (models/README.md, magic-wand-npu) | - | - | - |
+| magic-wand | 128x3x1 | --allow-none | ok, 6 NPU layers (pooling stride 3x1 rewritten) | PASS, 17 KB, 11.2 s | **EXACT** (0 s) | ddc82277175a, 4 B, 0.1 s |
 | magic-wand-npu | 128x3x1 | --allow-none | ok, 6 NPU layers | PASS, 17 KB, 10.0 s | **EXACT** (0 s) | ddc82277175a, 4 B, 0.1 s |
 | hello-world | 1x1x1 | --allow-none | ok, 3 NPU layers | PASS, 9 KB, 1.6 s | **EXACT** (0 s) | 2b4c342f5433, 1 B, 0.1 s |
 | squeezenet11-96 | 96x96x3 | - | ok, 38 NPU layers | PASS, 1162 KB, 5.9 s | **EXACT** (1 s) | 4951801caa0a, 10 B, 4.5 s |
-| alexnet-96 | 96x96x3 | --allow-none | refused: l1_conv1: conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::IterateOverAllValues); the same output: the conv at stride 2, then a 1x1 stride-2 VALID conv with identity weights and multiplier 1 keeping every other row and column (models/README.md, alexnet-96-npu) | - | - | - |
+| alexnet-96 | 96x96x3 | --allow-none | ok, 12 NPU layers (stride 4 rewritten) | PASS, 4576 KB, 16.5 s | **EXACT** (3 s) | 6d9704d8711f, 10 B, 9.5 s |
 | alexnet-96-npu | 96x96x3 | --allow-none | ok, 12 NPU layers | PASS, 4576 KB, 17.9 s | **EXACT** (43 s) | 6d9704d8711f, 10 B, 9.5 s |
 | vgg11-64 | 64x64x3 | --allow-none | ok, 16 NPU layers | PASS, 3838 KB, 122.5 s | **EXACT** (14 s) | 5456870cc263, 200 B, 16.0 s |
 | yolov2-tiny-128 | 128x128x3 | --allow-none | ok, 15 NPU layers | PASS, 4607 KB, 99.8 s | **EXACT** (20 s) | b4805006f2b0, 2000 B, 9.0 s |
@@ -78,8 +80,8 @@ npunet's lowering and was measured under a parallel load.
 Per published model: LeNet-5, the Keras MNIST convnet and MLP, the TensorFlow CIFAR CNN, a VGG-style CIFAR CNN, the
 DCASE/MLPerf Tiny autoencoder, the TFLM sine model, SqueezeNet 1.1, VGG-11, Tiny YOLOv2 and ResNet-8 are **exact as
 published** (with the generic adaptations above; ResNet-8's SAME 1x1 stride-2 shortcuts, the vector models' `[1, N]`
-inputs and SqueezeNet's MEAN as Keras writes them). The Hello Edge KWS CNN, magic wand and AlexNet are **exact after an
-exact rewrite** (`-npu`; npunet refuses the published forms up front, where NPUC would assert, and names the rewrite).
+inputs and SqueezeNet's MEAN as Keras writes them). The Hello Edge KWS CNN, magic wand and AlexNet are **exact as
+published** too, through npunet's exact stride rewrites (item 7: their `-npu` networks, made automatically).
 MobileNet v1 is **exact as published** (DEPTHWISE_CONV_2D and TFLite's ReLU6 quantisation: npunet lowers each depthwise
 layer to the dense block-diagonal conv, and NPUC's NCP for the depthwise form is the `-dense` form's byte for byte);
 MobileNet v2 lowers and compiles the same way and is exact too (with its adaptations; its MEAN as Keras writes it);
@@ -178,21 +180,43 @@ What unblocks the most models for the least work comes first. Items marked done 
    `[1, N]` (mnist-mlp, ad-autoencoder, hello-world as Keras writes them) is the same tensor as `[1, 1, 1, N]`. SAME
    padding whose pad would be negative (resnet8's 1x1 stride-2 shortcuts: "SAME padding with stride 2 > kernel 1 leaves
    a negative pad") is VALID in TFLite, which clamps the pad at 0. **Effort: an hour or two for the three.**
-7. **Done (2026-11-22) for the refusals: npunet: refuse what NPUC asserts on, or rewrite it exactly** (conv strides
-   over 2 or unequal, pooling strides larger than the kernel or with the vertical one larger, each refusal naming the
-   rewrite; pooling strides with the horizontal one larger compile in NPUC but ncpgen's streams do not model them
-   (2 probes, `$NCPGEN_WORK/zoo-evidence/probe-pool/`): refused too; the stride-3 pool on a width-1 map has one data
-   point, not refused; the rewrites are not automatic). npunet lowered these and NPUC then aborted:
-   conv stride > 2 (alexnet-96: "Stride > 2 is not supported here!"), unequal conv strides (kws-cnn's 2x1), unequal
-   pool strides (magic-wand's 3x1), any stride-3 pool on a width-1 map, a pool stride larger than its kernel. Two exact
-   rewrites, applied by hand in the zoo, could be automatic:
-   - conv stride 4 VALID -> stride 2 VALID, then a 1x1 stride-2 VALID identity conv (multiplier exactly 1) that keeps
-     every other row and column (alexnet-96-npu). A 1x1 stride-2 max pool would do the same, but NPUC refuses it
-     ("ncp_nfu_pooling: Invalid parameters! The stride value should be equal or less than the size of kernel").
-   - a stride-(s, 1) conv or pool read only by an FC -> stride 1, with the FC's weights on every s-th row and zeros
-     elsewhere (kws-cnn-npu, magic-wand-npu).
+7. **Done (2026-11-22): npunet: rewrite the strides NPUC asserts on, exactly, or refuse them** (`npunet.restride_plan`,
+   `_lower_restrided`; kws-cnn, magic-wand and alexnet-96 exact as published). The strides NPUC refuses (`stride_issue`,
+   V): conv strides over 2 or unequal; pooling strides over 3, larger than the kernel, or unequal (a larger vertical
+   one asserts `absDiff < stride`; a larger horizontal one compiles but ncpgen's streams do not model it, 2 probes in
+   `$NCPGEN_WORK/zoo-evidence/probe-pool/`). Such a conv, depthwise conv or pooling runs instead at the largest equal
+   stride t NPUC takes that divides both strides, VALID or else SAME, whichever puts a window on every original one
+   (output i of stride s and pad p reads the inputs from s i - p, output j of stride t and pad p' from t j - p', so
+   i is j = (s / t) i + (p' - p) / t; windows over the same inputs give the same value, the border being the zero point
+   in both and a pooling's window clipped alike). Then the positions the original keeps are selected:
+   - **by the FULLY_CONNECTED that alone reads the layer** (directly or through a RESHAPE): its weights on the kept rows
+     and columns, the weight zero point elsewhere. Every accumulator is the original's, so this is **exact for any
+     quantisation, bias and weight scales** (per-channel too). kws-cnn (conv 2x1), magic-wand (pool 3x1), and in the
+     sweep: conv 2x1 SAME, conv 1x3, conv 3 SAME, conv 4 SAME (rows 2, 6, 10, 14), pool 2x2 stride 3, average pool 3x1;
+   - **for strides 2t, whatever reads it**: a 1x1 stride-2 VALID conv with identity weights, weight scale 1, bias 0 and
+     its input's quantisation. NPUC's multiplier is then exactly 256 / 2^8 = 1 (npunet checks it and refuses
+     otherwise), so out = zp + (x - zp) = x, and the clamp changes nothing. **Exact under ReLU only when the input is >=
+     its zero point** (the output of a ReLU conv, or a pooling of one: ReLU, a no-op there); otherwise it needs 'none'
+     (refused without `--allow-none`; right on the NPU with ncpgen's corrected GReLU table, NPUC's own only for
+     ceil(C/8) even). alexnet-96 (conv 4), and in the sweeps: conv 3x3 / 4x4 stride 4, max and average pools 4x4
+     stride 4, a 2x2 stride-4 pool on the network input (none), TF-slim's 1x1 stride-2 max pool (no pooling at all: a
+     1x1 pooling at stride 1 is its input).
 
-   **Effort: the refusals an hour, the rewrites half a day.**
+   NPUC refuses every other subsampling conv (V, `$NCPGEN_WORK/zoo-evidence/probe-stride`: a 1x1 identity conv after a
+   3x3 conv on 16x16x8 asserts `_strideWidth == _strideHeight` at strides 2x1, 1x2 and 3x1 and "Stride > 2 is not
+   supported here!" at 3 and 4; at 2 it compiles, ncpgen exact, ReLU or none), and a 1x1 pooling cannot subsample
+   (stride > kernel). So npunet refuses, naming why: unequal strides not read by an FC alone (a 2x1 conv read by a
+   conv), strides whose remaining step is not 2 (3, 5, a pool 8x8 stride 8: steps 4 and 8), and SAME strides 4 whose
+   stride-2 windows do not start at the first position. A max pool with kernel = stride could also be split into a
+   cascade of smaller max pools (exact: a max of maxes; not for average pools, rounded twice): not done.
+   Proofs: npunet's selftest (each form's reference against the network lowered with its strides as they are,
+   `lower(..., npuc_strides=False)`, on random inputs; the refusals), `tests/rewrite_ref.py` in `tests/run.sh` (the
+   three published models and a network per form against a direct NHWC reference of the original graph written in the
+   test, random inputs), and NPUC: the three models compile to the `-npu` variants' NCPs byte for byte, the 9 networks
+   of `$NCPGEN_WORK/sweep/restride` (`tests/rewrite_ref.py --write`) and the 5 sweep networks npunet refused before and
+   now rewrites (`$NCPGEN_WORK/sweep/restride-unseen`: poollim's 4x4 stride-4 pools, the weights sweep's 4x4 stride-4
+   conv; nobody had looked at them for this) compile, and ncpgen is exact on all 17 (`tests/regress.sh`; the 12 of
+   the zoo and `restride` are golden rows).
 8. **micro-speech** (the FC over 25x20x8 as a 25x20 conv: `(nzvSize & 0xFE00) == 0`). Covering it needs the bitmask
    limit of 5 and then a split of the FC into partial convs whose partial sums are requantised (lossy). Low value for
    the effort (**a day**); refusing it cleanly comes with 5.
@@ -212,6 +236,9 @@ What unblocks the most models for the least work comes first. Items marked done 
 | max pool 3x3 stride 3 SAME on a 42x1 map | asserts "Tried to split a tensor's shape into zero tiles" | probe |
 | max pool 3x1 stride 3x3 on a 42x1 map | fails | probe |
 | max pool 1x1 stride 2 | "The stride value should be equal or less than the size of kernel" | alexnet-96-npu, first try |
+| 1x1 identity conv at strides 2x1, 1x2, 3x1 (after a 3x3 conv, 16x16x8) | asserts `_strideWidth == _strideHeight` (PNodeConvolution::toAtomicChain) | `probe-stride/` |
+| 1x1 identity conv at stride 3 or 4 | asserts "Stride > 2 is not supported here!" | `probe-stride/` |
+| 1x1 identity conv at stride 2, ReLU or none | compiles; ncpgen exact | `probe-stride/`, alexnet-96, `sweep/restride*` |
 | conv 25x20 VALID over 8 (or 4) channels, 13x20 over 8 | asserts `(nzvSize & 0xFE00) == 0` | micro-speech, probes |
 | conv 25x5/64, 16x4/30, 15x4/16, 14x14/16, 15x15/8, 25x10/8, 12x20/8, 14x18/8, 25x20/1, 49x1/8, 1x40/8 VALID | compile; ncpgen exact | ds-cnn-dense, kws-cnn-npu, probes |
 | conv 16x16/8, 20x13/8 VALID (random weights) | compile; ncpgen refuses ("a sub-batch would hold no channel pair") | probes |
@@ -223,8 +250,8 @@ What unblocks the most models for the least work comes first. Items marked done 
 | conv kernel side > 64 | not measured (our harness takes 1..64) | gap_sweep |
 | max pool 2x2 stride 1 SAME, 3x3 stride 3 SAME/VALID on 128x3/129x3, 3x1 stride 1 on 42x1 | compile; ncpgen exact | yolov2-tiny-128, magic-wand-npu, probes |
 
-The probes' networks (`probe-src/`, npu-net/1 JSON, our weights) and NPUC's outputs (`probe/`, `probe3/`,
-`probe-pool/`, `gaplim-defect/`) are in `$NCPGEN_WORK/zoo-evidence/` (outside `sweep/`, so `regress.sh` does not take
+The probes' networks (`probe-src/`, npu-net/1 JSON, our weights; `probe-stride/<probe>/model.json`) and NPUC's outputs
+(`probe/`, `probe3/`, `probe-pool/`, `probe-stride/`, `gaplim-defect/`) are in `$NCPGEN_WORK/zoo-evidence/` (outside `sweep/`, so `regress.sh` does not take
 them), with the resnet8 ordering variants (`order/`: add inputs swapped, shortcut first, both).
 
 ## The models
@@ -289,9 +316,8 @@ them), with the resnet8 ordering variants (`order/`: add inputs swapped, shortcu
 - **Source**: Hello Edge CNN (Zhang et al. 2017, 'Hello Edge: Keyword Spotting on Microcontrollers'; ARM ML-KWS-for-MCU CNN-S: conv 28 10x4 s1, conv 30 10x4 s2x1, linear 16, FC 128, 12 classes)
 - **Task / input**: keyword spotting, 49x10 MFCC, 12 classes; input 49x10x1 int8 (scale 0.6, zero point 80)
 - **Ops**: conv2d 10x4, conv2d 10x4/2x1, reshape, fully_connected x3, softmax; 0.07 M weights; output 1x1x12; `--allow-none`
-- **Adaptations**: dropout removed (inference)
-- **Missing for the published form**: conv stride 2x1: NPUC fails ('Couldn't find a correct processing strategy for a single node' here; '_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain on a 40x7x28 probe); npunet refuses it up front, naming the exact rewrite of kws-cnn-npu (an FC reads the conv); applying it automatically is not done
-- **Status**: refused (lowering: refused: l2_conv2: conv strides 2x1: NPUC wants equal strides (it asserts '_strideWidth == _strideHeight' in PNodeConvolution::toAtomicChain, or finds no processing strategy); when only a FULLY_CONNECTED reads it, the same function is the conv at stride 1 with the FC's weights on every 2-th row, zeros elsewhere (models/README.md, kws-cnn-npu); NPUC: -; ncpgen check: -)
+- **Adaptations**: dropout removed (inference); the linear layers (no activation): --allow-none; npunet rewrites conv2's stride 2x1 (NPUC fails on unequal strides: 'Couldn't find a correct processing strategy for a single node' here, '_strideWidth == _strideHeight' on a 40x7x28 probe) exactly and by itself: conv2 at stride 1, the linear layer's weights on its even rows and zeros on the odd ones (kws-cnn-npu's network, the same NCP)
+- **Status**: exact (lowering: ok, 5 NPU layers; NPUC: PASS, 116 KB, 10.6 s; ncpgen check: EXACT (0 s))
 
 ### kws-cnn-npu
 
@@ -315,9 +341,8 @@ them), with the resnet8 ordering variants (`order/`: add inputs swapped, shortcu
 - **Source**: TensorFlow Lite Micro magic_wand gesture CNN (conv 8 4x3, max pool 3x3, conv 16 4x1, max pool 3x1, FC 16, FC 4)
 - **Task / input**: gestures, 128 accelerometer samples x 3 axes, 4 classes; input 128x3x1 int8 (scale 15.748, zero point 0)
 - **Ops**: conv2d 4x3, max_pool2d x2, conv2d 4x1, reshape, fully_connected x2, softmax; 0.00 M weights; output 1x1x4; `--allow-none`
-- **Adaptations**: dropout removed (inference)
-- **Missing for the published form**: max pool 3x1 stride 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) on unequal pool strides (vertical > horizontal); npunet refuses it up front, naming the exact rewrite of magic-wand-npu (an FC reads the pool); applying it automatically is not done
-- **Status**: refused (lowering: refused: l4_pool2: pooling strides 3x1: NPUC asserts 'absDiff < stride' (PoolNodeTileBackPropagator) when the vertical stride is the larger; when only a FULLY_CONNECTED reads it, the same function is the pool at vertical stride 1 with the FC's weights on every 3-th row, zeros elsewhere (models/README.md, magic-wand-npu); NPUC: -; ncpgen check: -)
+- **Adaptations**: dropout removed (inference); the output FC: --allow-none; npunet rewrites the 3x1 stride-3x1 max pool (NPUC asserts 'absDiff < stride', PoolNodeTileBackPropagator, on a larger vertical stride) exactly and by itself: the pool at stride 1 VALID (40x1), the first FC's weights on rows 0, 3, ..., 39 and zeros elsewhere (magic-wand-npu's network, the same NCP)
+- **Status**: exact (lowering: ok, 6 NPU layers; NPUC: PASS, 17 KB, 11.2 s; ncpgen check: EXACT (0 s))
 
 ### magic-wand-npu
 
@@ -348,9 +373,8 @@ them), with the resnet8 ordering variants (`order/`: add inputs swapped, shortcu
 - **Source**: AlexNet (Krizhevsky et al. 2012), torchvision widths 64-192-384-256-256: conv 11x11/4, max pools 3/2, three FC layers
 - **Task / input**: 96x96x3 images (STL-10), 10 classes; input 96x96x3 int8 (scale 0.00392157, zero point -128)
 - **Ops**: conv2d 11x11/4, max_pool2d x3, conv2d 5x5, conv2d 3x3 x3, reshape, fully_connected x3, softmax; 3.79 M weights; output 1x1x10; `--allow-none`
-- **Adaptations**: dropout removed (inference); LRN dropped (torchvision's AlexNet has none); FC 4096-4096 -> 1024-1024 for 10 classes (STL-10); explicit padding -> TFLite VALID/SAME (no PAD op)
-- **Missing for the published form**: conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::IterateOverAllValues); npunet refuses it up front, naming the exact rewrite of alexnet-96-npu; applying it automatically is not done
-- **Status**: refused (lowering: refused: l1_conv1: conv stride 4: NPUC asserts 'Stride > 2 is not supported here!' (NPULIRKernelMemoryData::IterateOverAllValues); the same output: the conv at stride 2, then a 1x1 stride-2 VALID conv with identity weights and multiplier 1 keeping every other row and column (models/README.md, alexnet-96-npu); NPUC: -; ncpgen check: -)
+- **Adaptations**: dropout removed (inference); LRN dropped (torchvision's AlexNet has none); FC 4096-4096 -> 1024-1024 for 10 classes (STL-10); explicit padding -> TFLite VALID/SAME (no PAD op); the output FC: --allow-none; npunet rewrites conv1's stride 4 (NPUC asserts 'Stride > 2 is not supported here!', NPULIRKernelMemoryData::IterateOverAllValues) exactly and by itself: conv1 at stride 2 VALID, then a 1x1 stride-2 VALID conv with identity weights and multiplier 1 keeping every other row and column (alexnet-96-npu's network, the same NCP)
+- **Status**: exact (lowering: ok, 12 NPU layers; NPUC: PASS, 4576 KB, 16.5 s; ncpgen check: EXACT (3 s))
 
 ### alexnet-96-npu
 
