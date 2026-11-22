@@ -44,9 +44,10 @@ Python: `python3 -I`, standard library only. The host has docker (arm64 containe
 
 ## Where things stand (2026-11-22)
 
-Byte-exact with NPUC on every compiled network except NPUC's 7 uninitialised-byte eltwises (`tests/regress.sh`).
-Depthwise: NPUC compiles it as a dense block-diagonal conv, which ncpgen already generates (docs/format/depthwise.md);
-npunet.py must still lower DEPTHWISE_CONV_2D to it. Common models: `models/` (models/README.md). Not supported yet:
-channel split/slice, other activations (leaky ReLU, SiLU; the NCP has a LUT memory type),
-upsampling (NPUC's deconvolution crashed in the harness), several outputs. Nothing beyond one example has been run on
-the NPU; the NPU runs are done elsewhere (the nervesinator porting kit).
+Byte-exact with NPUC on every compiled network (`tests/regress.sh`) except NPUC's 7 uninitialised-byte eltwises and 3
+graph blocks NPUC tiles inside a graph. Common models: `models/` (20 of 24 exact; models/README.md). Depthwise is lowered
+to the dense block-diagonal conv NPUC itself compiles (docs/format/depthwise.md; NPUC's own depthwise-optimised path is
+off on the device and unproven on the NPU). Not supported yet: tiling inside a graph, channel split/slice, other
+activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling (NPUC's deconvolution crashed in the
+harness), several outputs. Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the
+nervesinator porting kit).

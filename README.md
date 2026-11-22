@@ -12,15 +12,19 @@ gets wrong (its activation table, below).
 
 | | |
 |---|---|
-| Byte-exact with NPUC | about 3150 of about 3250 compiled networks, every developed set at its maximum; the misses are 7 networks whose NCPs NPUC fills with uninitialised bytes (it differs from itself) and part of a sweep built to stress short weight rings (in progress) |
-| Without any vendor file | `tests/run.sh`: 109 of our own networks regenerated, each NCP equal by sha256 to NPUC's |
+| Byte-exact with NPUC | every compiled network of every developed set (about 3450 networks, `tests/regress.sh`) except 7 whose NCPs NPUC fills with uninitialised bytes (it differs from itself) and 3 graph blocks NPUC tiles inside a graph (ncpgen refuses them) |
+| Common models | `models/`: 20 of 24 generated exactly, among them LeNet-5, CIFAR CNNs, ResNet-8, SqueezeNet, VGG-11, a YOLOv2-tiny, MobileNet v1 0.25 and v2 0.35, DS-CNN, the MLPerf Tiny autoencoder; 3 more after a named rewrite (NPUC refuses strides above 2), 1 that NPUC itself fails on (`models/README.md`) |
+| Without any vendor file | `tests/run.sh`: our own networks (the corpus, a final unseen set, the zoo) regenerated, each NCP equal by sha256 to NPUC's, and the zoo's TFLite forms checked |
 | On the NPU | the example network (`ncpgen gen` of npunet's example writes the exact NCP of a bit-exact NPU run); the rest is predicted, with a run plan in the porting kit |
 
-Operations: CONV_2D (kernels 1..13, VALID up to 14, stride 1/2, SAME/VALID, ReLU or none), MAX/AVERAGE_POOL_2D (strides up to
-3), global average pooling (as a conv), FULLY_CONNECTED (as a conv), ADD (quant mode 3, power-of-two scales), CONCATENATION
-(channels), standalone RELU; RESHAPE and SOFTMAX after the NPU part run on the CPU. Quant modes 1 (uint8) and 3 (int8),
-one weight scale per layer. Large layers: NPUC's tiling policy (read from its code), weight rings, its command-queue
-split. Not yet: depthwise convolutions, other activations (leaky ReLU, SiLU), upsampling, channel split, several outputs.
+Operations: CONV_2D (kernels 1..13, VALID up to 14, stride 1/2, SAME/VALID, ReLU, ReLU6 where TFLite's clamp is a no-op,
+or none), DEPTHWISE_CONV_2D (multiplier 1; compiled, as NPUC does on this path, as a dense block-diagonal conv),
+MAX/AVERAGE_POOL_2D (strides up to 2-3, as NPUC allows), global average pooling and MEAN (as a conv, within NPUC's
+packing limits), FULLY_CONNECTED (as a conv), ADD (quant mode 3, power-of-two scales), CONCATENATION (channels),
+standalone RELU; RESHAPE and SOFTMAX after the NPU part run on the CPU. Quant modes 1 (uint8) and 3 (int8), one weight
+scale per layer (per-channel scales folded with `--fold-per-channel`, lossy). Large layers: NPUC's tiling policy (read
+from its code), weight rings, its command-queue split, its batch scheduling. Not yet: other activations (leaky ReLU,
+SiLU), upsampling, channel split, several outputs, tiling inside a graph.
 
 NPUC's defects ncpgen knows (`docs/format/grelu.md`, `docs/format/frame.md` section 9): its activation (GReLU) table is
 the DRUs' slope and zero-point slots read as one piece table, right only when ceil(Cout/8) is even; ncpgen writes the

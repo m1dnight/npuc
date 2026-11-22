@@ -158,7 +158,10 @@ def _min_batches(vals, K, nch):
         return 1
     cpb = maxrec // K // IL * IL
     if cpb == 0:
-        raise ValueError("a sub-batch would hold no channel pair: NPUC divides by zero")
+        # no channel pair fits the counter's run (a global-average-pool conv's long kernel): NPUC divides by zero, ARM's
+        # udiv gives 0, and updateBatchesForFile's maximum ignores a 0: one sub-batch per core (V: models/gap_sweep.py,
+        # the 5 quant-1 GAP convs of $NCPGEN_WORK/sweep/gaplim, exact with this; docs/format/weights.md)
+        return 0
     nb = cdiv(nch, cpb)
     if nch % nb and cdiv(cdiv(nch, nb), IL) * IL * K < maxrec:
         return nb
@@ -170,13 +173,15 @@ def _min_batches(vals, K, nch):
 def _max_batches(geo):
     """tryBuildData's maxPossibleBatches (decompiled, @0x3c5794; its debug line 'kernel VKH x VKW numInputChannels N
     maxPossibleBatches = M' is in the log): the smallest divisor of the channels per IDP (numInputChannels / IDPs =
-    getNumChannelsPerIDP = vcpc) >= max(ceil(K * vcpc / 1016), ceil(K * vcpc / 511))"""
+    getNumChannelsPerIDP = vcpc) >= max(ceil(K * vcpc / 1016), ceil(K * vcpc / 511)); 1 when no divisor is that large
+    (V: the 64x8 and 32x16 global-pool convs of $NCPGEN_WORK/sweep/gaplim, where NPUC logs "maxPossibleBatches = 1",
+    then fails its bitmap-size assertion, which _chunk's refusal mirrors)"""
     K = geo["vk"][0] * geo["vk"][1]
     vc = geo["vcpc"]
     bound = max(cdiv(K * vc, MAX_NZV), cdiv(K * vc, MAX_VALUES))
-    while vc % bound:
+    while bound <= vc and vc % bound:
         bound += 1
-    return bound
+    return bound if bound <= vc else 1
 
 
 def sub_batches(L, quant_mode=1, geo=None, planner=False):
