@@ -7,6 +7,8 @@ NPUC's Eltwise needs).
   stream_graphs.py write <dir> [--set split]      <dir>/<name>.json for every variant
   stream_graphs.py compile <dir> [name...] [--set split]   write, then npuc-local.sh each into <dir>/<name>/ (NPU_ROOT
                                                            below)
+  stream_graphs.py random <dir> <seed> [count] [--set split|large]   seeded random graphs, compiled (large: 64..160 px
+                                                           maps that NPUC tiles inside the graph)
   --set split: graphs with layers NPUC splits over several groups (its CMDQ cut, cmdq.md 7d) or tiles
 """
 import argparse
@@ -354,6 +356,52 @@ def random_split_net(name, seed):
     return n
 
 
+def random_large_net(name, seed):
+    """a seeded random graph at 64..160 px whose feature maps pass the SRAM (the unseen test of tiling inside a graph,
+    frame.md 6.11): a stem, then 2 to 4 blocks (a concat of 2 or 3 conv branches, a residual block, a conv chain, a
+    pool), downsampling now and then; a residual's eltwise is kept within 256 KiB per core (NPUC asserts when it would
+    have to tile one: models/README.md)"""
+    r = random.Random(seed)
+    h = r.choice([64, 80, 96, 112, 128, 160])
+    n = Net(name, h, h, r.choice([3, 8, 16, 32]), seed)
+    k = [0]
+
+    def nm(p):
+        k[0] += 1
+        return "%s%d" % (p, k[0])
+
+    def mem(t):                 # an NPUC feature-map estimate (common.fm_memory)
+        c, (hh, ww) = n.ch[t], n.hw[t]
+        pl = -(-c // 2)
+        cores = -(-pl // -(-pl // 4))
+        return 2 * (-(-ww // 8) * 8) * (-(-hh // 4) * 4) * (-(-pl // cores) * cores // cores)
+
+    def conv(t, c, kk=None, s=1, act="relu", out=1 / 128):
+        return n.conv(nm("c"), t, c, k=kk or r.choice([1, 3, 3, 5]), stride=s, act=act, out=out)
+
+    t = conv("image", r.choice([16, 32, 48, 64]), kk=3, s=r.choice([1, 2]))
+    for _ in range(r.randint(2, 4)):
+        kind = r.choice(["cat", "cat", "res", "chain", "pool"])
+        if kind == "cat":
+            br = [conv(t, r.choice([16, 32, 64, 96, 128])) for _ in range(r.choice([2, 2, 3]))]
+            t = n.concat(nm("k"), br)
+        elif kind == "res":
+            if 3 * mem(t) > 0x40000 or n.ch[t] > 128:
+                t = conv(t, r.choice([16, 32, 64]), kk=3, s=2)
+            if 3 * mem(t) > 0x40000:
+                continue
+            c = n.ch[t]
+            b = conv(conv(t, c, kk=3), c, kk=3, act="none", out=1 / 256)
+            t = n.add(nm("a"), b, t, act=r.choice(["relu", "none"]), out=1 / 128)
+        elif kind == "chain":
+            for _ in range(r.randint(2, 3)):
+                t = conv(t, r.choice([16, 32, 64, 96]), s=r.choice([1, 1, 2]) if min(n.hw[t]) >= 16 else 1)
+        elif min(n.hw[t]) >= 16:
+            t = n.pool(nm("p"), t, kind=r.choice(["max", "avg"]), k=r.choice([2, 3]), s=2)
+    t = conv(t, r.choice([8, 16, 32]), kk=r.choice([1, 3]))
+    return n
+
+
 def random_net(name, seed):
     """a seeded random graph: a stem, then 1 to 4 blocks (residual from the input or a computed tensor, add of two
     branches, concat of 2 or 3 branches, a standalone ReLU or ReLU6 after a pool, add or concat, pools between)"""
@@ -422,14 +470,15 @@ def main(argv=None):
         p.add_argument("dir")
         p.add_argument("names", nargs="*")
         p.add_argument("--set", choices=("main", "split"), default="main")
-    p = sub.add_parser("random", help="random graph networks g<seed> (--set split: wide ones, s<seed>), compiled")
+    p = sub.add_parser("random", help="random graph networks g<seed> (--set split: wide ones, s<seed>; --set large: "
+                                      "64..160 px ones NPUC tiles, t<seed>), compiled")
     p.add_argument("dir")
     p.add_argument("seed", type=int)
     p.add_argument("count", type=int, nargs="?", default=40)
-    p.add_argument("--set", choices=("main", "split"), default="main")
+    p.add_argument("--set", choices=("main", "split", "large"), default="main")
     a = ap.parse_args(argv)
     if a.cmd == "random":
-        f, pre = (random_split_net, "s") if a.set == "split" else (random_net, "g")
+        f, pre = {"split": (random_split_net, "s"), "large": (random_large_net, "t")}.get(a.set, (random_net, "g"))
         V = {"%s%03d" % (pre, s): f("%s%03d" % (pre, s), s) for s in range(a.seed, a.seed + a.count)}
         names = list(V)
     else:

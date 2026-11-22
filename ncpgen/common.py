@@ -122,6 +122,18 @@ def exec_order(out, ins, cons, src):
     return order
 
 
+SRAM_PER_IDP = 0x40000    # V: one IDP's SRAM, the bound of every NPUC memory estimate
+
+
+def fm_memory(chw):
+    """a feature map's per-IDP memory as NPUC's estimates count it (PFeatureShape::requiredMemory, frame.md 6.10):
+    ceil(C / 2) planes rounded up to the IDPs used, each rup(H, 4) x 2 rup(W, 8) bytes"""
+    C, H, W = chw
+    planes = cdiv(C, 2)
+    n = cdiv(planes, cdiv(planes, 4))
+    return 2 * rup(W, 8) * rup(H, 4) * (rup(planes, n) // n)
+
+
 def feeds_eltwise(t, by, cons):
     """an eltwise reads tensor t, or reads one of the one-input layers (conv, pool, ReLU) below it"""
     for r in cons.get(t, []):
@@ -141,6 +153,11 @@ def concat_in_sram(name, out, by, ins, cons):
         return False
     if not all(by[i]["kind"] == "pool" or (by[i]["kind"] == "conv" and by[i]["out_chw"][0] % 16 == 0)
                for i in ins[name]):
+        return False
+    if fm_memory(by[name]["out_chw"]) >= SRAM_PER_IDP:
+        # NPUC's layer-block forwarding ("Concat in SRAM", LayerBlockFMSharingCalculator::tryProcessInternalNode):
+        # the concat's own memory is held for the whole block, so a block node finds SRAM - that < 1 left: "is too
+        # fat", the concat goes to DRAM (V: graph-split cat96-64, 128 channels at 96 x 96)
         return False
     readers = cons.get(name, [])
     if any(by[r]["kind"] == "eltwise" for r in readers):

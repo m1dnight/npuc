@@ -1,0 +1,19 @@
+# Tiling inside a graph (frame part, graph path): which tensors stay in SRAM ("feature-map forwarding" for layer-blocks:
+# input sharing, concat in SRAM, full forwarding and their "too fat" refusals), the eltwise node's memory estimate and
+# back-propagator (it cannot be tiled), and how strata grow over multi-input nodes
+str:is too fat
+str:Concat in SRAM
+str:Full feature-map forwarding
+str:Input sharing
+str:Feature-map forwarding for layer-blocks
+str:Bulb start node
+str:a new layer-block was found
+str:layer-block succeeded
+sym:FullFFCalculator
+sym:SingleTileBackPropagator
+sym:PNodeEltwise
+sym:PNodeConcat
+sym:LayerBlock
+sym:Bulb
+sym:NewPolicyMaker18markNodesToBeTiled
+sym:NewPolicyMaker20performStratumTiling

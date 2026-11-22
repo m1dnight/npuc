@@ -1,0 +1,22 @@
+# Tiling inside a graph, second pass: the feature-map forwarding calculators' memory hooks (initial memory of a
+# layer-block head, the memory an internal node adds) and the node-memory getters they call
+sym:ConcatInSramCalculator
+sym:InputSharingCalculator
+sym:FullFFCalculator
+sym:bulbInternalStructureSupported
+sym:LayerBlockFMSharingCalculator
+sym:PNode.*getOutputMemory
+sym:PNode.*requiredMemory
+sym:PNodeOperation.*getOfmMemory
+sym:PNode15getMemoryOfOfm
+sym:PNode.*Memory
+sym:PNodeConcat
+sym:PNodeData
+sym:isTiled
+sym:NewPolicyMaker.*Optimiz
+sym:NewPolicyMaker.*apply
+str:opt_memory_for_concat_in_sram
+str:opt_concat_in_sram_available
+str:opt_input_sharing_available
+str:opt_full_ff_available
+str:ahead_concat_size

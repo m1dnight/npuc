@@ -385,7 +385,8 @@ def _segments(name, low, ins, cons, by):
     L = by.get(name)
     if L is not None and L["kind"] == "pool" and len(cons.get(name, [])) == 1:
         return _segments(L["input"], low, ins, cons, by)
-    if L is not None and L["kind"] == "concat" and concat_in_sram(name, _output(low, cons), by, ins, cons):
+    if L is not None and L["kind"] == "concat" and concat_in_sram(name, _output(low, cons), by, ins, cons) \
+            and not _concat_tiled(name, low, ins, cons):
         segs, base = [], 0
         for i in ins[name]:
             c = _channels(i, low, by)
@@ -393,6 +394,27 @@ def _segments(name, low, ins, cons, by):
             base += c
         return segs
     return [(0, _channels(name, low, by))]
+
+
+_POLICY_DEPTH = [0]
+
+
+def _concat_tiled(name, low, ins, cons):
+    """a concat one of whose producers or readers NPUC tiles stays in DRAM (frame.graph_policy, frame.md 6.11; the
+    stream part's rule). While the policy itself is computed (it asks for the weight sizes), the structural rule
+    alone (G: the policy then sizes those readers' blocks in the SRAM order)"""
+    if _POLICY_DEPTH[0]:
+        return False
+    from ncpgen import frame
+    _POLICY_DEPTH[0] += 1
+    try:
+        pol = frame.graph_policy(low)
+    except Exception:
+        return False
+    finally:
+        _POLICY_DEPTH[0] -= 1
+    tiled = {x for st in pol["strata"] for x in st["layers"]}
+    return any(x in tiled for x in ins[name] + cons.get(name, []))
 
 
 def _permuted_conv(L, segs):

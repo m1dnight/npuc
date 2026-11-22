@@ -43,8 +43,8 @@ if not __package__:     # run as a script: the package is this file's directory
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ncpgen import stream, weights  # noqa: E402
-from ncpgen.common import (MV_IM, MV_IN, MV_OT, MV_P0, MV_WT, Memo, cdiv, decode_isa, first_diff, is_graph,  # noqa
-                           ncp_header, ncp_parts, ncp_vectors, network_key, rup)
+from ncpgen.common import (MV_IM, MV_IN, MV_OT, MV_P0, MV_WT, Memo, cdiv, decode_isa, exec_order, first_diff,  # noqa
+                           is_graph, ncp_header, ncp_parts, ncp_vectors, network_key, rup, topology)
 
 # ---- constants of the format (V: NCPObjectGenerator2020::PackingHeader, dossier/npu-compiler.md 1.2) ----------------
 MAGIC1, MAGIC2 = 0x0C0FFEE0, 0xC0DEC0DE
@@ -565,6 +565,10 @@ def _plan(low, weight_sizes, strict, fix_npuc):
         return plan_graph(low, weight_sizes)
     layers = low["layers"]
     C0, H0, W0 = low["input"]["chw"]
+    for L in layers:
+        if L["kind"] == "pool" and L["stride"][0] != L["stride"][1]:
+            raise NotImplementedError("%s: pooling strides %dx%d (not modelled; stream.pool_strides)"
+                                      % ((L["name"],) + tuple(L["stride"])))
     convs = [i for i, L in enumerate(layers) if L["kind"] == "conv"]
     if weight_sizes is None:
         weight_sizes = _weight_sizes(low)
@@ -607,10 +611,17 @@ def _plan(low, weight_sizes, strict, fix_npuc):
         # V (final-chains f001, f061): the output read-back alone passes 256 KiB: NPUC splits it in rows as in a
         # tiled plan (plan_tiled keeps every layer in one single block then)
         return plan_tiled(low, wsize, fix_npuc, nsub)
-    if not copies_any(placed) and any(_cmdq_estimate(L, shp) > CMDQ_LIMIT for L, shp in zip(layers, shapes)) \
-            and not _IN_STREAM:
-        return _cut_plan(low, layers, shapes, placed, ops, dmas, wsize, v_in, v_im, v_w, av, mv, v_out, convs,
-                         (Co, Ho, Wo, Hi, Wi), fix_npuc)
+    if any(_cmdq_estimate(L, shp) > CMDQ_LIMIT for L, shp in zip(layers, shapes)) and not _IN_STREAM:
+        # (with a trim-and-spill copy too: its group has no DMA; V: mobilenet-v1-050-224, a copy before its 13th
+        # depthwise layer and its classifier cut in three)
+        copies = [c for c in placed if c.get("copy")]
+        cut = [li for li, (L, shp) in enumerate(zip(layers, shapes)) if _cmdq_estimate(L, shp) > CMDQ_LIMIT]
+        if copies and min(cut) < max(c["layer"] for c in copies):
+            raise NotImplementedError("a copy group after a layer NPUC cuts (its group index)")
+        p = _cut_plan(low, layers, shapes, placed, ops, dmas, wsize, v_in, v_im, v_w, av, mv, v_out, convs,
+                      (Co, Ho, Wo, Hi, Wi), fix_npuc)
+        _mark_copies(p["groups"], copies, 0, list(range(len(layers))))
+        return p
     # the output group reads the stored output back (V: spread or gathered, _read_back)
     copies = [c for c in placed if c.get("copy")]
     gu = len(layers) + len(copies)
@@ -802,9 +813,10 @@ def plan_graph(low, weight_sizes=None):
         for x in ins[L["name"]]:
             cons.setdefault(x, []).append(L["name"])
     out = low.get("npu_output") or layers[-1]["name"]
-    order = stream.exec_order(out, ins, cons, src)
+    order = exec_order(out, ins, cons, src)
     gl = P.group_layers[:-1]                    # the layer of each group but the unflatten (frame.md 6.8, 6.9)
-    if list(dict.fromkeys(gl)) != [n for n in order if by[n]["kind"] != "concat"]:
+    inner = getattr(P, "graph_inner", set())    # a tiled stratum's layers after its head (6.11)
+    if list(dict.fromkeys(gl)) != [n for n in order if by[n]["kind"] != "concat" and n not in inner]:
         raise ValueError("the stream's groups do not follow the layer order")
     wl = [n for n in order if by[n]["kind"] in ("conv", "relu", "eltwise")]     # the WEIGHT vectors, in order
     if weight_sizes is None:
@@ -894,6 +906,31 @@ def plan_graph(low, weight_sizes=None):
             c_, h_, w_ = chw[out]
             un = _read_back(rows, g, cell(c_, h_, w_), c_, tvec(out), False)
             k += 1
+            continue
+        if getattr(op, "tile", None) is not None:
+            # a tile of a stratum NPUC tiles inside the graph (frame.md 6.11): its input region loaded from the DRAM
+            # tensor, or its output region stored there (a concat's buffer at the producer's offset), as a chain's
+            # tiles (_tile_dma)
+            got = []
+            r0, r1, c0, c1 = op.region
+            if op.kind == "load":
+                j = k + 1
+                while j < len(dmas) and dmas[j][2] == g and dmas[j][0].kind == "load" and \
+                        getattr(dmas[j][0], "tile", None) == op.tile and getattr(dmas[j][0], "what", None) == "ifm":
+                    j += 1
+                _tile_dma(got, cell(*chw[op.tensor]), (r0, r1 - 1, c0, c1 - 1), tvec(op.tensor), op.sram, True, g,
+                          ns0=getattr(op, "ns0", False))
+            else:
+                j = k + len(op.flags)
+                prod = getattr(op, "prod", gl[g])
+                t = op.tensor
+                base = coff(prod, t) if by.get(t, {}).get("kind") == "concat" and t != prod else 0
+                _tile_dma(got, cell(*chw[prod]), (r0, r1 - 1, c0, c1 - 1), vim[t], op.sram, False, g,
+                          pool=getattr(op, "pool", False), base=base)
+            if len(got) != j - k:
+                raise NotImplementedError("a tile's %d DMAs, %d in the stream" % (len(got), j - k))
+            rows += got
+            k = j
             continue
         # a tensor moved between DRAM and SRAM: this DMA and the next ones of the same op / tensor in this group
         j = k + 1
@@ -1509,6 +1546,186 @@ def npuc_policy(low, wsize):
     return {"best": best, "strata": out, "readback": readback}
 
 
+def graph_shapes(low):
+    """(order, shapes) of a graph network: NPUC's layer order (common.exec_order) and each layer's backend input and
+    output shapes {name: {"in": (C, H, W), "out": (Co, Ho, Wo)}}, by internal_shapes' rule (a VALID pool that drops
+    columns keeps one more); a concat's input is its first input's shape"""
+    ins, cons, by, src = topology(low)
+    out = low.get("npu_output") or low["layers"][-1]["name"]
+    order = exec_order(out, ins, cons, src)
+    chw = {src: tuple(low["input"]["chw"])}
+    shp = {}
+    for n in order:
+        L = by[n]
+        C, H, W = chw[ins[n][0]]
+        if L["kind"] in ("conv", "pool"):
+            kh, kw = L["k"]
+            sh, sw = L["stride"]
+            pt, pb, pl, pr = L["pads"]
+            Ho, Wo = (H + pt + pb - kh) // sh + 1, (W + pl + pr - kw) // sw + 1
+            if L["kind"] == "pool" and (Ho - 1) * sh + kh - pt - pb - H >= 0 > (Wo - 1) * sw + kw - pl - pr - W:
+                Wo += 1
+            Co = L["out_chw"][0]
+        elif L["kind"] == "concat":
+            Co, Ho, Wo = sum(chw[i][0] for i in ins[n]), H, W
+        else:
+            Co, Ho, Wo = C, H, W
+        shp[n] = {"in": (C, H, W), "out": (Co, Ho, Wo)}
+        chw[n] = (Co, Ho, Wo)
+    return order, shp
+
+
+def graph_policy(low, wsize=None):
+    """(memoised by the network's content when wsize is weights.py's) _graph_policy"""
+    if wsize is not None:
+        return _graph_policy(low, wsize)
+    return _GPOL.get(network_key(low), lambda: _graph_policy(low, None))
+
+
+_GPOL = Memo(16)
+
+
+def _graph_policy(low, wsize=None):
+    """NPUC's tiling decisions for a graph network (computeTilesNumber over the tsorted graph from the output back,
+    then recalculateTilingForStratum; frame.md 6.10, 6.11): per conv, pool and standalone ReLU node its own
+    processing (_pol_best: a ReLU as its 1x1 dummy conv), its IFM rounded to 16 channels behind a conv; strata grow
+    from a tiled node with all its weights towards the input along single links (the head's one predecessor has one
+    successor) as npuc_policy's chains do. An eltwise is never tiled: NPUC asserts in its SingleTileBackPropagator
+    when its operands and result pass 256 KiB (V: graph-split res96-64 .. res160-64; G for the estimate, 3 blocks).
+    wsize: {layer: its WEIGHT block's size} (default weights.py's). Returns {"order", "shapes", "nodes", "best",
+    "strata": [{"layers": [names, head first], "tiles": (nh, nw), "nbuf"}]}."""
+    ins, cons, by, src = topology(low)
+    order, shp = graph_shapes(low)
+    if wsize is None:
+        wl = [n for n in order if by[n]["kind"] in ("conv", "relu", "eltwise")]
+        wsize = dict(zip(wl, _weight_sizes(low)))
+    nds = {}
+    for n in order:
+        L, k = by[n], by[n]["kind"]
+        C, H, W = shp[n]["in"]
+        if k == "concat":
+            continue
+        if k == "eltwise":
+            if 3 * _pol_blk(C, H, W) > SRAM_LIMIT:
+                raise NotImplementedError("eltwise %s: %d x %d x %d operands need tiling, which NPUC asserts on "
+                                          "('Trying to split an unsplittable layer', SingleTileBackPropagator)"
+                                          % (n, C, H, W))
+            continue
+        i0 = ins[n][0]
+        P = L if k != "relu" else {"kind": "conv", "name": n, "k": [1, 1], "stride": [1, 1], "pads": [0, 0, 0, 0],
+                                   "cout": C}
+        nd = {"L": P, "li": n, "C": C, "Cr": rup(C, 16) if i0 != src and by[i0]["kind"] == "conv" else C,
+              "in": (C, H, W), "out": shp[n]["out"]}
+        if P["kind"] == "conv":
+            nd["per"] = cdiv(wsize[n], cell(C, H, W)["n"])
+            nd["co16"] = rup(P["cout"], 16)
+            nd["P"] = nd["co16"] // 16
+        nds[n] = nd
+    best = {}
+    for n in reversed(order):
+        if n in nds:
+            best[n] = _pol_best(nds[n])
+            if best[n] is None:
+                raise NotImplementedError("NPUC finds no processing for layer %s" % n)
+    tnr = {n: b["tiles"] != (1, 1) and not b["nbuf"] for n, b in best.items()}
+
+    def pred1(n):           # the single predecessor of n when it is a node read by n alone
+        p = ins[n]
+        return p[0] if len(p) == 1 and p[0] in nds and len(cons.get(p[0], [])) == 1 else None
+
+    def succ1(n):           # the single successor of n when n is its only input
+        s = cons.get(n, [])
+        return s[0] if len(s) == 1 and s[0] in nds and len(ins[s[0]]) == 1 else None
+    chains, chain, chain_t = [], [], None
+    for n in reversed(order):
+        if n not in nds:
+            continue
+        cand = tnr[n]
+        p = pred1(n)
+        if not cand and p is not None and tnr[p]:
+            s = succ1(n)
+            if s is not None and tnr[s]:
+                cand = True
+            else:
+                cand = by[n]["kind"] in ("conv", "pool") and \
+                    not any(by[r]["kind"] == "eltwise" for r in cons.get(n, [])) and \
+                    _pol_blk(*shp[n]["in"]) > _pol_blk(*shp[n]["out"])
+        if not cand:
+            continue
+        if chain and pred1(chain[0]) == n and succ1(n) == chain[0]:
+            t = _pol_chain_layout([nds[x] for x in [n] + chain], best[chain[-1]]["tiles"][1])
+            if t:
+                chain, chain_t = [n] + chain, t
+                continue
+        if len(chain) > 1:
+            chains.append((chain, chain_t))
+        chain, chain_t = [n], None
+    if len(chain) > 1:
+        chains.append((chain, chain_t))
+    inchain = {x: c for c in chains for x in c[0]}
+    strata = []
+    for n in order:
+        if n in inchain:
+            c, t = inchain[n]
+            if n == c[0]:
+                strata.append({"layers": c, "tiles": t, "nbuf": 0})
+        elif n in best and best[n]["tiles"] != (1, 1):
+            strata.append({"layers": [n], "tiles": best[n]["tiles"], "nbuf": best[n]["nbuf"]})
+    return {"order": order, "shapes": shp, "nodes": nds, "best": best, "strata": strata, "wsize": wsize}
+
+
+def node_whole(nd, limit):
+    """getBestProcessingParams(node, limit) keeps the node whole with all its weights (the test NPUC's layer-block
+    forwarding makes of a block's nodes with the SRAM the block leaves, LayerBlockFMSharingCalculator::
+    tryProcessInternalNode): its input below its bound and the whole node's estimate, extended or short weight
+    lifetime, within limit (a weight ring within limit also passes NPUC's test: not modelled)"""
+    mh, mw = _pol_maxin(nd["L"])
+    _, H, W = nd["in"]
+    if H >= mh or W >= mw:
+        return False
+    return _pol_full(nd, 0, True) <= limit or _pol_full(nd, 0, False) <= limit
+
+
+def _tile_dma(dmas, lay, rng, dram_vec, sram_off, load, g, ns0=False, pool=False, base=0):
+    """one tile's DMAs between a DRAM tensor (IDP-major, real planes) and the SRAM (V: H tiles use h = rows, w = 2Wp;
+    tiles narrower than the tensor use cell rows, w = cells * 64 and a DRAM w_stride; more than one plane per IDP: one
+    DMA per IDP through its own SRAM vector, planes contiguous in SRAM). base: the tensor's offset in the DRAM vector
+    (a graph's concat buffer, frame.md 6.8)"""
+    r0, r1, c0, c1 = rng
+    rows = rup(r1 - r0 + 1, 4)
+    cells_row = lay["Wp"] // 8
+    cells = rup(c1 + 1, 8) // 8 - c0 // 8
+    full = cells == cells_row
+    if full:
+        h, w, ws = rows, 2 * lay["Wp"], 0
+        doff = r0 * 2 * lay["Wp"]
+        dspan = h * w
+        if lay["n"] == 1 and lay["pp"] == 1:
+            h, w = dspan // 64, 64      # V (final-chains f059, C = 1): one IDP's tile as one blob 64 B wide
+    else:
+        h, w, ws = rows // 4, cells * 64, (cells_row - cells) * 64
+        doff = (r0 // 4) * cells_row * 64 + (c0 // 8) * 64
+        dspan = h * (w + ws)
+    doff += base
+    pp, n = lay["pp"], lay["n"]
+    if pp == 1 or n == 1 and pp == 1:
+        sdram = _blob(dram_vec, doff, 1, n, h, w, ws=ws, cs=lay["per_idp"] - dspan if n > 1 else 0)
+        ssram = _blob(0, sram_off, 1, n, h, w, cs=(IDP_STRIDE - h * w) if n > 1 else 0)
+        dmas.append((g, 0, sdram, ssram) if load else (g, 1, ssram, sdram))
+    else:
+        for i in range(n):
+            # V: loads move every IDP's pp planes; a store from an IDP holding fewer planes (the last one) moves
+            # only those (a pool's: pp rounded down to even, as untiled); one plane: no n_stride
+            pl_ = pp
+            if not load:
+                pl_ = cdiv(min(lay["cpi"], lay["C"] - i * lay["cpi"]), 2)
+                if pool and pl_ < pp:
+                    pl_ = pp - pp % 2
+            sdram = _blob(dram_vec, i * lay["per_idp"] + doff, 1, pl_, h, w, ws=ws, cs=lay["plane"] - dspan)
+            ssram = _blob(i, sram_off, 1, pl_, h, w, ns=0 if ns0 or pl_ == 1 else IDP_STRIDE - pl_ * h * w)
+            dmas.append((g, 0, sdram, ssram) if load else (g, 1, ssram, sdram))
+
+
 def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
     """NPUC's plan when layers must be tiled: strata of chained layers, each cut into tiles (one group per tile),
     joined through DRAM (IM vectors), then the output read-back (one or more output groups). Which layers are tiled,
@@ -1610,41 +1827,7 @@ def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
     group = 0
 
     def tile_dma(lay, rng, dram_vec, sram_off, load, g, ns0=False, pool=False):
-        """one tile's DMAs between a DRAM tensor (IDP-major, real planes) and the SRAM (V: H tiles use h = rows,
-        w = 2Wp; tiles narrower than the tensor use cell rows, w = cells * 64 and a DRAM w_stride; more than one
-        plane per IDP: one DMA per IDP through its own SRAM vector, planes contiguous in SRAM)"""
-        r0, r1, c0, c1 = rng
-        rows = rup(r1 - r0 + 1, 4)
-        cells_row = lay["Wp"] // 8
-        cells = rup(c1 + 1, 8) // 8 - c0 // 8
-        full = cells == cells_row
-        if full:
-            h, w, ws = rows, 2 * lay["Wp"], 0
-            doff = r0 * 2 * lay["Wp"]
-            dspan = h * w
-            if lay["n"] == 1 and lay["pp"] == 1:
-                h, w = dspan // 64, 64      # V (final-chains f059, C = 1): one IDP's tile as one blob 64 B wide
-        else:
-            h, w, ws = rows // 4, cells * 64, (cells_row - cells) * 64
-            doff = (r0 // 4) * cells_row * 64 + (c0 // 8) * 64
-            dspan = h * (w + ws)
-        pp, n = lay["pp"], lay["n"]
-        if pp == 1 or n == 1 and pp == 1:
-            sdram = _blob(dram_vec, doff, 1, n, h, w, ws=ws, cs=lay["per_idp"] - dspan if n > 1 else 0)
-            ssram = _blob(0, sram_off, 1, n, h, w, cs=(IDP_STRIDE - h * w) if n > 1 else 0)
-            dmas.append((g, 0, sdram, ssram) if load else (g, 1, ssram, sdram))
-        else:
-            for i in range(n):
-                # V: loads move every IDP's pp planes; a store from an IDP holding fewer planes (the last one) moves
-                # only those (a pool's: pp rounded down to even, as untiled); one plane: no n_stride
-                pl_ = pp
-                if not load:
-                    pl_ = cdiv(min(lay["cpi"], lay["C"] - i * lay["cpi"]), 2)
-                    if pool and pl_ < pp:
-                        pl_ = pp - pp % 2
-                sdram = _blob(dram_vec, i * lay["per_idp"] + doff, 1, pl_, h, w, ws=ws, cs=lay["plane"] - dspan)
-                ssram = _blob(i, sram_off, 1, pl_, h, w, ns=0 if ns0 or pl_ == 1 else IDP_STRIDE - pl_ * h * w)
-                dmas.append((g, 0, sdram, ssram) if load else (g, 1, ssram, sdram))
+        _tile_dma(dmas, lay, rng, dram_vec, sram_off, load, g, ns0, pool)
 
     src_vec = v_in
     for si, st in enumerate(plan_strata):

@@ -311,6 +311,8 @@ descriptors and vectors from them.
   the stream's slot (core by core for a kernel over 4 MiB), the slot loads of an input an NFU op reads first, and per
   chunk one store of its passes' planes (`_range_store`), at the producer's offset when it fills a concat's DRAM
   buffer. The same slot loads serve an uncut layer whose NFU-first input has 16 plane slots per core or more.
+- **Tiled layers** (6.11): a layer NPUC tiles inside the graph is a stratum of per-tile groups; its tile loads and
+  stores are the chain's (6.5, `_tile_dma`, with a concat buffer's offset as base).
 - **Not reproducible:** a 4-channel eltwise (rc4-*, g120, g134) loads each operand in two parts whose second
   descriptor holds uninitialised words in NPUC's output (format fields that are heap addresses, an offset of -128):
   no generator can match those bytes. g103, g167: the stream part's SRAM offsets (a conv reading a concat, cmdq.md
@@ -332,6 +334,9 @@ with 64 loads or more has them in one batch while its triggers come in sub-batch
 - per chunk with passes p0 .. p1 one store of their planes: SRAM OFM + 2 p0 x plane, DRAM 2 p0 x plane, h = 2 (p1 -
   p0) x Hp, the IDPs holding fewer planes on their own (`_range_store`); none when the output stays in SRAM.
 `frame.plan` calls the stream part, which calls `frame.plan` back for tiled plans: a module flag stops the recursion.
+A plan may hold a trim-and-spill copy (6.7) too: its group, with no DMA, keeps its place before its layer (V:
+mobilenet-v1-050-224, a copy before its 13th depthwise layer and the 512 -> 1000 classifier cut in three; a copy after
+a cut layer is refused).
 
 ### 6.10 NPUC's tiling policy, read from its code (`npuc_policy`; V: decompiled, `oracle/ghidra/targets-tiling.txt`)
 
@@ -417,6 +422,43 @@ cases; b04 makes NPUC itself assert, "Tile end row", after the policy): `frame_s
 order, the edge pads, a ring of 5+ slots preferred: 6.4-6.6). Still G: which pool type has the pad working block, the
 2 DRUs per IDP of the partial-sum block for inputs on fewer IDPs, getTile's starts, the leading-edge pad rule, the
 copy's start/end test. `frame_sweep.py policy <dirs>` checks the policy against any compile's log.
+
+### 6.11 Tiling inside a graph (`graph_policy`, stream's `graph_stratum`; V: graph-split cat96-64, cat128-128, cat160-64, the zoo's standard-resolution models, the large random set)
+
+**The policy** is 6.10's over the graph's nodes (`graph_policy`): NPUC tsorts the graph and asks
+getBestProcessingParams for every node from the output back (computeTilesNumber; a ReLU as its 1x1 dummy conv, a
+concat skipped), the IFM rounded to 16 channels behind a conv; recalculateTilingForStratum grows chains along single
+links only (a node's one predecessor read by it alone, V: the decompile's predecessor/successor counts), so a stratum
+never crosses a fork, a join or a concat. V: the tile count of every tiled node and every stratum NPUC prints in the
+seven tiled zoo compiles and the 40 large random graphs (cat128-128: c1, c2 in 3 row tiles each, c3 in 32;
+mobilenet-v2-100-224: {conv3, dw2} in 4, dw4 in 2; squeezenet11-224-npu: {conv1, pool1} in 2).
+
+**An eltwise is never tiled**: its back-propagator is a SingleTileBackPropagator, which asserts ("Trying to split an
+unsplittable layer into more than one tile!") when getBestProcessingParams would tile it: NPUC fails on every residual
+block whose operands and result pass 256 KiB per core (V: graph-split res96-64, res128-64, res160-64, res96-128,
+res96-256; `graph_policy` refuses them, G for the estimate: 3 blocks).
+
+**A tiled stratum in a graph** is a chain's (6.5): per tile one group (load, TRIM, per layer PAD / REFORMAT / CONV or
+POOL, store), its ops' chunk sizes the largest over the tiles. Its input comes from DRAM (the network input, a concat's
+buffer, or a tensor its producer stores for it) and its output goes to DRAM: a concat's buffer at the producer's offset
+(the tile stores of 6.5 with that base; V: cat128-128, cat160-64), the output's IM, or an IM its readers load back. The
+chunks join the graph's allocation: the weights first citizens live over tile 0 (one-op tiles: ordinary chunks of the
+op's group), then the SPLIT alone, then tile 0's ops; its NPUC nodes take positions in the node order (the SPLIT, every
+tile's nodes, the vConcat). A reader of a stratum's output loads it into a chunk of its own, live at it only and
+allocated right after the stratum ("WCONCAT", the vConcat node's chunk; V: squeezenet11-224-npu).
+
+**Layer-block forwarding** (LayerBlockFMSharingCalculator, after the policy; read from the decompile): input sharing,
+concat in SRAM and full forwarding each hold memory for a whole fork-join block (the head's output, or the concat's
+own "ahead_concat_size") and test each untiled node inside with getBestProcessingParams(node, 256 KiB - that): a node
+left with less than one byte "is too fat" (V: cat96-64, its 128-channel concat at 96 x 96 goes to DRAM;
+`common.concat_in_sram`), a tiled node skips the test and the block fails (V: cat128-128, cat160-64: neither input
+sharing nor concat in SRAM). So a concat with a tiled producer or reader is in DRAM (stream, `weights._concat_tiled`).
+A node that would only fit with a weight ring under the reduced bound is refused (not modelled).
+
+**Not yet**: NPUC's trim and spill inside a graph ("Allocating splitted chunk": a long-lived tensor, a residual, split
+around a layer that cannot be allocated; resnet18-96, resnet18-224, mobilenet-v2-100-224), the policy's weight rings
+in graph layers (resnet18's 512-channel convs), a tile's per-core input loads clustered in 4 parts (cores x planes >= 64,
+section 5's DMACluster; 6 of the large random graphs), a tiled read-back in a graph, strata joined to each other.
 
 ## 7. The intrinsics (V: disassembled from every variant; our own A32 encoder writes them)
 

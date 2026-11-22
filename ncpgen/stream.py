@@ -239,6 +239,15 @@ def unflatten_tiles(d, ho, wo):
     raise Unsupported("no row tiling of the %d x %d read-back" % (ho, wo))
 
 
+def pool_strides(L):
+    """refuse a pool with unequal strides: NPUC asserts 'absDiff < stride' when the vertical one is the larger and
+    compiles the other way round with streams this module does not model (V: $NCPGEN_WORK/zoo-evidence/probe-pool,
+    2x2 and 3x3 pools at 1x2; models/README.md)"""
+    sh, sw = L["stride"]
+    if sh != sw:
+        raise Unsupported("%s: pooling strides %dx%d (unequal strides not modelled)" % (L["name"], sh, sw))
+
+
 # ---- planning: groups, IR elements, events, SRAM ---------------------------------------------------------------------
 class Op:
     """an IR element of a group: its kind, its dependencies (indices in the group) and its fields"""
@@ -330,6 +339,44 @@ def allocate(chunks, limit=None):
         placed += mine
 
 
+def graph_stratum(layers, shapes, st):
+    """a tiled stratum of a graph (frame.graph_policy's st: its layers, (nh, nw), nbuf) as frame.plan_tiled cuts one:
+    the tiles' geometry (frame._tile_geometry), tile 0's ops and their largest sizes over the tiles, a conv's ring and
+    slot step (frame._ring_chunk), its PARTIAL_SUM size and WEIGHT sizes; layers and shapes: the stratum's own, the
+    indices of the result are into them. The graph allocates the chunks with its own (Plan.graph)."""
+    lis = list(range(len(layers)))
+    _, Ho, Wo = shapes[-1]["out"]
+    nh, nw = st["tiles"]
+    g = frame._tile_geometry(layers, shapes, lis, frame._tile_ranges(Ho, nh, 4), frame._tile_ranges(Wo, nw, 8))
+    trim = any(t["load"][0] != t["layers"][0]["in"][0] or t["load"][2] != t["layers"][0]["in"][2] for t in g)
+    ops = [frame._stratum_ops(layers, shapes, lis, t, trim) for t in g]
+    mx = [dict(o, size=max(x[k]["size"] for x in ops)) for k, o in enumerate(ops[0])]
+    ws, ps, ring, step = [], {}, {}, {}
+    try:
+        wsz = {L["name"]: x for L, x in zip([L for L in layers if L["kind"] == "conv"],
+                                             [st["wsize"][L["name"]] for L in layers if L["kind"] == "conv"])}
+    except KeyError:
+        raise Unsupported("a tiled conv without its weight size")
+    for li in lis:
+        L = layers[li]
+        if L["kind"] != "conv":
+            continue
+        if st["nsub"].get(L["name"], 1) > 1:
+            sz = 0
+            for t in g:
+                i0, i1, j0, j1 = t["layers"][li]["in"]
+                pt, pb, pl, pr = t["layers"][li]["pads"]
+                sz = max(sz, frame._ps_size({"in": (0, i1 - i0 + 1, j1 - j0 + 1)}, dict(L, pads=[pt, pb, pl, pr])))
+            ps[li] = sz
+        per = wsz[L["name"]] // frame.cell(*shapes[li]["in"])["n"]
+        passes = cdiv(L["cout"], 16)
+        ring[li] = st["nbuf"] or passes
+        w_, step[li] = frame._ring_chunk(per, L["cout"], ring[li], passes)
+        ws.append(w_)
+    return {"kind": "tiled", "layers": lis, "tiles": g, "ops": mx, "ring": ring, "wstep": step, "wsizes": ws,
+            "ps": ps, "nh": nh, "nw": nw}
+
+
 class Plan:
     """groups of IR elements as NPUC builds them for a chain of layers (V: its log's IR lists, "create group" lines):
     one group per layer (the first also loads the input, the last stores the output; feature maps between layers stay
@@ -357,6 +404,8 @@ class Plan:
                     raise Unsupported("conv stride %s" % L["stride"])
             elif L["kind"] != "pool":
                 raise Unsupported("layer kind %s" % L["kind"])
+            else:
+                pool_strides(L)
         fp = self.frame_plan()
         if fp is not None:
             self.from_frame(fp)
@@ -426,15 +475,16 @@ class Plan:
                    for k in range(nl)]
             self.groups.append(ops + [Op("nopop", deps=list(range(nl))), Op("unflatten")])
 
-    def frame_stratum(self, st, shapes):
+    def frame_stratum(self, st, shapes, layers=None):
         """the groups of one tiled stratum as frame.plan cut it: per tile, its input region loaded, a TRIM when the
         stratum has one, then per layer its pad (in every tile of a padding layer; the tile's own edges), reformat,
         conv (weights loaded in tile 0, or a ring reloaded every tile; partial sums) or pool, and the store (V: tiled
-        sweeps, frame/fs/*, final-chains, tiling2); tiles reaching the output's end as tile_to_end extends them"""
-        layers = self.low["layers"]
+        sweeps, frame/fs/*, final-chains, tiling2); tiles reaching the output's end as tile_to_end extends them.
+        layers: the layer list st["layers"] indexes (default the network's; a graph's stratum: its own layers)"""
+        layers = layers or self.low["layers"]
         lis = st["layers"]
         tiles = st["tiles"]
-        if any(self.tile_to_end(t, lis, shapes) != t for t in tiles):
+        if any(self.tile_to_end(t, lis, shapes, layers) != t for t in tiles):
             raise Unsupported("a tile that frame.plan does not extend to the end of the output")
         chunks = st["chunks"]
         ch = {}
@@ -548,7 +598,7 @@ class Plan:
                           region=(o0, o1 + 1, q0, q1 + 1)))
             self.groups.append(ops)
 
-    def tile_to_end(self, t, lis, shapes):
+    def tile_to_end(self, t, lis, shapes, layers=None):
         """a tile that ends on the stratum output's last row (column) computes every layer's output to that layer's
         last row (column), its input to the tensor's end with the layer's trailing pad: NPUC's layout adds the
         rounding left-over of each layer (0 <= d < s) to the last tile (frame.md 6.10), so a layer whose output is
@@ -556,7 +606,7 @@ class Plan:
         is one such tile (V: tiling2 e03, e04: 2x2 pools on 27 x 31 after a 3x3 conv: pool 2 computes 31 columns, the
         stride-2 conv before pads 128 columns to 129). frame.plan's tiles are already extended (frame_stratum checks
         it: its chunks are sized on them)."""
-        layers = self.low["layers"]
+        layers = layers or self.low["layers"]
         out_end = (shapes[lis[-1]]["out"][1] - 1, shapes[lis[-1]]["out"][2] - 1)
         o = t["out"]
         ends = (o[1] >= out_end[0], o[3] >= out_end[1])
@@ -979,6 +1029,8 @@ class Plan:
             k = L["kind"]
             if k == "conv" and L["stride"] not in ([1, 1], [2, 2]):
                 raise Unsupported("conv stride %s" % L["stride"])
+            if k == "pool":
+                pool_strides(L)
             if k == "relu" and L.get("type", "ReLU") not in ("ReLU", "ReLU6"):
                 raise Unsupported("standalone %s" % L.get("type"))
             if k not in ("conv", "pool") + GRAPH_KINDS:
@@ -1000,9 +1052,27 @@ class Plan:
                     raise Unsupported("concat of the input or of a concat")
             if L["kind"] == "eltwise" and len(ins[L["name"]]) != 2:
                 raise Unsupported("eltwise of %d inputs" % len(ins[L["name"]]))
-        # atoms (NPUC's nodes, in order): pad, reformat, conv; pool; relu: its conv; eltwise: 2; concat: 1
+        # the layers NPUC tiles: its policy over the graph's nodes (frame.graph_policy; frame.md 6.11): each stratum's
+        # tiles load its input from DRAM and store its output there
+        try:
+            pol = frame.graph_policy(low)
+        except NotImplementedError as e:
+            raise Unsupported(str(e))
+        tst = {x: st for st in pol["strata"] for x in st["layers"]}
+        oidx = {L["name"]: i for i, L in enumerate(order)}
+        self.graph_inner = set()                            # a stratum's layers after its head (no group of their own)
+        for st in pol["strata"]:
+            if any(by[x]["kind"] not in ("conv", "pool") for x in st["layers"]):
+                raise Unsupported("tiling in a graph: a tiled %s" % by[st["layers"][0]]["kind"])
+            if [oidx[x] for x in st["layers"]] != list(range(oidx[st["layers"][0]],
+                                                              oidx[st["layers"][0]] + len(st["layers"]))):
+                raise Unsupported("tiling in a graph: a stratum whose layers NPUC does not run in a row")
+            self.graph_inner |= set(st["layers"][1:])
+        # atoms (NPUC's nodes, in order): pad, reformat, conv; pool; relu: its conv; eltwise: 2; concat: 1; a tiled
+        # stratum: its SPLIT, every tile's nodes (TRIM, then per layer pad, reformat, conv or pool), its vConcat
         c0, h0, w0 = low["input"]["chw"]
         chs, hw, head, tail, geo = {src: c0}, {src: (h0, w0)}, {}, {}, {}
+        tgeo = {}                                           # stratum head -> its tiles (graph_stratum)
         pos = 1
         for L in order:
             n, k = L["name"], L["kind"]
@@ -1027,7 +1097,20 @@ class Plan:
                 if k == "eltwise" and chs[ins[n][1]] != c:
                     raise Unsupported("%s: inputs of different channel counts" % n)
                 na = 2 if k == "eltwise" else 1
-            head[n], tail[n] = pos, pos + na - 1
+            if n in tst and n != tst[n]["layers"][0]:
+                head[n], tail[n] = head[tst[n]["layers"][0]], tail[tst[n]["layers"][0]]
+                na = 0
+            elif n in tst:
+                st = tst[n]
+                sub = [by[x] for x in st["layers"]]
+                tgeo[n] = graph_stratum(sub, [pol["shapes"][x] for x in st["layers"]],
+                                        dict(st, wsize=pol["wsize"], nsub={x["name"]: weight_rows(x, self.q)[1]
+                                                                           for x in sub if x["kind"] == "conv"}))
+                nt = len(tgeo[n]["ops"]) - 1
+                na = 2 + len(tgeo[n]["tiles"]) * nt
+                head[n], tail[n] = pos + 1, pos + na - 1     # tile 0's first node .. the vConcat
+            if n not in tst:
+                head[n], tail[n] = pos, pos + na - 1
             pos += na
             chs[n], hw[n] = cout, (ho, wo)
             geo[n] = (c, h, w, cout, ho, wo, pads)
@@ -1037,9 +1120,13 @@ class Plan:
         except ValueError as e:
             raise Unsupported("weights.py: %s" % e)
         cats = [L["name"] for L in order if L["kind"] == "concat"]
-        scats = [kn for kn in cats if concat_in_sram(kn, out, by, ins, cons)]
-        # tensors their readers load from DRAM: the network input, a concat's buffer
+        scats = [kn for kn in cats if concat_in_sram(kn, out, by, ins, cons)
+                 and not any(x in tst for x in ins[kn] + cons.get(kn, []))]
+        # tensors their readers load from DRAM: the network input, a concat's buffer, a tiled stratum's output read by
+        # a layer
         dsrc = [src] + [kn for kn in cats if kn not in scats and kn != out]
+        dsrc += [st["layers"][-1] for st in pol["strata"] if st["layers"][-1] != out
+                 and any(by[r]["kind"] != "concat" for r in cons.get(st["layers"][-1], []))]
         eltd = {L["name"] for L in order if L["kind"] == "eltwise" and any(i in dsrc for i in ins[L["name"]])}
         into = {}                                           # producer -> (SRAM concat, its first plane slot)
         for kn in scats:
@@ -1063,9 +1150,18 @@ class Plan:
                 if i in stored:
                     raise Unsupported("%s goes to DRAM twice" % i)
                 stored[i] = ("cat", kn)
+        for st in pol["strata"]:
+            t_in, t_out = ins[st["layers"][0]][0], st["layers"][-1]
+            if t_in != src and t_in not in dsrc:
+                if by[t_in]["kind"] == "concat":
+                    raise Unsupported("tiling in a graph: a tiled layer reading a concat in SRAM")
+                if t_in in tst:
+                    raise Unsupported("tiling in a graph: two strata joined")
+                stored.setdefault(t_in, ("im", t_in))       # its producer stores it for the tiles
+            stored.setdefault(t_out, ("im", t_out))
 
         def end_of(t):
-            e = [head[r] for r in cons.get(t, []) if by[r]["kind"] != "concat"]
+            e = [head[r] for r in cons.get(t, []) if by[r]["kind"] != "concat" and r not in tst]
             if t == out:
                 e.append(unfl)
             return max(e) if e else tail[t]
@@ -1086,7 +1182,31 @@ class Plan:
                 t = ins[t][0]
             return t
 
-        shared = any(all(bulb_root(i) == src for i in ins[kn]) for kn in cats)
+        def bulb_nodes(kn):
+            # the one-input layers on a concat's branches, from their root to the concat
+            out_ = []
+            for i in ins[kn]:
+                t = i
+                while t != src and by[t]["kind"] in ("conv", "pool", "relu") and len(cons[t]) == 1:
+                    out_.append(t)
+                    t = ins[t][0]
+            return out_
+
+        def bulb_fits(kn, mem):
+            # NPUC's layer-block forwarding (LayerBlockFMSharingCalculator::tryProcessInternalNode): no node of the
+            # block tiled, and each kept whole with the SRAM the block holds (mem: the head's output for input
+            # sharing, the concat for concat in SRAM) left over (frame.node_whole)
+            nodes = bulb_nodes(kn)
+            if any(x in tst for x in nodes):
+                return False
+            for x in nodes:
+                if x in pol["nodes"] and not frame.node_whole(pol["nodes"][x], SRAM_LIMIT - mem):
+                    raise Unsupported("a layer-block NPUC's forwarding may refuse on memory (%s): not modelled" % x)
+            return True
+        for kn in scats:
+            bulb_fits(kn, frame._pol_blk(*pol["shapes"][kn]["out"]))
+        shared = any(all(bulb_root(i) == src for i in ins[kn]) and bulb_fits(kn, frame._pol_blk(c0, h0, w0))
+                     for kn in cats)
         # a concat whose branches all start at one computed tensor ("Input sharing" from a layer): when that layer
         # is a single node (a pool, a ReLU, a conv without pad or stride), NPUC stores it to DRAM, its first reader
         # loads it back and the other branches share it in SRAM (V: g005, g008, g009, g030, g047); after a padded
@@ -1096,6 +1216,8 @@ class Plan:
             rs = {bulb_root(i) for i in ins[kn]}
             r = min(rs)
             if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r]:
+                if r in tst or any(x in tst for x in bulb_nodes(kn)):
+                    raise Unsupported("tiling in a graph: a concat's branches from a computed tensor, tiled")
                 roots |= rs
         for r in roots:
             stored.setdefault(r, ("im", r))
@@ -1106,11 +1228,17 @@ class Plan:
         catch, store = set(), {}
         xidx = {L["name"]: i for i, L in enumerate(order)}
         for t in dsrc:
-            rs = cons.get(t, [])
+            rs = [r for r in cons.get(t, []) if r not in tst]
             if not rs:
                 continue
             nm = "INPUT" if t == src else "CONCAT"
             size = insize if t == src else Dist(chs[t]).ppc * cells(*hw[t]) * 64
+            if t in tst:
+                # a tiled stratum's output read back: per reader a chunk live at it only, allocated after the
+                # stratum's own (NPUC's vConcat node, "WCONCAT"; V: squeezenet11-224-npu)
+                for j, r in enumerate(rs):
+                    rch[t, r] = chunk("WCONCAT", size, [head[r], head[r]], (2, oidx[tst[t]["layers"][0]], 2, j))
+                continue
             if t == src and shared:
                 ck = chunk(nm, size, [0, max(head[r] for r in rs)], (0, 0, 0))
                 rch.update({(t, r): ck for r in rs})
@@ -1134,6 +1262,30 @@ class Plan:
             c, h, w, cout, ho, wo, pads = geo[n]
             bt = (2, idx)
             i0 = ins[n][0]
+            if n in tst:
+                if n in tgeo:               # the stratum's chunks (frame._stratum_alloc's, with the graph's)
+                    tg = tgeo[n]
+                    p1, nops = head[n], len(tg["ops"])
+                    req = tg["req"] = []
+                    if nops > 2:            # first citizens: the weights, live over tile 0
+                        for kw_, wsz in enumerate(tg["wsizes"]):
+                            req.append(("WEIGHT", None, chunk("WEIGHT", wsz, [p1, p1 + nops - 2], (0, p1, 2, kw_))))
+                    req.append(("SPLIT", tg["ops"][0]["layer"], chunk("SPLIT", tg["ops"][0]["size"], [p1, p1],
+                                                                     bt + (0,))))
+                    for j, o in enumerate(tg["ops"][1:]):
+                        a = p1 + j
+                        live = [a, a] if nops <= 2 or j == nops - 2 else [a, a + 1]
+                        req.append((o["op"], o["layer"], chunk(o["op"], o["size"], live, bt + (1,))))
+                        if nops <= 2:       # one op: the weights are ordinary chunks of its group, after it
+                            for wsz in tg["wsizes"]:
+                                req.append(("WEIGHT", None, chunk("WEIGHT", wsz, live, bt + (1,))))
+                        if o["op"] == "CONV" and o["layer"] in tg["ps"]:
+                            req.append(("PARTIAL_SUM", o["layer"], chunk("PARTIAL_SUM", tg["ps"][o["layer"]], live,
+                                                                        bt + (1,), True)))
+                tens[n] = None
+                full[n] = True
+                info[n] = {"dout": Dist(cout), "ho": ho, "wo": wo, "conv": k == "conv"}
+                continue
             cin = rch[i0, n] if (i0, n) in rch else tens[i0]
             d = {"din": Dist(c), "dout": Dist(cout), "h": h, "w": w, "ho": ho, "wo": wo, "pads": pads,
                  "full": full[i0], "in": cin}
@@ -1239,15 +1391,21 @@ class Plan:
             ck.fixed = True
         allocate(chunks)
         self.chunks = chunks
-        need = max(ck.off + ck.size for ck in chunks if not getattr(ck, "top", False))
-        if need > min([SRAM_LIMIT] + [ck.off for ck in chunks if getattr(ck, "top", False)]):
-            raise Unsupported("tiling in a graph (SRAM %d B per core)" % need)
+        for tg in tgeo.values():            # the strata's chunk offsets, as frame.plan_tiled lists them
+            tg["chunks"] = [{"kind": kind, "layer": li, "off": ck.off, "size": ck.size} for kind, li, ck in tg["req"]]
+        tops = [ck for ck in chunks if getattr(ck, "top", False)]
+        for ck in chunks:                   # each chunk below SRAM's end and the top chunks live with it
+            if getattr(ck, "top", False) or not ck.size:
+                continue
+            lim = min([SRAM_LIMIT] + [t.off for t in tops if t.live[0] <= ck.live[1] and ck.live[0] <= t.live[1]])
+            if ck.off + ck.size > lim:
+                raise Unsupported("tiling in a graph (SRAM %d B per core)" % (ck.off + ck.size))
         for n, d in info.items():
             if "into" in d:
                 kn, slot = d["into"]
                 d["out"].off = store[kn].off + slot * cells(d["ho"], d["wo"]) * 64
         for L in order:
-            if L["kind"] == "conv" and max(hw[L["name"]]) > 255:
+            if L["kind"] == "conv" and max(hw[L["name"]]) > 255 and L["name"] not in tst:
                 raise Unsupported("tiling in a graph (an output dimension of %s > 255)" % L["name"])
         # groups
 
@@ -1264,6 +1422,28 @@ class Plan:
             d = info[n]
             i0 = ins[n][0]
             if k == "concat":
+                continue
+            if n in tst:
+                # a tiled stratum: per tile its input region loaded from DRAM, its layers, its output region stored
+                if n in tgeo:
+                    st = tst[n]
+                    t_in, t_out = ins[st["layers"][0]][0], st["layers"][-1]
+                    g0 = len(self.groups)
+                    self.frame_stratum(tgeo[n], [pol["shapes"][x] for x in st["layers"]],
+                                       layers=[by[x] for x in st["layers"]])
+                    sub0 = by[st["layers"][0]]
+                    # V (frame.md 6.5): no SRAM n_stride in the per-core loads of a one-conv stratum reading its tile
+                    # directly (k1, no pad, stride 1)
+                    direct = len(st["layers"]) == 1 and sub0["kind"] == "conv" and not any(sub0["pads"]) and \
+                        tuple(sub0["stride"]) == (1, 1) and tgeo[n]["ops"][1]["op"] == "CONV"
+                    for ops in self.groups[g0:]:
+                        for op in ops:
+                            if op.kind == "load" and op.what == "ifm":
+                                op.tensor, op.ns0 = t_in, direct
+                            elif op.kind == "store":
+                                op.tensor, op.pool, op.prod = stored[t_out][1], by[t_out]["kind"] == "pool", t_out
+                    self.group_layers += [n] * (len(self.groups) - len(self.group_layers))
+                prev = None
                 continue
             # a reader of a tensor in DRAM loads it, unless the input is shared by a concat's branches and an earlier
             # branch loaded it, or the layer just before loaded it the same way (NPUC's LIR skips an identical load;

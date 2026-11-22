@@ -26,13 +26,15 @@ meaning not proven on the NPU). No vendor bytes: addresses, fields, formulas and
   the short-ring sweep `stream_variants_ring3.txt`, 271; whole files 302/302; 210/302 before): the trigger batches now
   come from NPUC's event schedule run on a generated memory profile (7b), which replaced the fitted batch rules.
 - Graphs (section 7c): eltwise add, concat (in DRAM and in SRAM), standalone ReLU/ReLU6, any DAG of them with convs and
-  pools: graph sweep 98/98, random graphs 47/47 and 66/66 unseen, final-graph 57/57, ops-check 12/12.
+  pools: graph sweep 98/98, random graphs 47/47 and 66/66 unseen, final-graph 57/57, ops-check 12/12; layers NPUC
+  tiles inside a graph (7c, frame.md 6.11): graph-split 18/18, large random graphs 22/40 unseen.
 - Covered: chains of convolutions and pools in any order (a pool may come first), odd sizes anywhere, conv
   kernels 1..13 square and rectangular, stride 1 and 2, SAME and VALID, Cin 1..256, Cout 1..255, H/W 1..250
   (non-multiples of 4/8 included), quant modes 1 and 3, any zero points and scales, ReLU or none, max/avg pools
   (k 2..3, stride 1..2, SAME/VALID), several output passes, weight sub-batches with partial sums, 16+ input planes
   per core (chunked input load), more than 16 DMAs (event wrap), NFU width splitting.
-- Not covered: conv strides other than 1/2 (NPUC supports only 1 and 2); pads above 6 (NPUC refuses: "Pad size
+- Not covered: unequal pool strides (refused, `pool_strides`); conv strides other than 1/2 (NPUC supports only 1 and
+  2); pads above 6 (NPUC refuses: "Pad size
   ... can be up to: 6"); a group whose memory profile has no fit (an op kind not in 7b's list) is refused.
 - Dependencies: `grelu.py` (the activation table; the slope is NPUC's round-half-away one) and `weights.py` (rows per
   weight batch, sub-batch split). Without them stream.py uses its own derivations and refuses what needs them.
@@ -514,6 +516,13 @@ sub-channels (`weights.weight_layer_info`); a ring's slots sit 2 x planning rows
 emitted rows (V: g103, g167). A ring with Cout not a multiple of 16 takes the chain's slot, 16 x ceil(bytes per IDP /
 Cout) (frame.md 6.6; V: mobilenet-v2-035-dense's 1280 -> 1000 classifier, 32 of 63 passes), and a graph never stores
 pass by pass: one store after the last pass (V: graph-split ring-pbp-16, a 500-channel output with 16 of 32 passes).
+**Tiled layers in a graph** (frame.md 6.11; V: graph-split cat96-64, cat128-128, cat160-64, squeezenet11-224-npu,
+mobilenet-v2-035-224, 22 of the 40 large random graphs `stream_graphs.py random <dir> 1000 40 --set large`): the layers
+NPUC's policy tiles (frame.graph_policy) become strata whose per-tile groups are the chain's (`frame_stratum`, 7b,
+`graph_stratum` cutting the tiles), loading their input from DRAM and storing their output there; the graph stores a
+stratum's input for it when a layer in SRAM makes it, and its readers load its output back. Unequal pool strides are
+refused (`pool_strides`; npunet refuses them too).
+
 **Misses (unseen set).** none left (g103, g161, g167 fixed with weights.py's planning
 rows; g134: a 4-channel eltwise's
 second operand load skips a flag: fixed since (that load, the second plane slot of a 4-channel operand, takes the
