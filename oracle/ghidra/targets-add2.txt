@@ -1,0 +1,4 @@
+# ADD with any scales, second pass: NPUC's ConcatScaleFoldingFilter (a concat's predecessors take its output scale; a
+# pool predecessor gets a scale conv), which runs on the device chain when a concat input's scale differs
+sym:ConcatScaleFolding
+str:will update the scale value of predecessors
