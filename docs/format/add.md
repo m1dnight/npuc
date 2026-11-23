@@ -173,12 +173,14 @@ only: npunet's unproven list); the multiplier rounding of NPUC's 8-bit slope app
 ## 7. The camera models with ADDs (`$NCPGEN_WORK/sweep/camera-add`, models/camera.md)
 
 SSD MobileNet v2 and SSDLite MobileDet are the two whose NPU part starts with a conv: with `--add-as-conv` (and
-`--output` per head, `--allow-none --relu6-range`) every head of both lowers. NPUC compiles SSD v2's box head 0 (t166,
-57 layers) and its last class head (t253: the whole network, 81 layers, 10 ADDs), and MobileDet's box head 0 (t0, 68
-layers); MobileDet's later heads and its last ADD crash NPUC itself in its weight packer (NPULIRKernelPack::
+`--output` per head, `--allow-none --relu6-range`) every head of both lowers, and so does each whole NPU part with its 12
+heads as outputs (`--output` repeated, after main's several outputs: 92 and 123 layers). NPUC compiles SSD v2's box head
+0 (t166, 57 layers), its last class head (t253, 81 layers, 10 ADDs) and the 12-head network (92 layers, 219 s, 15.5 MB,
+root-3504c01f), and MobileDet's box head 0 (t0, 68 layers); MobileDet's later heads and its last ADD crash NPUC itself in its weight packer (NPULIRKernelPack::
 tryBuildData, a memset: the dense depthwise 3x3 stride 2 over 768 channels, "numInputChannels 3072"), not in anything
 of the ADD. ncpgen's weights are exact on the SSD v2 cuts; its streams refuse them ("a layer-block whose node only fits
-with a weight ring": NPUC's forwarding at 300 px, the big-models work) and MobileDet's t0 ("a concat in SRAM NPUC's
+with a weight ring": in a residual block's layer-block the dense 3x3 depthwise at 19x19x576 fits only with 18 weight
+buffers; taking the forwarding test's ring there gets t166 generated, but groups 15 to 17 still differ: not modelled) and MobileDet's t0 ("a concat in SRAM NPUC's
 forwarding refuses": the second ADD's concat at 80x80, whose block's 3x3 expansion to 128 channels leaves no room; the
 case of graph-large2 t2022, frame.md 6.11). The other five models stop before their first ADD (PAD, a CPU head).
 

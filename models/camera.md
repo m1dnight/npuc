@@ -133,7 +133,7 @@ python3 -I models/camera.py addcheck <model.tflite> [--input T] --output T --all
 
 | model | lowers with `--add-as-conv` | NPUC (root-81d28366) | `ncpgen check` |
 |---|---|---|---|
-| SSD MobileNet v2 | every head alone (`--output` 166..253; 57 to 81 NPU layers, all 10 ADDs from t188 on) | compiles: t166 (box head 0, 57 layers, 39 s), t253 (the last class head, the whole network, 81 layers, 111 s, 13.5 MB) | not yet: "a layer-block whose node only fits with a weight ring" (t166; the big-models work, frame.md 6.11) |
+| SSD MobileNet v2 | every head alone (`--output` 166..253; 57 to 81 NPU layers, all 10 ADDs from t188 on), and the whole NPU part with its 12 heads as outputs (`--output` x 12, 92 layers) | compiles: t166 (box head 0, 57 layers, 39 s), t253 (the last class head, 81 layers, 111 s), the 12-head network (92 layers, 219 s, 15.5 MB, root-3504c01f) | not yet: "a layer-block whose node only fits with a weight ring": the dense 3x3 depthwise at 19x19x576 inside a residual block's layer-block needs 18 weight buffers; taking that ring gets t166 generated but not exact (groups 15 to 17 differ) |
 | SSDLite MobileDet | every head alone (68 to 101 layers), the last ADD (t308, 84 layers) | compiles t0 (box head 0, 68 layers, 51 s); t16, t80, t308 crash NPUC itself (SIGSEGV in NPULIRKernelPack::tryBuildData: the dense depthwise 3x3 stride 2 over 768 channels, "numInputChannels 3072") | not yet: "a concat in SRAM NPUC's forwarding refuses" (an ADD's concat at 80x80 NPUC keeps in DRAM; graph-large2 t2022's case, frame.md 6.11) |
 | face SSD, YOLO-Fastest | refused at their first PAD | - | - |
 | SSDLite (PINTO), EfficientDet-Lite0, MoveNet | refused at their CPU head (QUANTIZE, CAST) | - | - |
