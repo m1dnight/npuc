@@ -951,6 +951,221 @@ def _ssd_mnv1_300(n):
     _ssd_mnv1(n)
 
 
+# ---- camera resolutions: the backbones of the camera models (models/camera.md) at their published input sizes ------
+# Each is the NPU part up to the model's last feature map, one output (several outputs and the CPU tails are other
+# work): the published layers, our weights. ReLU6 as the zoo writes it (quant 1: 6/255 zp -128; quant 3: 6/127 zp 0):
+# its clamp is the int8 saturation, a no-op (models/camera.md).
+SSD_EXTRAS = ((256, 512), (128, 256), (128, 256), (64, 128))   # TF OD API's SSD extra layers: 1x1 then 3x3/2
+
+
+def _ssd_extras(n, lite=False):
+    for k, (c1, c2) in enumerate(SSD_EXTRAS):
+        n.conv(c1, 1, act="relu6", name="extra%d_1x1" % (k + 2))
+        if lite:        # SSDLite: the 3x3/2 as a depthwise conv and a 1x1
+            n.dw(3, 2, act="relu6", name="extra%d_dw" % (k + 2))
+            n.conv(c2, 1, act="relu6", name="extra%d_pw" % (k + 2))
+        else:
+            n.conv(c2, 3, s=2, act="relu6", name="extra%d_3x3" % (k + 2))
+
+
+CAMERA_AD = COMMON[:1] + ["the NPU part only: the detection heads, their RESHAPE / CONCATENATION, LOGISTIC and the "
+                          "post-process (CPU work) left out; the output is the last feature map"]
+CAMERA_Q3 = ["every activation scale a power of two except ReLU6's, every zero point 0 (quant 3) for the residual "
+             "ADDs (NPUC's Eltwise aligns by shifts only)", "ReLU6 quantised 6/127 zp 0 (its clamp is then the int8 "
+             "saturation)", "the linear bottlenecks: --allow-none"]
+
+
+@model("ssd-mobilenet-v1-300", "ssd-mobilenet-v1-300", "SSD MobileNet v1 (Liu et al. 2016, Howard et al. 2017; TF Object "
+       "Detection API ssd_mobilenet_v1_coco, Coral's quantised release: MobileNet v1 1.0 to conv13 at 10x10x1024, then "
+       "4 extra layers 1x1 + 3x3/2 down to 1x1x128)", "object detection 300x300x3: the feature extractor",
+       adapt=CAMERA_AD + ["ReLU6 at TFLite's 6/255 (zp -128): the published TF1 ranges clamp inside (--relu6-range "
+                          "for the published file)"])
+def _ssd_mnv1_feat(n):
+    n.conv(32, 3, s=2, act="relu6")
+    for c, s in ((64, 1), (128, 2), (128, 1), (256, 2), (256, 1), (512, 2)) + ((512, 1),) * 5 + ((1024, 2), (1024, 1)):
+        n.dw(3, s, act="relu6")
+        n.conv(c, 1, act="relu6")
+    _ssd_extras(n)
+
+
+def _mnv2_trunk(n):
+    """MobileNet v2 1.0's layers to its conv 1280"""
+    first, b0, blocks = MNV2_100
+    n.conv(first, 3, s=2, act="relu6")
+    n.dw(3, 1, act="relu6")
+    n.conv(b0, 1, act="none")
+    cin = b0
+    for t, c, rep, s in blocks:
+        for i in range(rep):
+            x = n.cur
+            n.conv(cin * t, 1, act="relu6", inp=x)
+            n.dw(3, s if i == 0 else 1, act="relu6")
+            y = n.conv(c, 1, act="none")
+            if i > 0:
+                n.add(x, y)
+            cin = c
+    n.conv(1280, 1, act="relu6")
+
+
+@model("ssd-mobilenet-v2-300", "ssd-mobilenet-v2-300", "SSD MobileNet v2 (Sandler et al. 2018; TF Object Detection API "
+       "ssd_mobilenet_v2_coco, Coral's quantised release: MobileNet v2 1.0 to conv 1280 at 10x10, then 4 extra layers "
+       "1x1 + 3x3/2 down to 1x1x128)", "object detection 300x300x3: the feature extractor", adapt=CAMERA_AD + CAMERA_Q3)
+def _ssd_mnv2(n):
+    _mnv2_trunk(n)
+    _ssd_extras(n)
+
+
+def _mobiledet_blocks(n, c4=False):
+    """MobileDet-EdgeTPU (Xiong et al. 2021; TF OD API mobiledet_edgetpu_backbone, as in test_data's
+    ssdlite_mobiledet_coco_qat): Tucker, fused and inverted bottleneck blocks, ReLU6, 3x3 and 5x5 kernels"""
+    def fused(c, e, k=3, s=1, res=True):
+        x, cin = n.cur, n.T[n.cur]["hwc"][2]
+        n.conv(cin * e, k, s=s, act="relu6", inp=x)
+        y = n.conv(c, 1, act="none")
+        if res:
+            n.add(x, y)
+
+    def ibn(c, e, k=3, s=1, res=True):
+        x, cin = n.cur, n.T[n.cur]["hwc"][2]
+        n.conv(cin * e, 1, act="relu6", inp=x)
+        n.dw(k, s, act="relu6")
+        y = n.conv(c, 1, act="none")
+        if res:
+            n.add(x, y)
+    n.conv(32, 3, s=2, act="relu6")
+    n.conv(8, 1, act="relu6")                   # the Tucker conv: 1x1 compress, 3x3, 1x1 (linear)
+    n.conv(16, 3, act="relu6")
+    n.conv(16, 1, act="none")
+    fused(16, 8, s=2, res=False)
+    for e in (4, 8, 4):
+        fused(16, e)
+    fused(40, 8, k=5, s=2, res=False)
+    for _ in range(3):
+        fused(40, 4)
+    ibn(72, 8, s=2, res=False)
+    ibn(72, 8)
+    fused(72, 4)
+    fused(72, 4)
+    ibn(96, 8, k=5, res=False)
+    ibn(96, 8, k=5)
+    ibn(96, 8)
+    ibn(96, 8)
+    if c4:                                      # C4, the first SSDLite feature map (20x20x96 at 320 px)
+        return
+    ibn(120, 8, k=5, s=2, res=False)
+    ibn(120, 8)
+    ibn(120, 4, k=5)
+    ibn(120, 8)
+    ibn(384, 8, k=5, res=False)
+
+
+@model("mobiledet-320", "mobiledet-320", "SSDLite MobileDet-EdgeTPU (Xiong et al. 2021; TF Object Detection API, "
+       "test_data's ssdlite_mobiledet_coco_qat, Frigate's default model: the MobileDet-EdgeTPU backbone to 10x10x384, "
+       "then 4 SSDLite extra layers 1x1 + depthwise 3x3/2 + 1x1 down to 1x1x128)",
+       "object detection 320x320x3: the feature extractor",
+       adapt=CAMERA_AD + CAMERA_Q3 + ["ReLU6 where the published file has none fused (its output ranges are ReLU6's)"],
+       gaps=["NPUC crashes on its 5x5 depthwise layers over 768 channels at stride 2 and 960 at stride 1 (the dense "
+             "form: its weight packer's stack array overflows); mobiledet-320-c4 stops before them"],
+       expect="npuc-fails")
+def _mobiledet(n):
+    _mobiledet_blocks(n)
+    _ssd_extras(n, lite=True)
+
+
+@model("mobiledet-320-c4", "mobiledet-320", "SSDLite MobileDet-EdgeTPU (Xiong et al. 2021; TF Object Detection API, "
+       "test_data's ssdlite_mobiledet_coco_qat: the MobileDet-EdgeTPU backbone to C4, 20x20x96, its first SSDLite "
+       "feature map)", "object detection 320x320x3: the backbone to C4",
+       adapt=CAMERA_AD + CAMERA_Q3 + ["ReLU6 where the published file has none fused (its output ranges are ReLU6's)",
+                                      "the backbone stops at C4: its C5 blocks (5x5 depthwise layers over 768 channels "
+                                      "at stride 2 and 960 at stride 1) crash NPUC in their dense form (its weight "
+                                      "packer's stack array overflows: models/README.md)"])
+def _mobiledet_c4(n):
+    _mobiledet_blocks(n, c4=True)
+
+
+# EfficientNet-Lite0 (Tan & Le 2019; the lite variant: ReLU6, no squeeze-excitation, stem and head not scaled): per
+# stage the MBConv expansion, kernel, channels, repeats, stride of the first
+EFFNET_LITE0 = ((1, 3, 16, 1, 1), (6, 3, 24, 2, 2), (6, 5, 40, 2, 2), (6, 3, 80, 3, 2), (6, 5, 112, 3, 1),
+                (6, 5, 192, 4, 2), (6, 3, 320, 1, 1))
+
+
+@model("efficientdet-lite0-320", "efficientdet-lite0-320", "EfficientDet-Lite0 (Tan et al. 2020; the TF Lite Model "
+       "Maker / Coral efficientdet_lite0_320_ptq backbone: EfficientNet-Lite0 to 10x10x320 (P5), then P6 = 1x1 conv "
+       "to 64 + max pool 3x3/2 and P7 = max pool 3x3/2)", "object detection 320x320x3: the backbone and its P6/P7",
+       adapt=CAMERA_AD + CAMERA_Q3 + ["the BiFPN left out (it needs RESIZE_NEAREST_NEIGHBOR: upsampling, not done)",
+                                      "per-tensor weights (the published file is per-channel)"],
+       gaps=["NPUC crashes on its 5x5 depthwise layers over 1152 channels (the dense form: its weight packer's stack "
+             "array overflows); efficientdet-lite0-320-p4 stops before them"], expect="npuc-fails")
+def _effdet_lite0(n):
+    n.conv(32, 3, s=2, act="relu6")
+    cin = 32
+    for e, k, c, rep, s in EFFNET_LITE0:
+        for i in range(rep):
+            x = n.cur
+            if e != 1:
+                n.conv(cin * e, 1, act="relu6", inp=x)
+            n.dw(k, s if i == 0 else 1, act="relu6")
+            y = n.conv(c, 1, act="none")
+            if i > 0:
+                n.add(x, y)
+            cin = c
+    n.conv(64, 1, act="none", name="resample_p6")
+    n.pool("max", 3, 2, pad="same", name="p6")
+    n.pool("max", 3, 2, pad="same", name="p7")
+
+
+@model("efficientdet-lite0-320-p4", "efficientdet-lite0-320", "EfficientDet-Lite0 (Tan et al. 2020; the Coral "
+       "efficientdet_lite0_320_ptq backbone: EfficientNet-Lite0 to its stage 5, P4 at 20x20x112, the BiFPN's "
+       "20x20 input)", "object detection 320x320x3: the backbone to P4",
+       adapt=CAMERA_AD + CAMERA_Q3 + ["per-tensor weights (the published file is per-channel)",
+                                      "the backbone stops at P4: its stage 6 (5x5 depthwise layers over 1152 channels) "
+                                      "crashes NPUC in their dense form (its weight packer's stack array overflows: "
+                                      "models/README.md), and written as channel halves it would be 100 M dense "
+                                      "weights in the JSON"])
+def _effdet_lite0_p4(n):
+    n.conv(32, 3, s=2, act="relu6")
+    cin = 32
+    for e, k, c, rep, s in EFFNET_LITE0[:5]:
+        for i in range(rep):
+            x = n.cur
+            if e != 1:
+                n.conv(cin * e, 1, act="relu6", inp=x)
+            n.dw(k, s if i == 0 else 1, act="relu6")
+            y = n.conv(c, 1, act="none")
+            if i > 0:
+                n.add(x, y)
+            cin = c
+
+
+@model("posenet-mobilenet-v1-257", "posenet-mobilenet-v1-257", "PoseNet (Papandreou et al. 2018; TF Lite's "
+       "posenet_mobilenet_v1_100_257x257: MobileNet v1 1.0, output stride 32, 1x1 heads: 17 heatmaps, 34 offsets, "
+       "32 + 32 displacements at 9x9)", "multi-person pose 257x257x3",
+       adapt=COMMON[:1] + ["the four heads concatenated along channels (one NPU output, 9x9x115; the CPU splits it), "
+                           "sharing one output quantisation (NPUC's concat copies bytes)",
+                           "the decoder (CPU work) left out", "the heads: --allow-none"],
+       gaps=["NPUC asserts \"Tile end row exceeds FM shape\" after its policy (conv1 .. dw4 one stratum of 5 row "
+             "tiles at 257 px: frame.md 6.11)"], expect="npuc-fails")
+def _posenet(n):
+    n.conv(32, 3, s=2, act="relu6")
+    for c, s in ((64, 1), (128, 2), (128, 1), (256, 2), (256, 1), (512, 2)) + ((512, 1),) * 5 + ((1024, 2), (1024, 1)):
+        n.dw(3, s, act="relu6")
+        n.conv(c, 1, act="relu6")
+    x = n.cur
+    q = n.qout("none", "heads")
+    heads = [n.conv(c, 1, act="none", inp=x, name=nm, out=q)
+             for nm, c in (("heatmap", 17), ("offset", 34), ("displacement_fwd", 32), ("displacement_bwd", 32))]
+    n.concat(heads, name="heads")
+
+
+@model("movenet-backbone-192", "movenet-backbone-192", "MoveNet Lightning (Google 2021; Coral's "
+       "movenet_single_pose_lightning_ptq: a MobileNet v2 1.0 backbone to conv 1280 at 6x6, then an FPN and CenterNet "
+       "heads)", "single-person pose 192x192x3: the backbone",
+       adapt=CAMERA_AD[:1] + CAMERA_Q3 + ["the FPN and the heads left out (RESIZE_BILINEAR: upsampling, not done), "
+                                          "the input's CAST/QUANTIZE/SUB/MUL preprocessing too (a CPU head)"])
+def _movenet(n):
+    _mnv2_trunk(n)
+
+
 # the input of each family: shape, quantisation (scale, zero point), quant mode, power-of-two activations
 INPUTS = {
     "lenet5": ((28, 28, 1), 1 / 255, -128, 1, False), "keras-mnist-cnn": ((28, 28, 1), 1 / 255, -128, 1, False),
@@ -972,6 +1187,12 @@ INPUTS = {
     "ssd-mobilenet-v1-025-128": ((128, 128, 3), 1 / 128, 0, 1, False),
     "ssd-mobilenet-v1-025-224": ((224, 224, 3), 1 / 128, 0, 1, False),
     "ssd-mobilenet-v1-025-300": ((300, 300, 3), 1 / 128, 0, 1, False),
+    "ssd-mobilenet-v1-300": ((300, 300, 3), 1 / 255, -128, 1, False),
+    "ssd-mobilenet-v2-300": ((300, 300, 3), 1 / 128, 0, 3, True),
+    "mobiledet-320": ((320, 320, 3), 1 / 128, 0, 3, True),
+    "efficientdet-lite0-320": ((320, 320, 3), 1 / 128, 0, 3, True),
+    "posenet-mobilenet-v1-257": ((257, 257, 3), 1 / 255, -128, 1, False),
+    "movenet-backbone-192": ((192, 192, 3), 1 / 128, 0, 3, True),
 }
 
 

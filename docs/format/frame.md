@@ -485,7 +485,7 @@ own "ahead_concat_size") and test each untiled node inside with getBestProcessin
 left with less than one byte "is too fat" (V: cat96-64, its 128-channel concat at 96 x 96 goes to DRAM;
 `common.concat_in_sram`), a tiled node skips the test and the block fails (V: cat128-128, cat160-64: neither input
 sharing nor concat in SRAM). So a concat with a tiled producer or reader is in DRAM (stream, `weights._concat_tiled`).
-A node that would only fit with a weight ring under the reduced bound is refused (not modelled).
+A node that passes only with a weight ring under the reduced bound takes that ring (its last test sets its processing; V: fresh camera v3024, v3025: 4 of 8 passes, a short ring on its conv only).
 **Their side effect on weight lifetimes** (`frame.forwarding`; V: decompiled tryProcessInternalNode,
 getBestProcessingParams, estimateFullMemoryRequirements; large random t1004, t1013): getBestProcessingParams sets or
 clears the node's "weights_have_extended_lifetime" tag on every call, so the forwarding tests change the lifetime the
@@ -511,7 +511,7 @@ holding less so far, the bottom on a tie, as a chain stratum's weights (6.5): ss
 **Also modelled** (V: large random t1016, t1018, t1038, t1039):
 - a layer-block's forwarding decided by `frame.forwarding` (the tests above with their prealloc flags; t1038's
   96-channel branch conv fits once the shared input or the concat is not counted: concat in SRAM), so the old refusal
-  "may refuse on memory" is gone; a block whose node would pass only with a weight ring is still refused;
+  "may refuse on memory" is gone; a block node that passes only with a weight ring takes it (`forwarding`'s "last");
 - a concat whose branches start at a single-node layer but one of whose branch layers is tiled: no input sharing (the
   tiled node is not tested, the block fails), the root an ordinary tensor kept in SRAM for its untiled readers and
   stored for the tiled ones (t1018);
@@ -519,15 +519,35 @@ holding less so far, the bottom on a tie, as a chain stratum's weights (6.5): ss
 - the io batch ids of a graph: the stream part's (NPUC's SetBatchTransferInGroup, cmdq.md 7b), not re-derived from the
   ev2set masks (t1016: a clustered load's 16 parts in one batch, which the masks cannot tell).
 
-**Not yet**: strata joined to each other, a tiled stratum's output heading a concat's branches, a concat the forwarding
-keeps out of SRAM (fresh t2022: its reader's chunk a second citizen, the next block's pool output a first citizen),
-fresh t2006 (a spill our model aborts on, NPUC not; its weight blocks differ too). Rate on the first large random set:
-40 of 40 (31 before the trim and spill of 6.12, the forwarding model and the items above; 22 before the clustered
-loads, the shared WCONCAT and the chain rule). **A fresh unseen set** (`stream_graphs.py random
-$NCPGEN_WORK/sweep/graph-large2 2000 40 --set large`, compiled after the work above): 35 of 39 at first sight (NPUC
-crashes on t2031, GlobalMemoryAllocator.cpp:860); t2016 and t2029 then fixed by NPUC's backward order in the stream
-allocator (the start of the live range, latest first, as frame._first_fit has it, not the plain reverse of bigger
-first): 37 of 39.
+**Concats kept out of SRAM** (V: large random t2006, t2022; fresh camera v3003, v3025): NPUC drops a concat from SRAM
+after its static test (`common.concat_in_sram`) when the concat-in-SRAM block test fails (forwarding "cs"), when a
+producer or reader is tiled, or when its readers do not share its OFM (`frame.concat_ofm_shared`: read by several
+layers whose input-sharing block fails; LivenessAnalysis::collectAllChunks, "ConcatInSram was turned off here!", the
+readers' weights then in the DRAM order: t2006's three readers). Read back from DRAM such a concat gets, for one
+reader, a chunk live at that reader only (a second citizen; a concat that never passed the static test keeps the first
+citizen from the concat to its reader: cat2, cat3), and for several readers that share it (their input-sharing block
+passes) one first citizen from the concat to the last reader, loaded by the first (v3025). A tiled stratum's output
+read back by several layers gets their chunks in NPUC's node order (v3003).
+
+**Not yet**: strata joined to each other, a tiled stratum's output heading a concat's branches, fresh camera v3003 (a
+pool stratum's output read by two 1x1 convs and a tiled 5x5 conv: NPUC loads it for the first reader where ncpgen does
+not). Rate on the first large random set: 40 of 40 (31 before the trim and spill of 6.12, the forwarding model and the
+items above; 22 before the clustered loads, the shared WCONCAT and the chain rule). **A fresh unseen set**
+(`stream_graphs.py random $NCPGEN_WORK/sweep/graph-large2 2000 40 --set large`, compiled after the work above): 35 of
+39 at first sight (NPUC crashes on t2031, GlobalMemoryAllocator.cpp:860); t2016 and t2029 then fixed by NPUC's
+backward order in the stream allocator (the start of the live range, latest first, as frame._first_fit has it, not the
+plain reverse of bigger first): 37 of 39; t2006 and t2022 with the concat rules above: 39 of 39.
+
+**Camera resolutions** (256..320 px; models/README.md "Camera resolutions"): SSD MobileNet v1's heads (camera t99,
+t102, t168) needed only the tile cut of 6.9; the zoo's SSD v1 and v2 backbones at 300 px, MoveNet's at 192 and
+MobileDet's to C4 at 320 are exact (SSD v2 after the policy's ring and the first-citizen rule above). **A fresh unseen
+set at camera sizes** (`stream_graphs.py random $NCPGEN_WORK/sweep/graph-camera 3000 40 --set camera`, 256, 257, 288,
+300 or 320 px inputs; compiled while the work above went on): of the first 26 NPUC compiled, 23 exact at first sight
+(v3024 refused: a block node passing only with a ring; v3025: a concat in DRAM shared by its readers, with that ring;
+v3003); the rules above then fixed v3024 and v3025, and the 8 compiled after them were all exact at first sight: 33
+of 34 now, v3003 the miss. NPUC fails on 3 more (v3002 and v3030: the tile-end assertion of 6.10, predicted; v3006: "Defragmentation and spilling
+failed", which ncpgen's trim and spill predicts too) and 3 did not finish in the harness (v3013, v3019 past its
+300 s limit under load, twice; v3035 no run directory, twice).
 
 ### 6.12 Trim and spill (`stream.allocate(ts=...)`, `_trim_spill`; V: decompiled GlobalMemoryAllocator, `oracle/ghidra/targets-spill*.txt`; mobilenet-v2-100-224, resnet18-96, resnet18-224, large random t1004, t1013, t1021, t1033, t1036)
 

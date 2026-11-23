@@ -1889,7 +1889,9 @@ def forwarding(low, pol=None):
     whole. Each test sets the node's weight lifetime (_pol_whole), so the last test wins (V: large random t1004,
     t1013: the branch convs' weights live on their conv only). A block succeeds in a mode when every input of its
     concat passed (or is the head: tryProcessLayerBlockEnd). Returns {"life": {node: extended} for the nodes tested,
-    "ok": {mode: {head: succeeded}}, "nbuf": {mode: {node: weight buffers it passed with}}, "heads": {head: concat}}."""
+    "ok": {mode: {head: succeeded}}, "nbuf": {mode: {node: weight buffers it passed with}}, "heads": {head: concat},
+    "last": {node: the weight buffers of its last test, None when it did not stay whole}} (a node's last test sets
+    its processing: a ring it passed with is its ring, V: fresh camera v3024, v3025)."""
     ins, cons, by, src = topology(low)
     pol = pol or graph_policy(low)
     nds, shp = pol["nodes"], pol["shapes"]
@@ -1925,7 +1927,7 @@ def forwarding(low, pol=None):
                 t = ins[t][0]
         if all(x in branch or x == kn for x in cons.get(r, [])):
             heads[r] = kn
-    life, res, nbuf = {}, {}, {}
+    life, res, nbuf, last = {}, {}, {}, {}
     for mode in ("is", "cs", "ff"):
         cur, mem0, ok = None, 0, set()
         res[mode], nbuf[mode] = {}, {}
@@ -1954,10 +1956,11 @@ def forwarding(low, pol=None):
             r = _pol_whole(nds[n], mem, ifm_pre=mode != "cs" and p == cur,
                            ofm_pre=mode != "is" and bool(rd) and by[rd[0]]["kind"] == "concat")
             life[n] = r["extended"]
+            last[n] = r["nbuf"] if r["whole"] else None
             if r["whole"]:
                 ok.add(n)
                 nbuf[mode][n] = r["nbuf"]
-    return {"life": life, "ok": res, "nbuf": nbuf, "heads": heads}
+    return {"life": life, "ok": res, "nbuf": nbuf, "heads": heads, "last": last}
 
 
 def concat_ofm_shared(kn, cons, fwd):

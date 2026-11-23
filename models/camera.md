@@ -115,3 +115,13 @@ decoding and NMS).
 
 SSD MobileNet v2, the face SSD and Frigate's MobileDet add residual ADDs (rank 3 above; and PAD for the face SSD);
 PoseNet (353x481, 3 outputs, a decoder op on the CPU) needs exactly what SSD v1 needs.
+
+## Camera resolutions in the zoo
+
+The backbones of SSD MobileNet v1 and v2 (300 px), MobileDet and EfficientDet-Lite0 (320 px), PoseNet MobileNet v1
+(257 px) and MoveNet (192 px), with our weights and power-of-two ADD scales, one output each: models/README.md,
+section "Camera resolutions". ncpgen is exact on the SSD v1 and v2 backbones, MoveNet's and MobileDet's to C4; NPUC
+itself crashes on the published MobileDet and EfficientDet-Lite0 backbones (their 5x5 depthwise layers over 768 at
+stride 2, 960 and 1152 channels overflow its weight packer's stack in their dense form) and asserts on PoseNet at 257 px
+(a tile of its first stratum ends past the map); ncpgen refuses all three the same way. What remains for the
+published files is listed per model above (several outputs, the CPU tail, ADD scales, upsampling).

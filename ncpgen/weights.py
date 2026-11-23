@@ -184,6 +184,24 @@ def _max_batches(geo):
     return bound if bound <= vc else 1
 
 
+# tryBuildData's stack array (decompiled, @0x3c5794): 24 B x IDPs x interleave x maxPossibleBatches x passes x DRUs,
+# 1536 x maxPossibleBatches x ceil(Cout / 16) bytes on the packing thread's stack (Bionic's 1 MiB): V on
+# $NCPGEN_WORK/zoo-evidence/probe-dw5 (dense 5x5 depthwise convs at 10x10): 995328 B compiles (864 channels), 1050624
+# crashes (912), as 1105920 (960), 1179648 (5x5 stride 2 over 768) and 1769472 (1152)
+TRYBUILD_STACK_OK = 995328
+
+
+def _stack_check(geo):
+    """NPUC crashes (SIGSEGV in tryBuildData's memset) when its stack array passes the packing thread's stack: refuse
+    the layers past the largest one seen compiling (the camera models' 5x5 depthwise layers over 912+ channels in
+    their dense form: MobileDet's and EfficientDet-Lite0's; models/README.md)"""
+    need = 1536 * _max_batches(geo) * cdiv(geo["cout"], 16)
+    if need > TRYBUILD_STACK_OK:
+        raise ValueError("NPUC crashes packing this conv (tryBuildData's stack array of %d B for %d sub-batches x %d "
+                         "passes; %d B compile, 1050624 crash)" % (need, _max_batches(geo), cdiv(geo["cout"], 16),
+                                                                     TRYBUILD_STACK_OK))
+
+
 def sub_batches(L, quant_mode=1, geo=None, planner=False):
     """The split of each core's (virtual) channels into sub-batches: (count, virtual channels per sub-batch).
     updateBatchesForFile (@0x3c7be0): the count is the largest getMinNumberOfBatches over every (core, real output
@@ -196,6 +214,7 @@ def sub_batches(L, quant_mode=1, geo=None, planner=False):
     geo = geo or conv_geometry(L)
     w, zero = _stored(L, quant_mode)
     cin, (kh, kw) = geo["cin"], geo["k"]
+    _stack_check(geo)
     pos = _positions(geo)
     K = geo["vk"][0] * geo["vk"][1]
     if len(pos) <= MAX_NZV:

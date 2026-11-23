@@ -155,6 +155,30 @@ Findings on the way (NPUC, V):
   (`frame.graph_policy` refuses the rest); real ResNets and MobileNet v2 downsample first (56x56x64 is 150 KB), so this
   does not matter for them.
 
+## Camera resolutions (2026-11-23)
+
+The camera models' backbones (models/camera.md) at their published input sizes, our weights, one output each (the
+NPU part to the last feature map; the heads, CPU tails, upsampling and several outputs are other work). They exercise
+NPUC's tiling inside graphs at 192..320 px. **8 entries: 4 exact, 1 differs, 3 that NPUC refuses (ncpgen refuses
+them too).**
+
+| model | NPUC | ncpgen | what NPUC does / why it refuses |
+|---|---|---|---|
+| ssd-mobilenet-v1-300 | PASS | **EXACT** | conv1 .. conv8 one stratum of 4 x 2 tiles, each tile cut in 2 groups for its CMDQ size (frame.md 6.9), trim-and-spill copies before the 19x19x512 depthwise layers, the extra layers whole |
+| ssd-mobilenet-v2-300 | PASS | **EXACT** | the 150x150 layers one stratum of 7 row tiles; the 19x19x576 stride-2 depthwise layer with the policy's ring of 12 of 36 passes (frame.md 6.11); spills and trims as NPUC's allocator does them |
+| movenet-backbone-192 | PASS | **EXACT** | MobileNet v2 1.0 at 192 px to conv 1280 |
+| mobiledet-320-c4 | PASS | **EXACT** | MobileDet-EdgeTPU to C4 (20x20x96): Tucker and fused blocks at 160 and 80 px tiled, 15 ADDs' blocks |
+| efficientdet-lite0-320-p4 | PASS | differs | EfficientNet-Lite0 to P4 (20x20x112): NPUC gives a one-layer tiled stratum (the 3x3 stride-2 depthwise over 240 channels, quant 3) a PARTIAL_SUM chunk and partial-sum passes although its weights pack in one sub-batch (the policy's 511-byte rule; not modelled) |
+| mobiledet-320 | crashes | refuses | its 5x5 depthwise layers over 768 at stride 2 and 960: tryBuildData's stack array (NPUC limits below) |
+| efficientdet-lite0-320 | crashes | refuses | its 5x5 depthwise layers over 1152: the same |
+| posenet-mobilenet-v1-257 | asserts | refuses | conv1 .. dw4 one stratum of 5 row tiles at 257 px whose fourth input tile ends on row 260: "Tile end row exceeds FM shape" (frame.md 6.10) |
+
+The C4 and P4 cuts keep every layer above 20x20, where the planner matters, and stop before the layers NPUC crashes
+on. A depthwise layer written as channel halves (two dense convs over the whole input, concatenated: the same
+function) compiles (`probe-dw5/dwhalf5-960`), so npunet could lower those layers so (not done: as dense convs in the
+JSON the halves would be 26 M (MobileDet) and 100 M (EfficientDet) weights). The fresh camera random set
+(`stream_graphs.py random $NCPGEN_WORK/sweep/graph-camera 3000 40 --set camera`, 256..320 px): frame.md 6.11.
+
 ## What ncpgen and npunet need, ranked
 
 What unblocks the most models for the least work comes first. Items marked done have been applied since.
@@ -331,8 +355,10 @@ What unblocks the most models for the least work comes first. Items marked done 
 | average pool 7x7 stride 1 VALID over 64, 1024, 1280 channels; 8x8 stride 1 | compile; ncpgen exact | probe-gap7, the 224 models |
 | average pool 9x9 .. 13x13 (stride 1) | "ncp_nfu_pooling: Invalid parameters!" (13x13 over 1000 channels: a DynamicBuffer assertion) | probe-gap7, squeezenet11-224 |
 | eltwise add whose operands and result pass 256 KiB per core (residual blocks of 64+ channels at 96..160 px) | asserts "Trying to split an unsplittable layer into more than one tile!" (SingleTileBackPropagator) | graph-split res96-64 .. res160-64 |
+| dense 5x5 depthwise conv over 912+ channels, or over 768 at stride 2 (MobileDet's and EfficientDet-Lite0's 10x10 and 20x20 stages) | crashes (SIGSEGV in tryBuildData's memset): its stack array of 1536 x maxPossibleBatches x ceil(Cout / 16) bytes passes the packing thread's 1 MiB stack (995328 B compiles, 1050624 crashes); ncpgen refuses past 995328 (`weights._stack_check`) | mobiledet-320, efficientdet-lite0-320, `probe-dw5/` (5x5 over 480 .. 864 and a 960 -> 480 half compile, 912, 960, 1152 and 768 at stride 2 crash; 3x3 over 960 and 1152 compile) |
+| a tiled stratum whose input tile ends past the map (odd sizes: 257 px) | asserts "Tile end row exceeds FM shape" after its policy (calculateNodeCodegenParameters); ncpgen refuses (`frame._pol_tile_ends`) | posenet-mobilenet-v1-257, tiling2 b04, fresh camera v3002, v3030 |
 
-The probes' networks (`probe-src/`, npu-net/1 JSON, our weights; `probe-stride/<probe>/model.json`) and NPUC's outputs
+The probes' networks (`probe-src/`, npu-net/1 JSON, our weights; `probe-dw5/src/`, the depthwise probes; `probe-stride/<probe>/model.json`) and NPUC's outputs
 (`probe/`, `probe3/`, `probe-pool/`, `probe-stride/`, `gaplim-defect/`) are in `$NCPGEN_WORK/zoo-evidence/` (outside `sweep/`, so `regress.sh` does not take
 them), with the resnet8 ordering variants (`order/`: add inputs swapped, shortcut first, both).
 

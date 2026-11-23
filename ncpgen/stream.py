@@ -1447,11 +1447,18 @@ class Plan:
             raise Unsupported("weights.py: %s" % e)
         cats = [L["name"] for L in order if L["kind"] == "concat"]
         # a concat in SRAM: NPUC's static conditions (common.concat_in_sram); its layer-block forwarding's test of the
-        # block must pass too (frame.forwarding, mode "cs"): a block that fails it (large random t2022: the concat in
-        # DRAM, its single reader's chunk a second citizen, the next block's pool output a first citizen) is refused
+        # block must pass too (frame.forwarding, mode "cs"), and its readers must share its OFM (concat_ofm_shared);
+        # a concat that passes the static test but not the others goes to DRAM, its single reader's chunk a second
+        # citizen live at the reader (V: large random t2022, fresh camera v3003)
         fwd = frame.forwarding(low, pol)
-        scats = [kn for kn in cats if concat_in_sram(kn, outs, by, ins, cons)
-                 and not any(x in tst for x in ins[kn] + cons.get(kn, [])) and frame.concat_ofm_shared(kn, cons, fwd)]
+
+        def cs_ok(kn):
+            hs = [h for h, k in fwd["heads"].items() if k == kn]
+            return bool(hs) and fwd["ok"]["cs"].get(hs[0], False)
+        tagged = {kn for kn in cats if concat_in_sram(kn, outs, by, ins, cons)}
+        scats = [kn for kn in cats if kn in tagged
+                 and not any(x in tst for x in ins[kn] + cons.get(kn, [])) and frame.concat_ofm_shared(kn, cons, fwd)
+                 and cs_ok(kn)]
         # tensors their readers load from DRAM: the network input, a concat's buffer, a tiled stratum's output read by
         # a layer
         dsrc = [src] + [kn for kn in cats if kn not in scats and kn not in outs]
@@ -1535,10 +1542,7 @@ class Plan:
             if any(x in tst for x in nodes):
                 return False
             heads = [h for h, k in fwd["heads"].items() if k == kn]
-            ok = bool(heads) and fwd["ok"][mode].get(heads[0], False)
-            if ok and any(fwd["nbuf"][mode].get(x) for x in nodes):
-                raise Unsupported("a layer-block whose node only fits with a weight ring: not modelled")
-            return ok
+            return bool(heads) and fwd["ok"][mode].get(heads[0], False)
         for kn in scats:
             if not bulb_fits(kn, "cs"):
                 raise Unsupported("a concat in SRAM NPUC's forwarding refuses (%s): not modelled" % kn)
@@ -1586,7 +1590,9 @@ class Plan:
                 # reader, loaded by the first and shared (input sharing; V: large random t1016)
                 if not any(all(bulb_root(i) == t for i in ins[kn]) and
                            bulb_fits(kn, "is") for kn in cats):
-                    for j, r in enumerate(rs):
+                    # (several readers: in NPUC's node order, V: fresh camera v3003's chunk requests, two 1x1 convs
+                    # reading a pool stratum)
+                    for j, r in enumerate(sorted(rs, key=lambda r: head[r])):
                         rch[t, r] = chunk("WCONCAT", size, [head[r], head[r]], (2, oidx[tst[t]["layers"][0]], 2, j))
                 else:
                     ck = chunk("WCONCAT", size, [tail[t], max(head[r] for r in rs)], (0, tail[t], 1))
@@ -1596,7 +1602,13 @@ class Plan:
             if t == src and shared:
                 ck = chunk(nm, size, [0, max(head[r] for r in rs)], (0, 0, 0))
                 rch.update({(t, r): ck for r in rs})
-            elif t != src and len(rs) == 1:
+            elif t != src and len(rs) > 1 and by[t]["kind"] == "concat" and fwd["ok"]["is"].get(t):
+                # a concat in DRAM heading an input-sharing block its readers pass: one first citizen from the concat
+                # to its last reader, loaded by the first, shared by the others (V: fresh camera v3025)
+                ck = chunk(nm, size, [tail[t], max(head[r] for r in rs)], (0, tail[t], 1))
+                rch.update({(t, r): ck for r in rs})
+                wshared.add(t)
+            elif t != src and len(rs) == 1 and t not in tagged:
                 rch[t, rs[0]] = chunk(nm, size, [tail[t], head[rs[0]]], (0, tail[t], 1))
             else:
                 for r in rs:
@@ -1723,7 +1735,11 @@ class Plan:
                 pr = d.get("prows", d["wunits"])
                 d["ring"] = weight_ring(dict(d, wunits=pr))
                 b = pol["best"].get(n)
-                if b is not None and b["tiles"] == (1, 1) and b["nbuf"] and b["nbuf"] != d["ring"]:
+                if fwd["last"].get(n):
+                    # a block node's last forwarding test passed with a weight ring: that ring (frame.forwarding's
+                    # "last"; V: fresh camera v3024, v3025, 4 of 8 passes, a short ring on its conv only)
+                    d["ring"] = fwd["last"][n]
+                elif b is not None and b["tiles"] == (1, 1) and b["nbuf"] and b["nbuf"] != d["ring"]:
                     # the ring NPUC's policy chose (getBestProcessingParams, frame.md 6.10), as a chain takes it: its
                     # estimate counts a stride-2 conv's PAD and REFORMAT blocks where weight_ring's chunks do not
                     # (V: ssd-mobilenet-v2-300's 19x19x576 depthwise at stride 2, 12 of 36 passes, not 18)

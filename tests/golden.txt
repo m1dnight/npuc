@@ -149,6 +149,10 @@ zoo-squeezenet11-224-npu|zoo:squeezenet11-224-npu||bd99ab41ec3d242b784b1773a329f
 zoo-ssd-mobilenet-v1-025-128|zoo:ssd-mobilenet-v1-025-128|--allow-none|51a90f529eba7988cb3f66627f1c585ac3a50d10b94cbb224d9bc5e5aecbca38
 zoo-ssd-mobilenet-v1-025-224|zoo:ssd-mobilenet-v1-025-224|--allow-none|0bf6f6642561e426c4157199513da9eee682a961032f0881e60a2ce49f679ded
 zoo-ssd-mobilenet-v1-025-300|zoo:ssd-mobilenet-v1-025-300|--allow-none|b7e204214d9348b4d1a3cb5aecb547f24d579f475b89bda7587c21beedeba43a
+zoo-ssd-mobilenet-v1-300|zoo:ssd-mobilenet-v1-300||8e9eed36aeba58f95d9cefb3a4ecdd31dfce09acb9f25ed77048b33c53b71a98
+zoo-ssd-mobilenet-v2-300|zoo:ssd-mobilenet-v2-300|--quant 3 --allow-none|deed317b57537975d9ecdb2db526943bb6c5047c7bdb49cc0c186e8c2c91b3eb
+zoo-mobiledet-320-c4|zoo:mobiledet-320-c4|--quant 3 --allow-none|174becbb206b23d98534e245a7d8b7852608a962342a30ae4b31fbf071e5eac2
+zoo-movenet-backbone-192|zoo:movenet-backbone-192|--quant 3 --allow-none|dda454657c815b9d1590dbf3cb8a84ff21abd0b9bb393810b6a01428b3779474
 restride-s-conv2x1-fc|restride:s-conv2x1-fc|--allow-none|5d3a8bda7bc46578996776bd6e151cef3df381ecf89e06f1868e2b57e1dd191e
 restride-s-conv1x3-fc|restride:s-conv1x3-fc|--allow-none|dd96df281f1fb8bae7f7d7700cbc0e2a6ec012df30ed92bb3e6cda54d68eae14
 restride-s-conv3-fc|restride:s-conv3-fc|--allow-none|cbd3e6dbdc0be6b81461a918ec2afc11350e9fd1dffe2e1a916e8f552ae3565e
