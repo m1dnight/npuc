@@ -1,4 +1,4 @@
-# NEPCGen
+# NPCGen
 
 An open compiler for the NPU of Samsung's Exynos 990 (Galaxy S20 family). It takes quantized TFLite models and writes
 **NCPs**, the binaries the NPU's firmware runs, byte for byte what Samsung's own compiler writes. Pure Python, no
