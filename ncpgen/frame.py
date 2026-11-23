@@ -916,8 +916,17 @@ def plan_graph(low, weight_sizes=None):
     dmas = [(op, i, g) for g, ops in enumerate(P.groups) for op in ops if op.kind in ("load", "store")
             for i in range(len(op.flags) if op.kind == "store" else 1)]
     vim = {}
+    # a DRAM concat's input that another layer loads back from the concat's buffer (stream.py, cat_of): NPUC still
+    # gives it a DRAM of its own (its forwarding names it the reader's input DRAM), an IM vector no DMA uses, before
+    # the concat's at its first store (V: add-probe res-c4, res-c8, res-c24, chain3's stem; not for the one-node
+    # inputs its readers share in SRAM: chain3's ADD convs)
+    own = {op.cat_of for op, _, _ in dmas if op.kind == "load" and getattr(op, "cat_of", None)}
     for op, i, g in dmas:
         if op.kind == "store" and op.tensor not in vim:
+            if gl[g] in own and gl[g] not in vim:
+                c_, h_, w_ = chw[gl[g]]
+                im = _im_vector(c_, h_, w_, c_ * h_ * w_)
+                vim[gl[g]] = vec(MV_IM, im["av"], (im["w"], im["h"], im["c"]))
             c_, h_, w_ = chw[op.tensor]
             im = _im_vector(c_, h_, w_, c_ * h_ * w_)
             vim[op.tensor] = vec(MV_IM, im["av"], (im["w"], im["h"], im["c"]))
@@ -1073,19 +1082,26 @@ def plan_graph(low, weight_sizes=None):
         elif hasattr(op, "slots"):
             # an input read slot by slot (its first op an NFU one, 16 plane slots per core or more; or a cut layer's
             # chunks): each load its slots of every IDP, as in a chain (section 6.9)
-            lay = cell(*chw[t])
+            cat_of = getattr(op, "cat_of", None)
+            lay = cell(*chw[cat_of or t])
+            base = coff(cat_of, t) if cat_of else 0
             for op_, _, _ in run:
                 s0, s1 = op_.slots
                 sz = (s1 - s0) * lay["plane"]
                 idps, h, w, cs = _sram_dma(lay["n"], sz // (2 * lay["Wp"]), 2 * lay["Wp"])
-                rows.append((g, 0, _blob(tvec(t), s0 * lay["plane"], 1, idps, h, w, cs=lay["per_idp"] - sz),
+                rows.append((g, 0, _blob(tvec(t), base + s0 * lay["plane"], 1, idps, h, w, cs=lay["per_idp"] - sz),
                              _blob(0, op_.sram, 1, idps, h, w, cs=cs)))
         else:
-            lay = cell(*chw[t])
+            # a concat input another layer reads too, loaded back from the concat's buffer (cat_of: its own layout,
+            # at its channel offset; cmdq.md 7c)
+            cat_of = getattr(op, "cat_of", None)
+            lay = cell(*chw[cat_of or t])
+            base = coff(cat_of, t) if cat_of else 0
             parts = _spread_dmas(lay, len(run) > 1)
             for q, (op_, i_, _) in enumerate(run):
                 vec_, idps, h, w, cs, doff = parts[min(q, len(parts) - 1)]
-                rows.append((g, 0, _blob(tvec(t), doff, 1, idps, h, w), _blob(vec_, op_.sram, 1, idps, h, w, cs=cs)))
+                rows.append((g, 0, _blob(tvec(t), base + doff, 1, idps, h, w),
+                             _blob(vec_, op_.sram, 1, idps, h, w, cs=cs)))
         k = j
     io = []
     for n_, ((op, i, _), (g, d_, sb, db)) in enumerate(zip(dmas, rows)):

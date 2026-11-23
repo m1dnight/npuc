@@ -478,6 +478,13 @@ planes at a slot offset (sum of the earlier inputs' ppc); no group, no DMA. Each
 input 2's planes, ...]: a permuted channel order for every reader. A pool of it keeps the segments, and storing it
 takes one DMA per segment per core, or one per core when the segments are alike (V: g169 2 x 4, g141 3 x 4 and 1 x 4).
 
+**A concat input other layers read too** (V: `$NCPGEN_WORK/sweep/add-probe` 20/20, `add-random` 40/40 unseen; npunet's
+`--add-as-conv`, docs/format/add.md 5). In SRAM: the producer writes into CONCAT_STORAGE as any input and its other
+readers read its planes there; a branch root that is itself an input of its SRAM concat is never stored. In DRAM: the
+producer stores into the concat's buffer as any input; when its layer is more than one node (a padded or strided
+conv), its first other reader loads it back from the buffer at its channel offset into the producer's own chunk; a
+one-node layer is read in SRAM, and as a branch root it is a first citizen that nothing stores or reloads.
+
 **SRAM chunks.** First citizens, in order of live start, each at 0 when free there, else at the top of SRAM below any
 top one live with it (V: cat16, g021, g141, g169): the shared INPUT, stored branch roots, a concat buffer read by one
 layer (from the concat atom), CONCAT_STORAGE. Then the per-reader chunks of DRAM tensors read by several layers (one

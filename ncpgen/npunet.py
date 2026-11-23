@@ -3,7 +3,7 @@
 Python 3: no numpy, no flatbuffers package (a minimal FlatBuffer reader and writer are below).
 
   npunet.py lower <model.tflite|net.json> <dir> [--quant 1|3] [--allow-none] [--fold-per-channel | --per-channel-shifts]
-                  [--output TENSOR] [--relu6-range]
+                  [--output TENSOR] [--relu6-range] [--add-as-conv]
         the model as the NPU will compute it: <dir>/lowered.json (every parameter explicit) and <dir>/net.npuc (the
         phone's compiler harness input, oracle/harness/npuc-net.cpp)
   npunet.py ref <lowered.json> <input.bin> <output.bin>        the CPU reference: the model's output bytes
@@ -46,6 +46,11 @@ point, else with --allow-none). NPUC refuses every other subsampling conv (1x1 a
 $NCPGEN_WORK/zoo-evidence/probe-stride), so nothing else is rewritten. Graph ops through the harness's "npuc-net 2" layers
 (docs/harness-ops.md; NPUC compiles them, nothing of them has run on the NPU yet):
   ADD -> eltwise Add (--quant 3 only, every scale 2^-n, no broadcasting; a fused RELU -> a relu layer after it);
+    any other ADD (any scales and zero points, quant 1 or 3, x + x) with --add-as-conv: a channel concat of the two
+    inputs, each keeping its quantisation ("concat ... mixed"), and a 1x1 conv over it weighing each input's channel
+    by an integer, the zero-point difference in its bias, one requantisation (a change of the model within a
+    fraction of an LSB plus the rounding: docs/format/add.md; NPUC itself has no form of it, the stock HAL never
+    hands it an ADD);
   CONCATENATION -> concat (channels only, every input already in the output's quantisation, not the network input);
   RELU (RELU6 when its clamp is a no-op) -> folded into the conv before it when it alone reads that conv, else relu.
 Anything else (MUL, LOGISTIC...) is refused with its name. A chain of conv/pool layers is written as
@@ -788,6 +793,7 @@ class _Lowering:
         self.low, self.dtype, self.quant, self.fold, self.allow_none = low, dtype, quant, fold, allow_none
         self.ents, self.show, self.npuc_strides = ents, show, npuc_strides
         self.relu6_range = False    # --relu6-range (lower() sets it)
+        self.add_conv = False       # --add-as-conv (lower() sets it)
         self.blobs = {}
         self.tail = None        # the key of the last CPU-tail op
         self.readers = {}       # tensor key -> the indices in ents of the ops reading it
@@ -1250,34 +1256,223 @@ def _lower_pool(lw, idx, L, op, name, key, ins, srcs):
     return {"name": name, "chw": [Cc, ho, wo], "scale": os_, "zp": oz}
 
 
-def _lower_add(lw, idx, L, op, name, key, ins, srcs):
-    """ADD as NPUC's Eltwise: quant 3, every scale 2^-n (its fractional lengths), no broadcasting; a fused RELU
-    becomes a relu layer"""
-    if len(ins) != 2:
-        raise Refused("add %s: %d inputs (two)" % (name, len(ins)))
+def add_fit(ra, rb, Ra, Rb, wmax):
+    """the integer weights and NPUC multiplier closest to an ADD's two scale ratios (docs/format/add.md): (wa, wb,
+    slope, shift) minimising the worst output error |wa M - ra| Ra + |wb M - rb| Rb (LSB of the output), M = slope /
+    2^shift as NPUC's setScale makes it from a multiplier below 1 (slope 128..255, shift 8..15: 8 bits, V), weights
+    1..wmax; ra = s_a / s_out, rb = s_b / s_out, Ra / Rb the largest |x - zp| of each input. rb None: one input (x + x,
+    its ratio ra = 2 s_x / s_out)"""
+    best = None
+    for shift in range(8, 16):
+        for slope in range(128, 256):
+            M = Fraction(slope, 1 << shift)
+            cand = []
+            for r, R in ((ra, Ra), (rb, Rb)):
+                if r is None:
+                    cand.append([(0, Fraction(0))])
+                    continue
+                q = int(r / M)
+                cand.append([(w, abs(w * M - r) * R) for w in {max(1, min(wmax, q)), max(1, min(wmax, q + 1))}])
+            for wa, ea in cand[0]:
+                for wb, eb in cand[1]:
+                    if best is None or ea + eb < best[0]:
+                        best = (ea + eb, wa, wb, slope, shift)
+    return best[1:] + (float(best[0]),)
+
+
+def _w_scale_for(in_s, out_s, slope, shift, name):
+    """a float32 weight scale for which NPUC's setScale gives exactly (slope, shift) from in_s and out_s (npuc_multiplier)"""
+    w = f32(float(Fraction(slope, 1 << shift) * Fraction(out_s) / Fraction(in_s)))
+    u = struct.unpack("<I", struct.pack("<f", w))[0]
+    for d in (0, 1, -1, 2, -2, 3, -3, 4, -4):
+        ws = struct.unpack("<f", struct.pack("<I", u + d))[0]
+        try:
+            if npuc_multiplier(in_s, ws, out_s) == (slope, shift):
+                return ws
+        except Refused:
+            pass
+    raise Refused("%s: no float32 weight scale gives NPUC's multiplier %d/2^%d" % (name, slope, shift))
+
+
+def _relabel(lw, x, k, s_new, name):
+    """the ADD operand x (graph tensor k) given the scale label s_new for NPUC: when a conv makes it and this ADD alone
+    reads it, that conv declares s_new as its output scale with its weight scale changed so that NPUC's multiplier
+    (slope, shift) is the same: its output bytes do not change (NPUC sees scales only through multipliers). True when
+    done"""
+    if x["name"] == "data0" or len(lw.readers.get(k, [])) != 1:
+        return False
+    prod = next((l for l in reversed(lw.low["layers"]) if l["name"] == x["name"]), None)
+    if prod is None or prod["kind"] != "conv" or "slopes" in prod:
+        return False
+    try:
+        ws = _w_scale_for(hex_f32(prod["in_scale"]), s_new, prod["slope"], prod["shift"], name)
+    except Refused:
+        return False
+    prod.setdefault("scale_label", {"out_scale": prod["out_scale"], "w_scale": prod["w_scale"]})
+    prod["out_scale"], prod["w_scale"] = f32_hex(s_new), f32_hex(ws)
+    lw.low["warnings"].append("%s: output scale declared %.9g (real %.9g) and weight scale %.9g for NPUC: the same "
+                              "multiplier %d/2^%d, so the same bytes; %s's concat then takes no rescale (NPUC's "
+                              "ConcatScaleFoldingFilter, docs/format/add.md)" % (
+                                  prod["name"], s_new, x["scale"], ws, prod["slope"], prod["shift"], name))
+    return True
+
+
+def _copy_conv(lw, x, s_new, name, L, op):
+    """an identity 1x1 conv over the ADD operand x, its bytes unchanged (weights 1, bias 0, NPUC's multiplier exactly
+    256/2^8, the output zero point = the input's), its output labelled s_new: the network input made a layer (NPUC
+    refuses it as a concat operand), or an operand given its partner's scale label when no producer conv can take it"""
+    C = x["chw"][0]
+    wz, one = (0, 1) if lw.quant == 1 else (128, 129)
+    ws = _w_scale_for(x["scale"], s_new, 256, 8, name)
+    act = "relu" if _nonneg(lw.low, x["name"]) else "none"
+    if act == "none" and not lw.allow_none:
+        raise Refused("%s: ADD with any scales (--add-as-conv) needs an identity conv over %s, without activation: "
+                      "--allow-none" % (name, x["name"]))
+    w = [wz] * (C * C)
+    for o in range(C):
+        w[o * C + o] = one
+    cname = "l%d_%s" % (len(lw.low["layers"]) + 1, _clean(L.get("name", op) + "_copy"))
+    lw.low["layers"].append({"kind": "conv", "name": cname, "from": "add", "src_name": L.get("name", ""),
+                             "input": x["name"], "in_chw": list(x["chw"]), "cout": C, "k": [1, 1], "stride": [1, 1],
+                             "padding": "VALID", "pads": [0, 0, 0, 0], "act": 1 if act == "relu" else 0,
+                             "in_scale": f32_hex(x["scale"]), "in_zp": x["zp"], "w_scale": f32_hex(ws), "w_zp": wz,
+                             "out_scale": f32_hex(s_new), "out_zp": x["zp"], "slope": 256, "shift": 8,
+                             "weights_oihw_u8": w, "bias": [0] * C, "out_chw": list(x["chw"])})
+    lw.low["warnings"].append("%s: identity 1x1 conv over %s for %s (multiplier 256/2^8: the same bytes), labelled "
+                              "scale %.9g for NPUC" % (cname, x["name"], name, s_new))
+    return {"name": cname, "chw": list(x["chw"]), "scale": x["scale"], "zp": x["zp"], "label": s_new}
+
+
+def _lower_add_conv(lw, idx, L, op, name, key, ins, srcs):
+    """ADD with any scales and zero points (--add-as-conv): NPUC's Eltwise only shifts and has no zero-point term, and
+    the stock HAL never hands NPUC an ADD (docs/format/add.md), so the sum is a 1x1 conv over the channel concatenation
+    of the two inputs: output o weighs input a's channel o by wa and input b's channel o by wb, its bias holds the
+    zero-point difference wb (z_a - z_b), the conv's input zero point is z_a, so acc = wa (a - z_a) + wb (b - z_b)
+    exactly, and one requantisation (NPUC's multiplier, 8 bits) gives the output. wa, wb and the multiplier
+    approximate s_a / s_out and s_b / s_out (add_fit): the change of the model against TFLite's ADD is the fit's error
+    plus the rounding (docs/format/add.md, models/camera.md). NPUC's ConcatScaleFoldingFilter gives a concat's
+    producers the concat's scale, so both operands are declared with one scale label (_relabel, _copy_conv); the zero
+    points differ ("concat ... mixed")"""
     a, b = srcs
-    if a["name"] == b["name"]:
-        raise Refused("add %s: both inputs are %r: x + x is not supported (NPUC's policy maker asserts, PGraph::clone "
-                      "\"this->equals(graph)\": docs/harness-ops.md 3.1)" % (name, lw.show[ins[0]]))
-    if a["chw"] != b["chw"]:
-        raise Refused("add %s: inputs %s and %s (C x H x W): broadcasting is not supported (NPUC's Eltwise adds two "
-                      "tensors of the same shape)" % (name, "x".join(map(str, a["chw"])), "x".join(map(str, b["chw"]))))
-    if lw.quant != 3:
-        raise Refused("add %s: ADD needs --quant 3 (native s8, every zero point int8 0): NPUC's Eltwise has no "
-                      "zero-point term (docs/harness-ops.md 3.1)" % name)
+    C = a["chw"][0]
     outq = L["output"]
     os_ = f32(float(outq["scale"]))
     oz = lw.u8zp(int(outq["zero_point"]))
-    fl = []
-    for what, s_ in (("input 1 (%s)" % lw.show[ins[0]], a["scale"]), ("input 2 (%s)" % lw.show[ins[1]], b["scale"]), ("output", os_)):
-        n_ = pow2_fl(s_)
+    act = L.get("activation", "none")
+    if act == "relu6":
+        if _relu6_as_relu(name, oz, os_, lw.low):
+            act = "relu"
+        elif lw.relu6_range and lw.quant == 1 and lw.readers.get(key):
+            lw.low["warnings"].append("%s: RELU6 clamping at %d inside the range (scale %g, zero point %d): output "
+                                      "requantised to [0, 6] (scale 6/255, zero point 0) for its readers: a change of "
+                                      "the model (--relu6-range)" % (name, relu6_top(oz, os_), os_, oz))
+            os_, oz, act = f32(6.0 / 255), 0, "relu"
+        else:
+            raise Refused("%s: ADD with RELU6 clamping inside the output range (NPUC: 'Unsupported FusedActivation "
+                          "type' 3); --relu6-range requantises such outputs to [0, 6]" % name)
+    if act == "none" and not lw.allow_none:
+        raise Refused("%s: ADD without activation, lowered to a conv (--add-as-conv) that NPUC compiles to "
+                      "GRELU_BYPASS_ONDEVICE (the byte 0 wherever acc >= 0, dossier/npu-compiler.md section 9.11); "
+                      "--allow-none compiles it anyway" % name)
+    if act not in ("none", "relu"):
+        raise Refused("%s: ADD activation %s (none or relu)" % (name, act))
+    # quant 1: uint8 weights with zero point 0 (1..255: both ratios are positive); quant 3: int8 weights (zero point 128)
+    wz, wmax = (0, 255) if lw.quant == 1 else (128, 127)
+    same = a["name"] == b["name"]
+    za, zb = a["zp"], b["zp"]
+    rng = lambda z: max(z, 255 - z)
+    if same:
+        ra, rb = Fraction(a["scale"]) * 2 / Fraction(os_), None
+    else:
+        ra, rb = Fraction(a["scale"]) / Fraction(os_), Fraction(b["scale"]) / Fraction(os_)
+    wa, wb, slope, shift, err = add_fit(ra, rb, rng(za), rng(zb), wmax)
+    if same:
+        cur = dict(a, label=a["scale"])
+    else:
+        x = [dict(a, label=a["scale"]), dict(b, label=b["scale"])]
+        for i in (0, 1):
+            if x[i]["name"] == "data0":     # NPUC refuses the network input as a concat operand: copy it first
+                x[i] = _copy_conv(lw, x[i], x[i]["scale"], name, L, op)
+        if x[0]["label"] != x[1]["label"]:
+            if _relabel(lw, x[1], ins[1], x[0]["label"], name):
+                x[1]["label"] = x[0]["label"]
+            elif _relabel(lw, x[0], ins[0], x[1]["label"], name):
+                x[0]["label"] = x[1]["label"]
+            else:
+                x[1] = _copy_conv(lw, x[1], x[0]["label"], name, L, op)
+        lname = "l%d_%s" % (len(lw.low["layers"]) + 1, _clean(L.get("name", op) + "_cat"))
+        chw = [2 * C] + list(a["chw"][1:])
+        # the concat's declared quantisation is its reader's view: the common scale label, a's zero point
+        lw.low["layers"].append({"kind": "concat", "name": lname, "from": "add", "src_name": L.get("name", ""),
+                                 "input": x[0]["name"], "inputs": [x[0]["name"], x[1]["name"]], "axis": 1,
+                                 "mixed": True, "in_chws": [list(a["chw"]), list(b["chw"])],
+                                 "out_scale": f32_hex(x[0]["label"]), "out_zp": za, "act": 0, "pads": [0, 0, 0, 0],
+                                 "out_chw": chw})
+        cur = {"name": lname, "chw": chw, "label": x[0]["label"], "zp": za}
+    cin = cur["chw"][0]
+    ws = _w_scale_for(cur["label"], os_, slope, shift, name)
+    w = [wz] * (C * cin)
+    for o in range(C):
+        w[o * cin + o] = wz + wa
+        if not same:
+            w[o * cin + C + o] = wz + wb
+    bias = [0 if same else wb * (za - zb)] * C
+    cname = "l%d_%s" % (len(lw.low["layers"]) + 1, _clean(L.get("name", op)))
+    lw.low["layers"].append({"kind": "conv", "name": cname, "from": "add", "src_name": L.get("name", ""),
+                             "input": cur["name"], "in_chw": list(cur["chw"]), "cout": C, "k": [1, 1], "stride": [1, 1],
+                             "padding": "VALID", "pads": [0, 0, 0, 0], "act": 1 if act == "relu" else 0,
+                             "in_scale": f32_hex(cur["label"]), "in_zp": cur["zp"], "w_scale": f32_hex(ws), "w_zp": wz,
+                             "out_scale": f32_hex(os_), "out_zp": oz, "slope": slope, "shift": shift,
+                             "weights_oihw_u8": w, "bias": bias, "out_chw": list(a["chw"]),
+                             "add": {"wa": wa, "wb": wb, "ra": float(ra), "rb": None if rb is None else float(rb),
+                                     "worst_lsb": round(err, 4)}})
+    M = Fraction(slope, 1 << shift)
+    lw.low["warnings"].append(
+        "%s: ADD with any scales as a 1x1 conv over %s (--add-as-conv, a change of the model): multiplier %d/2^%d, "
+        "weights %s for s_a/s_out %.6g%s: worst-case error %.3f LSB before rounding (docs/format/add.md)" % (
+            name, "its input (x + x)" if same else "the concatenation of its inputs (%d -> %d)" % (cin, C),
+            slope, shift, "%d" % wa if same else "%d, %d" % (wa, wb), float(ra),
+            "" if same else ", s_b/s_out %.6g (approximated %.6g, %.6g)" % (float(rb), float(wa * M), float(wb * M)), err))
+    lw.low["unproven"].append("%s: ADD as a conv over a concat whose inputs have their own zero points (compiles; not "
+                              "run on the NPU): the reference is that conv's arithmetic; weight zero point %d" % (name, wz))
+    if act == "none":
+        lw.low["warnings"].append("%s: no activation (GRELU_BYPASS_ONDEVICE: the byte 0 wherever acc >= 0, V)" % cname)
+    return {"name": cname, "chw": list(a["chw"]), "scale": os_, "zp": oz}
+
+
+def _lower_add(lw, idx, L, op, name, key, ins, srcs):
+    """ADD as NPUC's Eltwise: quant 3, every scale 2^-n (its fractional lengths), no broadcasting; a fused RELU
+    becomes a relu layer. Any other scales or zero points: refused, or with --add-as-conv a 1x1 conv over the
+    concatenation of the two inputs (_lower_add_conv)"""
+    if len(ins) != 2:
+        raise Refused("add %s: %d inputs (two)" % (name, len(ins)))
+    a, b = srcs
+    hint = "; --add-as-conv lowers it to a 1x1 conv over the concatenation of its inputs (a change of the model: " \
+           "docs/format/add.md)"
+    if a["chw"] != b["chw"]:
+        raise Refused("add %s: inputs %s and %s (C x H x W): broadcasting is not supported (NPUC's Eltwise adds two "
+                      "tensors of the same shape)" % (name, "x".join(map(str, a["chw"])), "x".join(map(str, b["chw"]))))
+    outq = L["output"]
+    os_ = f32(float(outq["scale"]))
+    oz = lw.u8zp(int(outq["zero_point"]))
+    fl = [pow2_fl(s_) for s_ in (a["scale"], b["scale"], os_)]
+    native = a["name"] != b["name"] and lw.quant == 3 and None not in fl and a["zp"] == b["zp"] == oz
+    if not native and lw.add_conv:
+        return _lower_add_conv(lw, idx, L, op, name, key, ins, srcs)
+    if a["name"] == b["name"]:
+        raise Refused("add %s: both inputs are %r: x + x is not supported (NPUC's policy maker asserts, PGraph::clone "
+                      "\"this->equals(graph)\": docs/harness-ops.md 3.1)%s" % (name, lw.show[ins[0]], hint))
+    if lw.quant != 3:
+        raise Refused("add %s: ADD needs --quant 3 (native s8, every zero point int8 0): NPUC's Eltwise has no "
+                      "zero-point term (docs/harness-ops.md 3.1)%s" % (name, hint))
+    for what, s_, n_ in (("input 1 (%s)" % lw.show[ins[0]], a["scale"], fl[0]),
+                         ("input 2 (%s)" % lw.show[ins[1]], b["scale"], fl[1]), ("output", os_, fl[2])):
         if n_ is None:
             raise Refused("add %s: %s scale %.9g is not 2^-n (n 0..31): NPUC's Eltwise aligns its inputs by powers "
-                          "of two only and cannot rescale (docs/harness-ops.md 3.1); quantise the model with "
-                          "power-of-two scales for the ADD's inputs and output" % (name, what, s_))
-        fl.append(n_)
+                          "of two only and cannot rescale (docs/harness-ops.md 3.1)%s" % (name, what, s_, hint))
     if not a["zp"] == b["zp"] == oz:
-        raise Refused("add %s: zero points %d, %d, %d (u8) differ: NPUC's Eltwise has no zero-point term" % (name, a["zp"], b["zp"], oz))
+        raise Refused("add %s: zero points %d, %d, %d (u8) differ: NPUC's Eltwise has no zero-point term%s" % (
+            name, a["zp"], b["zp"], oz, hint))
     act = _fused_act(name, "ADD", L.get("activation", "none"), oz, os_, lw.low)
     lw.low["layers"].append({"kind": "eltwise", "name": name, "op": "Add", "from": "add", "src_name": L.get("name", ""),
                           "input": a["name"], "inputs": [a["name"], b["name"]], "in_chw": list(a["chw"]),
@@ -1409,7 +1604,7 @@ LOWER_OPS = {"conv2d": _lower_conv, "fully_connected": _lower_conv, "depthwise_c
              "relu6": _lower_relu, "reshape": _lower_reshape, "softmax": _lower_softmax, "cpu_mean": _lower_cpu_mean}
 
 
-def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, relu6_range=False):
+def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, relu6_range=False, add_conv=False):
     """an npu-net/1 graph -> lowered.json's dict: every layer as NPUC computes it (uint8 asymmetric, OIHW weights,
     NPUC's multipliers and pads), the CPU tail, the warnings and what is not proven on the NPU; Refused for what NPUC
     or this path cannot take (the module docstring). Strides NPUC refuses are rewritten exactly (_lower_restrided);
@@ -1437,6 +1632,7 @@ def lower(g, quant=1, fold=False, allow_none=False, soc=2, npuc_strides=True, re
         low["input"]["shape"] = list(io["shape"])
     lw = _Lowering(low, dtype, quant, fold, allow_none, ents, show, npuc_strides)
     lw.relu6_range = relu6_range
+    lw.add_conv = add_conv
     lw.blobs[inkey] = {"name": "data0", "chw": [C, H, W], "scale": sc, "zp": zp_in}
     for idx, (L, key, ins) in enumerate(ents):
         op = L["op"]
@@ -1560,8 +1756,8 @@ def npuc_text(low):
                 l["name"], l["inputs"][0], l["inputs"][1], l["op"], l["in_scales"][0], l["in_zps"][0], l["in_scales"][1],
                 l["in_zps"][1], l["out_scale"], l["out_zp"]))
         elif l["kind"] == "concat":
-            out.append("concat %s %d %d %s %s %d" % (l["name"], l["axis"], len(l["inputs"]), " ".join(l["inputs"]),
-                                                     l["out_scale"], l["out_zp"]))
+            out.append("concat %s %d %d %s %s %d%s" % (l["name"], l["axis"], len(l["inputs"]), " ".join(l["inputs"]),
+                                                       l["out_scale"], l["out_zp"], " mixed" if l.get("mixed") else ""))
         elif l["kind"] == "relu":
             out.append("relu %s %s %s" % (l["name"], l["input"], l["type"]))
         else:
@@ -1570,7 +1766,7 @@ def npuc_text(low):
     return "\n".join(out) + "\n"
 
 
-def load_model(path, quant=1, fold=False, allow_none=False, output=None, relu6_range=False):
+def load_model(path, quant=1, fold=False, allow_none=False, output=None, relu6_range=False, add_conv=False):
     """a TFLite file or an npu-net/1 JSON -> lowered.json's dict (lower()); output: cut a TFLite model at that tensor
     (tflite_cut)"""
     data = open(path, "rb").read()
@@ -1583,7 +1779,7 @@ def load_model(path, quant=1, fold=False, allow_none=False, output=None, relu6_r
             g = json.loads(data)
         except ValueError:
             raise Refused("%s is neither a TFLite file nor JSON" % path)
-    low = lower(g, quant=quant, fold=fold, allow_none=allow_none, relu6_range=relu6_range)
+    low = lower(g, quant=quant, fold=fold, allow_none=allow_none, relu6_range=relu6_range, add_conv=add_conv)
     low["source"] = {"path": os.path.basename(path), "sha256": hashlib.sha256(data).hexdigest(),
                      "kind": "tflite" if tfl else "npu-net/1 json"}
     return low
@@ -2642,6 +2838,7 @@ def selftest_graph():
                (l2["ifm"]["plane_h"], l2["ifm"]["plane_w"]) == (16, 32) and not l2["ofm"]["proven"]))
     ok.append(("layout: the IFM read in two formats refused", _refuses(lambda: ncp_layout(low, _synthetic_ncp(
         8, 16, 16, [s0, (0, 512) + s0[2:]])))))
+    ok += _selftest_add_conv()
     # suspected NPUC defects named (frame.md 9.1, 9.2)
     u3 = lower(_sgraph([_sconv("a", 8, 3, r)]))["unproven"]
     ok.append(("an NPU output with 3 channels: named unproven (frame.md 9.1)", any("frame.md 9.1" in u for u in u3)))
@@ -2650,6 +2847,87 @@ def selftest_graph():
     u5 = lower(_sgraph(wg, shape=(1, 16, 17, 8)))["unproven"]
     ok.append(("a VALID pool widened by NPUC, read by a conv: named unproven (cmdq.md 7); last layer: not",
                any("cmdq.md 7" in u for u in u4) and not any("cmdq.md 7" in u for u in u5)))
+    return ok
+
+
+def _selftest_add_conv():
+    """--add-as-conv (docs/format/add.md): the lowering's structure, NPUC's scale labels, the arithmetic"""
+    ok = []
+    r = random.Random(11)
+
+    def q(L, s_, z):
+        L["output"] = {"scale": s_, "zero_point": z}
+        return L
+    # a residual over a computed tensor, uint8 with any scales and zero points: stem -> proj -> ADD(proj, stem) -> conv
+    g = _sgraph([q(_sconv("stem", 8, 16, r, inp="x"), 0.1371, 37), q(_sconv("proj", 16, 16, r, act="none"), 0.0517, 151),
+                 {"op": "add", "name": "add", "inputs": ["proj", "stem"], "activation": "none",
+                  "output": {"scale": 0.1733, "zero_point": 120}}, q(_sconv("head", 16, 8, r), 0.05, 0)])
+    g["input"].update(dtype="uint8", scale=0.02, zero_point=128)
+    ok.append(("ADD with any scales refused without --add-as-conv, the flag named",
+               "--add-as-conv" in _refusal(lambda: lower(g, allow_none=True))))
+    low = lower(g, allow_none=True, add_conv=True)
+    kinds = [l["kind"] for l in low["layers"]]
+    by = {l["name"]: l for l in low["layers"]}
+    cat = next(l for l in low["layers"] if l["kind"] == "concat")
+    mix = low["layers"][3]
+    ok.append(("--add-as-conv: stem, proj, a mixed concat (proj, stem), the 1x1 conv over 32 channels, head",
+               kinds == ["conv", "conv", "concat", "conv", "conv"] and cat.get("mixed") and
+               cat["inputs"] == ["l2_proj", "l1_stem"] and mix["in_chw"] == [32, 8, 8] and mix["k"] == [1, 1]))
+    t = npuc_text(low)
+    ok.append(("the concat line carries 'mixed' (npuc-net 2)", t.startswith("npuc-net 2") and " mixed\n" in t))
+    # NPUC's ConcatScaleFoldingFilter: both concat inputs declared at one scale; proj (read by the ADD alone) relabelled
+    # with its multiplier unchanged
+    proj, stem = by["l2_proj"], by["l1_stem"]
+    ok.append(("proj relabelled to stem's scale with the same multiplier; the concat's scale = both producers'",
+               proj["out_scale"] == stem["out_scale"] == cat["out_scale"] == mix["in_scale"] and
+               "scale_label" in proj and npuc_multiplier(hex_f32(proj["in_scale"]), hex_f32(proj["w_scale"]),
+                                                         hex_f32(proj["out_scale"])) == (proj["slope"], proj["shift"])))
+    ok.append(("the conv's own multiplier as add_fit chose it", npuc_multiplier(hex_f32(mix["in_scale"]),
+               hex_f32(mix["w_scale"]), hex_f32(mix["out_scale"])) == (mix["slope"], mix["shift"])))
+    # the arithmetic: weights wa on proj's channel o, wb on stem's, the zero-point difference in the bias; the output
+    # within the fit's error + 1/2 of the exact real sum
+    wa, wb = mix["add"]["wa"], mix["add"]["wb"]
+    w = mix["weights_oihw_u8"]
+    diag = all(w[o * 32 + o] == wa and w[o * 32 + 16 + o] == wb and sum(w[o * 32:(o + 1) * 32]) == wa + wb
+               for o in range(16))
+    ok.append(("weights: wa, wb on the two diagonals, weight zero point 0 elsewhere; bias wb (z_proj - z_stem)",
+               diag and mix["w_zp"] == 0 and mix["bias"] == [wb * (151 - 37)] * 16 and mix["in_zp"] == 151))
+    rr = random.Random(3)
+    a_, b_ = bytes(rr.randrange(256) for _ in range(16 * 64)), bytes(rr.randrange(256) for _ in range(16 * 64))
+    y = ref_conv(mix, a_ + b_, "half_away", False, 1)
+    worst = max(abs(y[i] - (Fraction(0.0517) * (a_[i] - 151) + Fraction(0.1371) * (b_[i] - 37)) / Fraction(0.1733) - 120)
+                for i in range(len(y)) if 0 < y[i] < 255)
+    ok.append(("the conv's output: within the fit's error + 1/2 LSB of the real sum (%.3f <= %.3f)" % (
+        float(worst), 0.5 + mix["add"]["worst_lsb"]), worst <= Fraction(1, 2) + Fraction(mix["add"]["worst_lsb"]) + Fraction(1, 1000)))
+    # the network input as an operand: an identity copy conv first (multiplier 256/2^8), relabelled
+    g2 = _sgraph([q(_sconv("a", 8, 8, r, inp="x", act="none"), 0.03, 140),
+                  {"op": "add", "name": "add", "inputs": ["a", "x"], "output": {"scale": 0.04, "zero_point": 128}}])
+    g2["input"].update(dtype="uint8", scale=0.02, zero_point=128)
+    l2 = lower(g2, allow_none=True, add_conv=True)
+    cp = l2["layers"][1]
+    ok.append(("ADD of the network input: an identity conv over it (256/2^8, bias 0), then concat and conv",
+               [l["kind"] for l in l2["layers"]] == ["conv", "conv", "concat", "conv"] and cp["input"] == "data0" and
+               (cp["slope"], cp["shift"]) == (256, 8) and cp["in_zp"] == cp["out_zp"] == 128 and
+               ref_conv(cp, bytes(range(256)) * 2, "half_away", False, 1)[:256] == bytes(range(256))))
+    # x + x: one conv over x
+    g3 = _sgraph([q(_sconv("a", 8, 8, r, inp="x"), 0.03, 10),
+                  {"op": "add", "name": "add", "inputs": ["a", "a"], "output": {"scale": 0.05, "zero_point": 0}}])
+    l3 = lower(g3, allow_none=True, add_conv=True)
+    ok.append(("ADD x + x: one 1x1 conv over x (no concat)", [l["kind"] for l in l3["layers"]] == ["conv", "conv"]))
+    # quant 3 with scales that are not powers of two: int8 weights (zero point 128); power-of-two scales: the Eltwise
+    rg = residual_graph()
+    ok.append(("quant 3, power-of-two scales: still NPUC's Eltwise with --add-as-conv",
+               [l["kind"] for l in lower(rg, quant=3, allow_none=True, add_conv=True)["layers"]] ==
+               ["conv", "conv", "eltwise", "relu"]))
+    b1 = json.loads(json.dumps(rg))
+    b1["layers"][1]["output"]["scale"] = 0.01
+    b1["layers"].insert(0, dict(_sconv("c0", 8, 8, r, inp="image"), output={"scale": 1 / 128, "zero_point": 0}))
+    b1["layers"][1]["input"] = "c0"
+    b1["layers"][3]["inputs"] = ["conv2", "c0"]
+    l4 = lower(b1, quant=3, allow_none=True, add_conv=True)
+    m4 = next(l for l in l4["layers"] if l["kind"] == "conv" and l["from"] == "add" and l["in_chw"][0] == 16)
+    ok.append(("quant 3, scales not 2^-n: the conv form, int8 weights (zero point 128, weights <= 127), bias 0",
+               m4["w_zp"] == 128 and max(m4["weights_oihw_u8"]) <= 255 and set(m4["bias"]) == {0}))
     return ok
 
 
@@ -3109,7 +3387,7 @@ def _selftest_strides():
 def cmd_lower(a):
     """lowered.json and net.npuc for a model, and a line per layer"""
     low = load_model(a.model, a.quant, "shifts" if a.per_channel_shifts else a.fold_per_channel, a.allow_none, a.output,
-                     a.relu6_range)
+                     a.relu6_range, a.add_as_conv)
     os.makedirs(a.dir, exist_ok=True)
     json.dump(low, open(os.path.join(a.dir, "lowered.json"), "w"), indent=1)
     open(os.path.join(a.dir, "net.npuc"), "w").write(npuc_text(low))
@@ -3202,6 +3480,9 @@ def main(argv=None):
     p.add_argument("--fold-per-channel", action="store_true")
     p.add_argument("--relu6-range", action="store_true", help="a fused RELU6 clamping inside its output range: the output "
                    "requantised to [0, 6] so the clamp is the saturation (a change of the model)")
+    p.add_argument("--add-as-conv", action="store_true", help="an ADD NPUC's Eltwise cannot take (any scales or zero "
+                   "points, x + x) as a 1x1 conv over the concatenation of its inputs: a change of the model, within "
+                   "a fraction of an LSB plus the rounding (docs/format/add.md)")
     p.add_argument("--output", metavar="TENSOR", help="a TFLite model cut at this tensor (index or name): its NPU part "
                    "up to there, the rest left to the CPU")
     p.add_argument("--per-channel-shifts", action="store_true",

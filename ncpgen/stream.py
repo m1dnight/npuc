@@ -1393,12 +1393,24 @@ class Plan:
         eltd = {L["name"] for L in order if L["kind"] == "eltwise" and any(i in dsrc for i in ins[L["name"]])}
         into = {}                                           # producer -> (SRAM concat, its first plane slot)
         for kn in scats:
+            # a producer read by other layers too writes its planes into the concat's chunk all the same, and they
+            # read them there (V: add-probe res-c16..c64, an ADD lowered to a conv over concat(proj(t), t))
             o = 0
             for i in ins[kn]:
-                if len(cons[i]) != 1:
-                    raise Unsupported("%s feeds a concat in SRAM and another layer" % i)
                 into[i] = (kn, o)
                 o += Dist(chs[i]).ppc
+        # a DRAM concat's input that another layer reads too: stored into the concat's buffer as any input; when its
+        # layer is more than one node (a padded or strided conv), its first other reader loads it back from there, at
+        # its channel offset, into its own chunk (NPUC's "disable forwarding" on that edge; V: add-probe res-c4,
+        # res-c8, res-c24, big-c24, chain3's stem); a one-node layer's readers share it in SRAM (chain3's ADD convs).
+        # The mirror image of a stored branch root (roots, below)
+        catin = {}
+        for kn in cats:
+            if kn in scats:
+                continue
+            for i in ins[kn]:
+                if any(by[r]["kind"] != "concat" for r in cons[i]) and head[i] != tail[i]:
+                    catin[i] = kn
         stored = {}                                         # tensor -> where its producer stores it
         if by[out]["kind"] != "concat":
             stored[out] = ("out", out)
@@ -1480,6 +1492,10 @@ class Plan:
             rs = {bulb_root(i) for i in ins[kn]}
             r = min(rs)
             if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r]:
+                if kn in scats and r in ins[kn]:
+                    continue                # the root writes into its SRAM concat's chunk itself (an ADD's conv
+                    #                         read by the next block): its readers find it there, never stored
+                    #                         (V: add-probe chain-then-conv)
                 if r in tst:
                     raise Unsupported("tiling in a graph: a concat's branches from a tiled stratum's output")
                 if any(x in tst for x in bulb_nodes(kn)):
@@ -1487,6 +1503,9 @@ class Plan:
                 roots |= rs
         for r in roots:
             stored.setdefault(r, ("im", r))
+        # a root that is an input of a DRAM concat (stored into its buffer): a first citizen as any root, but its
+        # readers share it in SRAM, nothing loads it back (V: add-probe chain3, its ADD convs at the top of SRAM)
+        catroot = {r for r in roots if stored[r][0] == "cat"}
         # where each reader finds a tensor loaded from DRAM: the network input shared by a concat's branches, one
         # chunk live from 0 (V: cat2, cat3, cat-chain); a concat read by one layer, one first citizen from the concat
         # (V: cat2, cat3); else one chunk per reader, live at it only (NPUC's "Hack on LA"; V: add2, res; g006, g022)
@@ -1632,6 +1651,8 @@ class Plan:
                 segs[n] = d["segs"] = segs[i0]
             if n in roots:                                  # a stored bulb root: a first citizen (V: g030),
                 d["out"].batch = (0, tail[n], 0)            # all its slots written once loaded back (V: g021)
+                full[n] = True
+            if n in catin:                                  # loaded back from the concat's buffer: all slots
                 full[n] = True
             tens[n] = d["out"]
             info[n] = d
@@ -1783,7 +1804,9 @@ class Plan:
             # a reader of a tensor in DRAM loads it, unless the input is shared by a concat's branches and an earlier
             # branch loaded it, or the layer just before loaded it the same way (NPUC's LIR skips an identical load;
             # V: add2, in-two vs add-branches, g020; g022: a concat's buffer read by two convs)
-            firstr = next(x["name"] for x in order if x["name"] in cons[i0]) if i0 in cons else None
+            firstr = next(x["name"] for x in order if x["name"] in cons[i0] and (i0 not in catin or
+                                                                               x["kind"] != "concat")) \
+                if i0 in cons else None
             ld = (i0, load_kind(L, d)) if (i0 in dsrc or (i0, n) in spilled) and k != "eltwise" else None
             if (i0, n) in spilled:
                 first = True
@@ -1792,7 +1815,7 @@ class Plan:
             elif ld is not None:
                 first = ld != prev
             else:
-                first = i0 in roots and n == firstr
+                first = ((i0 in roots and i0 not in catroot) or i0 in catin) and n == firstr
             prev = ld
             if i0 != src and k != "eltwise":
                 # an intermediate loaded whole comes in one DMA per distinct per-core plane count; loaded per core,
@@ -1812,6 +1835,8 @@ class Plan:
             for op in ops:
                 if op.kind == "load" and op.what == "ifm":
                     op.tensor = i0
+                    if i0 in catin:                         # from the concat's buffer, at i0's channel offset
+                        op.tensor, op.cat_of = catin[i0], i0
                 elif op.kind == "store":
                     op.tensor = stored[n][1]
             self.groups += self.cut(ops, ev0) if k != "eltwise" else [ops]

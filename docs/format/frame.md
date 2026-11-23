@@ -300,6 +300,10 @@ descriptors and vectors from them.
   one entry per channel slot of a core (cpi) zero-padded to a multiple of 4, in a 32-byte block (64 B when the
   arrays pass 32). Its load moves ceil(size / 64) // cores rows of 64 B per core (0 for 32-byte blocks on several
   cores, 1 on one).
+- **A DRAM concat's input loaded back** by another reader (stream.py `cat_of`; docs/format/add.md 5): the load reads
+  the input's own layout at its channel offset in the concat's buffer (the producer's store offset), and NPUC gives
+  that input an IM vector of its own, used by no DMA, just before the concat's at its first store (V: add-probe res-c4,
+  res-c8, res-c24, chain3).
 - **DMAs.** A tensor load or store moves the whole tensor spread over its cores (one DMA, or two when the last core
   holds fewer planes, as section 5); weights as section 5 at the stream's slot offsets. A producer of a concat in DRAM
   stores its own tensor (IDP-major) at its offset in the buffer: the earlier inputs' channel counts x half a plane
