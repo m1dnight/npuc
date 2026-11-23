@@ -346,7 +346,8 @@ def conv_groups(L, quant_mode=1, planner=False):
     return geo, out
 
 
-_PACKED = Memo(64)      # conv_block's results by _pack_key (the packing is pure)
+_PACKED = Memo(256)     # conv_block's results by _pack_key (the packing is pure; a large graph asks for 3 forms of
+#                         each of its convs: 64 made MobileDet's head 0 pack its convs again and again)
 
 
 def _pack_key(L, quant_mode, planner):
@@ -406,16 +407,17 @@ def _channels(name, low, by):
     return low["input"]["chw"][0] if name not in by else by[name]["out_chw"][0]
 
 
-def _segments(name, low, ins, cons, by):
+def _segments(name, low, ins, cons, by, cache=None):
     """the channel segments a conv reading tensor `name` sees per core: [(first channel, count), ...]. One segment,
     except a concat in SRAM (each input split over the cores on its own: V cat16, cat16-3, cat16-chain, cat-32-16,
     g161, g169, g141), also through a pool that has one reader (V: c16_16/c16_48/c32_16-catpool-k3); a pool of one
-    with several readers is stored and loaded back: normal order (V: g169, g141)."""
+    with several readers is stored and loaded back: normal order (V: g169, g141). cache: _concat_tiled's, one per
+    pass over the network's layers."""
     L = by.get(name)
     if L is not None and L["kind"] == "pool" and len(cons.get(name, [])) == 1:
-        return _segments(L["input"], low, ins, cons, by)
+        return _segments(L["input"], low, ins, cons, by, cache)
     if L is not None and L["kind"] == "concat" and concat_in_sram(name, _output(low, cons), by, ins, cons) \
-            and not _concat_tiled(name, low, ins, cons):
+            and not _concat_tiled(name, low, ins, cons, cache):
         segs, base = [], 0
         for i in ins[name]:
             c = _channels(i, low, by)
@@ -428,29 +430,41 @@ def _segments(name, low, ins, cons, by):
 _POLICY_DEPTH = [0]
 
 
-def _concat_tiled(name, low, ins, cons):
+def _concat_tiled(name, low, ins, cons, cache=None):
     """a concat one of whose producers or readers NPUC tiles stays in DRAM (frame.graph_policy, frame.md 6.11; the
     stream part's rule). While the policy itself is computed (it asks for the weight sizes), the structural rule
-    alone (G: the policy then sizes those readers' blocks in the SRAM order)"""
+    alone (G: the policy then sizes those readers' blocks in the SRAM order). cache: a dict that keeps the policy and
+    the forwarding tests for the other concats of the same network (one per pass over its layers: they do not
+    change within it)"""
     if _POLICY_DEPTH[0]:
         return False
     from ncpgen import frame
-    _POLICY_DEPTH[0] += 1
-    try:
-        pol = frame.graph_policy(low)
-    except Exception:
+    if cache is None:
+        cache = {}
+    if "pol" not in cache:
+        _POLICY_DEPTH[0] += 1
+        try:
+            cache["pol"] = frame.graph_policy(low)
+        except Exception:
+            cache["pol"] = None
+        finally:
+            _POLICY_DEPTH[0] -= 1
+    pol = cache["pol"]
+    if pol is None:
         return False
-    finally:
-        _POLICY_DEPTH[0] -= 1
-    tiled = {x for st in pol["strata"] for x in st["layers"]}
-    if any(x in tiled for x in ins[name] + cons.get(name, [])):
+    if "tiled" not in cache:
+        cache["tiled"] = {x for st in pol["strata"] for x in st["layers"]}
+    if any(x in cache["tiled"] for x in ins[name] + cons.get(name, [])):
         return True
-    _POLICY_DEPTH[0] += 1
-    try:            # its block's concat-in-SRAM test fails, or its OFM is not shared: NPUC keeps it in DRAM, its
-        fwd = frame.forwarding(low, pol)        # readers' weights in the DRAM order (V: t2006; add-probe2 fx-80-*)
-        return not frame.concat_cs_ok(name, fwd) or not frame.concat_ofm_shared(name, cons, fwd)
-    finally:
-        _POLICY_DEPTH[0] -= 1
+    if "fwd" not in cache:
+        _POLICY_DEPTH[0] += 1
+        try:        # its block's concat-in-SRAM test fails, or its OFM is not shared: NPUC keeps it in DRAM, its
+            #         readers' weights in the DRAM order (V: t2006; add-probe2 fx-80-*)
+            cache["fwd"] = frame.forwarding(low, pol)
+        finally:
+            _POLICY_DEPTH[0] -= 1
+    fwd = cache["fwd"]
+    return not frame.concat_cs_ok(name, fwd) or not frame.concat_ofm_shared(name, cons, fwd)
 
 
 def _permuted_conv(L, segs):
@@ -566,9 +580,10 @@ def _relu_zero_conv(L):
             "stride": [1, 1], "w_zp": 128, "weights_oihw_u8": [128] * (c * c)}
 
 
-def layer_blocks(low):
-    """[(layer name, kind, WEIGHT block)] in the NCP's order"""
+def layer_blocks(low, cache=None):
+    """[(layer name, kind, WEIGHT block)] in the NCP's order (cache: _segments')"""
     q = low.get("quant_mode", 1)
+    cache = {} if cache is None else cache
     if not _graph_order(low):
         return [(L["name"], L["kind"], conv_block(L if L["kind"] == "conv" else _relu_zero_conv(L), q)[1])
                 for L in low["layers"] if L["kind"] in ("conv", "relu")]
@@ -577,7 +592,7 @@ def layer_blocks(low):
     for L in exec_order(low):
         k = L["kind"]
         if k == "conv":
-            segs = _segments(L["input"], low, ins, cons, by)
+            segs = _segments(L["input"], low, ins, cons, by, cache)
             res.append((L["name"], k, conv_block(L if len(segs) == 1 else _permuted_conv(L, segs), q)[1]))
         elif k == "eltwise":
             # an operand its group loads from DRAM: the network input, or a concat (one an eltwise reads stays in DRAM)
@@ -664,7 +679,7 @@ def _planner_concat(L, by, ins, low):
     return [_channels(i, low, by) for i in ins[p["name"]]]
 
 
-def weight_planning_sizes(low):
+def weight_planning_sizes(low, cache=None):
     """One per WEIGHT block, in the NCP's order: the size NPUC's planner computes for it (the log's compWeight, which
     sets the WEIGHT SRAM chunk the allocator asks for; weights.md section 7). Equal to the block except:
     - a conv whose first input is a concat (or a pool of one): the larger of the normal channel order's pack and the
@@ -672,8 +687,10 @@ def weight_planning_sizes(low):
       concat readers, incl. g103, g161, g167);
     - a standalone ReLU's identity dummy conv: its block counted on 4 cores (C <= 16: 512 B);
     - an eltwise: no compWeight (its CU_BIN is a fixed 128 B in SRAM): its block size;
-    - stride 2: the planner's own sub-batch split (sub_batches(planner=True); differs for odd Cin)."""
+    - stride 2: the planner's own sub-batch split (sub_batches(planner=True); differs for odd Cin).
+    cache: _segments'."""
     q = low.get("quant_mode", 1)
+    cache = {} if cache is None else cache
 
     def plan_len(L, blk):
         if L.get("stride", [1, 1]) == [1, 1]:
@@ -682,13 +699,13 @@ def weight_planning_sizes(low):
 
     if not _graph_order(low):
         convs = [L for L in low["layers"] if L["kind"] == "conv"]
-        return [plan_len(L, b) for L, b in zip(convs, [b for _, _, b in layer_blocks(low)])]
+        return [plan_len(L, b) for L, b in zip(convs, [b for _, _, b in layer_blocks(low, cache)])]
     ins, cons, by, src = topology(low)
     out = []
-    for name, kind, blk in layer_blocks(low):
+    for name, kind, blk in layer_blocks(low, cache):
         L = by[name]
         if kind == "conv":
-            segs = _segments(L["input"], low, ins, cons, by)
+            segs = _segments(L["input"], low, ins, cons, by, cache)
             normal = plan_len(L, blk) if len(segs) == 1 else len(conv_block(L, q, True)[1])
             chans = _planner_concat(L, by, ins, low)
             if chans is not None and all(c % 2 == 0 for c in chans):
@@ -711,8 +728,9 @@ def weight_layer_info(low):
     and for a conv or ReLU the emitted block's geometry: ncores, nloads, rows_per_batch (R: io h = 2R), sub_batches,
     sub_channels, plus planning_rows = planning_size / (planning cores x nloads x 2 x 64)}."""
     q = low.get("quant_mode", 1)
-    lb = layer_blocks(low)
-    ps = weight_planning_sizes(low)
+    cache = {}                  # _segments' for the three passes below
+    lb = layer_blocks(low, cache)
+    ps = weight_planning_sizes(low, cache)
     by = {L["name"]: L for L in low["layers"]}
     graph = _graph_order(low)
     if graph:
@@ -725,7 +743,7 @@ def weight_layer_info(low):
             if kind == "relu":
                 G = _relu_zero_conv(L)
             elif graph:
-                segs = _segments(L["input"], low, ins, cons, by)
+                segs = _segments(L["input"], low, ins, cons, by, cache)
                 G = L if len(segs) == 1 else _permuted_conv(L, segs)
             else:
                 G = L

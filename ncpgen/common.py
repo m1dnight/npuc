@@ -268,13 +268,68 @@ def ncp_parts(ncp):
 
 def first_diff(a, b):
     """the first index where two sequences differ (the shorter one's length when one is a prefix), None if equal"""
-    for i in range(min(len(a), len(b))):
+    n = min(len(a), len(b))
+    if isinstance(a, (bytes, bytearray)) and isinstance(b, (bytes, bytearray)):
+        # bytes: slices compared in C, the first difference found by halving (a[:lo] == b[:lo], a[lo:hi] != b[lo:hi])
+        if a[:n] == b[:n]:
+            return n if len(a) != len(b) else None
+        lo, hi = 0, n
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if a[lo:mid] == b[lo:mid]:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+    for i in range(n):
         if a[i] != b[i]:
             return i
     return min(len(a), len(b)) if len(a) != len(b) else None
 
 
 # ---- memoisation --------------------------------------------------------------------------------------------------
+_ATOMIC = frozenset((int, float, bool, complex, str, bytes, type(None)))
+
+
+def deep_copy(x, memo=None):
+    """copy.deepcopy(x), faster on the plain data the planners memoise: dicts, lists and tuples are copied here (a list
+    of atomic values, e.g. a layer's weights, in one slice instead of one deepcopy call per value), anything else by
+    copy.deepcopy with the same memo, so sharing and cycles come out as deepcopy makes them"""
+    if memo is None:
+        memo = {}
+    t = type(x)
+    if t in _ATOMIC:
+        return x
+    y = memo.get(id(x))
+    if y is not None:
+        return y
+    if t is list:
+        y = []
+        memo[id(x)] = y
+        if _ATOMIC.issuperset(map(type, x)):
+            y += x
+        else:
+            for a in x:
+                y.append(deep_copy(a, memo))
+        return y
+    if t is dict:
+        y = {}
+        memo[id(x)] = y
+        for k, v in x.items():
+            y[deep_copy(k, memo)] = deep_copy(v, memo)
+        return y
+    if t is tuple:
+        ys = [deep_copy(a, memo) for a in x]
+        y = memo.get(id(x))             # (as deepcopy: a tuple met again through its own items)
+        if y is not None:
+            return y
+        if all(a is b for a, b in zip(x, ys)):
+            return x
+        y = memo[id(x)] = tuple(ys)
+        return y
+    return copy.deepcopy(x, memo)
+
+
 class Memo:
     """the latest `size` results of a pure computation by a hashable key, handed out as deep copies (callers may change
     them); an exception it raised is raised again, same type and arguments. The planners, the stream generator and the
@@ -298,7 +353,7 @@ class Memo:
             self.d.move_to_end(key)
         if hit[1] is not None:
             raise hit[1][0](*hit[1][1])
-        return copy.deepcopy(hit[0])
+        return deep_copy(hit[0])
 
 
 def weights_digest(w):
