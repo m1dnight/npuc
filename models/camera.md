@@ -9,7 +9,8 @@ sha256 and licences, fetches the files into `$NCPGEN_WORK/models/<name>/` and ch
 python3 -I models/camera.py list | fetch [model...]          # the catalogue; download + sha256 check
 python3 -I models/camera.py tflref model.tflite in.bin out.bin [--stop TENSOR]   # TFLite's own integer arithmetic
 python3 -I models/camera.py person                           # person_detect: npunet's reference against tflref
-python3 -m ncpgen lower <model> <dir> [--per-channel-shifts | --fold-per-channel] [--allow-none] [--output TENSOR] [--relu6-range]
+python3 -m ncpgen lower <model> <dir> [--per-channel-shifts | --fold-per-channel] [--allow-none] [--output TENSOR] [--relu6-range] [--add-as-conv]
+python3 -I models/camera.py addcheck model.tflite [--input T] [--output T] [--all]  # ADD as a conv against TFLite's ADD
 ```
 
 ## The models (fetched 2026-11-22)
@@ -23,8 +24,8 @@ on the CPU. Op counts from the files.
 |---|---|---|---|---|---|---|
 | **person_detect** (VWW, MobileNet v1 0.25) | tflite-micro `models/person_detect.tflite`, Apache-2.0 | 96x96x1 int8 | DW 14, CONV 14, AVG_POOL 1, RESHAPE 1, SOFTMAX 1; RELU6 (no-op clamps) | int8 per-channel, R 3.7 / 121; first DW multiplier 8 on 1 channel | 1 | **PASS** (29 NPU layers) with `--per-channel-shifts` or `--fold-per-channel`, and `--allow-none` (the logits) |
 | SSD MobileNet v1 COCO quant | google-coral/test_data, Apache-2.0 | 300x300x3 uint8 | CONV 34, DW 13, RESHAPE 13, QUANTIZE 10, CONCAT 2 (axis 1), DEQUANTIZE 2, LOGISTIC 1, TFLite_Detection_PostProcess 1 | uint8 per-tensor, 46 of 47 zero points != 128 | 12 | 4 outputs (one supported); with `--output`: every head lowers (`--relu6-range --allow-none`) |
-| SSD MobileNet v2 COCO quant | google-coral/test_data, Apache-2.0 | 300x300x3 uint8 | CONV 55, DW 17, RESHAPE 13, ADD 10, QUANTIZE 10, CONCAT 2, DEQUANTIZE 2, LOGISTIC 1, PostProcess 1 | uint8 per-tensor, zero points != 128 | 12 | 4 outputs; then ADD (scales not 2^-n) |
-| SSDLite MobileDet COCO (Frigate's default CPU model) | test_data release-frogfish, Apache-2.0 (Frigate's `docker/main/Dockerfile`: `cpu_model.tflite`) | 320x320x3 uint8 | CONV 66, DW 27, ADD 15, RESHAPE 13, CONCAT 2, LOGISTIC 1, PostProcess 1; fused NONE everywhere (ReLU6 in the output ranges), 5x5 kernels | uint8 per-tensor, 91 of 93 zero points != 128 | 12 | 4 outputs; then ADD |
+| SSD MobileNet v2 COCO quant | google-coral/test_data, Apache-2.0 | 300x300x3 uint8 | CONV 55, DW 17, RESHAPE 13, ADD 10, QUANTIZE 10, CONCAT 2, DEQUANTIZE 2, LOGISTIC 1, PostProcess 1 | uint8 per-tensor, zero points != 128 | 12 | 4 outputs; with `--output` and `--add-as-conv` every head lowers (ADD below) |
+| SSDLite MobileDet COCO (Frigate's default CPU model) | test_data release-frogfish, Apache-2.0 (Frigate's `docker/main/Dockerfile`: `cpu_model.tflite`) | 320x320x3 uint8 | CONV 66, DW 27, ADD 15, RESHAPE 13, CONCAT 2, LOGISTIC 1, PostProcess 1; fused NONE everywhere (ReLU6 in the output ranges), 5x5 kernels | uint8 per-tensor, 91 of 93 zero points != 128 | 12 | 4 outputs; with `--output` and `--add-as-conv` every head lowers |
 | SSDLite MobileNet v2 (no official quantised release: PINTO_model_zoo 006, MIT) | PINTO 006 tarball (`ssdlite_mobilenet_v2_coco_300_full_integer_quant.tflite`, sha256 2ece88ad...) | 300x300x3 **float32** (QUANTIZE inside) | CONV 55, DW 33, RESHAPE 13, QUANTIZE 11, ADD 10, CONCAT 2, DEQUANTIZE 2, LOGISTIC 1 | int8 per-channel, R 15 / 5e8 (dead channels) | 12 | 2 outputs; float input |
 | EfficientDet-Lite0 | Coral `efficientdet_lite0_320_ptq.tflite` and MediaPipe int8/1 (same graph), Apache-2.0 | 320x320x3 uint8 -> QUANTIZE int8 | CONV 102, DW 80, ADD 42, MAX_POOL 14, RESIZE_NEAREST_NEIGHBOR 12, RESHAPE 10, CONCAT 2, DEQUANTIZE 2, LOGISTIC 1 (+ PostProcess in Coral's) | int8 per-channel, R 7.1 / 2e5 | 10 (largest 40x40x810) | 4 / 2 outputs; then RESIZE_NEAREST_NEIGHBOR |
 | BlazeFace short range | MediaPipe float16/1, Apache-2.0 | 128x128x3 float32 | float16 weights (74 DEQUANTIZE), PAD 11, RELU 17, ADD 16 | **float only** (no quantised release) | 2 | 2 outputs; a float model |
@@ -46,7 +47,7 @@ first in their rank.
 |---|---|---|---|
 | 1 | **several outputs** (the detection heads) | 9: SSD v1, SSD v2, MobileDet, SSDLite, EfficientDet, face SSD, PoseNet, MoveNet, YOLO-Fastest | the other agent's work. Each head alone now lowers and compiles (`--output`) |
 | 2 | **the CPU tail** (stop before RESHAPE/CONCAT across anchors, LOGISTIC, DEQUANTIZE, the post-process op) | 9: the 8 with a post-process or decoder + Tiny YOLO v2's DEQUANTIZE | **partly done**: `--output TENSOR` cuts the model at one tensor (tflite_cut). What remains is lowering, not hardware: cut at the set of tensors that feed the first CPU-only op (with several outputs) and keep the rest as a CPU tail graph (npunet's cpu_tail runs only RESHAPE and SOFTMAX today; LOGISTIC, CONCATENATION along an axis, DEQUANTIZE and TFLite_Detection_PostProcess would be host code) |
-| 3 | **ADD with any scales and zero points** | 7: SSD v2, MobileDet, SSDLite, EfficientDet, face SSD, MoveNet, YOLO-Fastest (none of their 124 ADDs has power-of-two scales; 2 of MoveNet's have equal zero points; counted in the files) | NPUC's Eltwise only shifts (quant 3, scales 2^-n, no zero-point term). Proposed lowering (G, not tried): concat the two inputs (NPUC places them as they are) and a 1x1 conv over the 2C channels with weights s_a/s_w and s_b/s_w on two identity blocks and the zero-point difference in the bias: exact up to the rounding of the two scale ratios to int8 |
+| 3 | **ADD with any scales and zero points** | 7: SSD v2, MobileDet, SSDLite, EfficientDet, face SSD, MoveNet, YOLO-Fastest (none of their 124 ADDs has power-of-two scales or zero points NPUC's Eltwise could take; 2 of MoveNet's broadcast) | **done, opt-in** (`--add-as-conv`, a change of the model): NPUC has no form of it (the stock HAL never hands it an ADD; its Eltwise only shifts); npunet lowers it to a concat of the two inputs and a 1x1 conv over it (exact accumulator, one requantisation): **0.15 to 0.38 % of each ADD's values off by 1 LSB** against TFLite's ADD, never more (section "ADD with any scales"; docs/format/add.md). NPUC compiles it, ncpgen exact on 20 probes and 80 of 80 unseen random networks |
 | 3 | **resolution over 224** (tiling inside a graph) | 7: SSD v1/v2 (300), MobileDet, EfficientDet, face SSD (320), SSDLite (300), PoseNet (353x481) | ncpgen follows NPUC's graph tiling; SSD v1's heads: section "SSD detectors" |
 | 5 | **per-channel weight scales** | 6: person_detect, SSDLite, EfficientDet, MoveNet, YOLO-Fastest, Tiny YOLO v2 | **done**: NPUC has no per-channel multiplier and the NPU no per-channel slope; `--per-channel-shifts` keeps each channel's power of two in its DRU's shift word (unproven on the NPU), `--fold-per-channel` folds all (docs/format/perchannel.md) |
 | 6 | **uint8 weight zero points other than 128** | 5: SSD v1, SSD v2, MobileDet, face SSD, PoseNet | **done**: NPUC compiles any (MTC 0x1b0's low half), ncpgen exact on 20 probes (`$NCPGEN_WORK/sweep/wzp-probe`, quant 1); npunet takes them in quant 1 (unproven on the NPU: every run had 128) |
@@ -58,10 +59,11 @@ first in their rank.
 | 11 | depthwise multiplier > 1 | 1: person_detect (TFLite's form of a 1-channel CONV_2D) | **done**: npunet lowers any multiplier to the dense conv |
 | - | LOGISTIC, HARD_SWISH on the NPU | 0: every LOGISTIC is in a CPU tail, no HARD_SWISH | - |
 
-What each model still lacks after this work: person_detect nothing; **SSD v1 and PoseNet only several outputs and
-the CPU tail** (and the tiling at their resolution: below); SSD v2, MobileDet + ADD; face SSD + ADD, PAD; SSDLite +
-ADD, a CPU head; EfficientDet + ADD, upsampling, a CPU head; MoveNet + ADD, upsampling, a CPU head; YOLO-Fastest +
-ADD, upsampling, PAD; Tiny YOLO v2 a CPU head and leaky ReLU.
+What each model still lacks after this work: person_detect nothing; **SSD v1, PoseNet and (with `--add-as-conv`) SSD
+v2 only several outputs and the CPU tail** (and, for ncpgen's exactness, the graph work at their resolution: below);
+MobileDet the same, and past its 20x20 stage NPUC itself crashes (below); face SSD PAD; SSDLite a CPU head;
+EfficientDet upsampling, a CPU head; MoveNet upsampling, a CPU head; YOLO-Fastest upsampling, PAD; Tiny YOLO v2 a CPU
+head and leaky ReLU.
 
 ## person_detect: exact as published
 
@@ -113,3 +115,42 @@ decoding and NMS).
 
 SSD MobileNet v2, the face SSD and Frigate's MobileDet add residual ADDs (rank 3 above; and PAD for the face SSD);
 PoseNet (353x481, 3 outputs, a decoder op on the CPU) needs exactly what SSD v1 needs.
+
+## ADD with any scales
+
+None of the 124 ADDs of the seven models can be NPUC's Eltwise (it only shifts by powers of two and has no zero-point
+term; every one needs zero points other than u8 128), and Samsung's own HAL never gives NPUC an ADD: it runs them on
+the CPU (docs/format/add.md 2). `--add-as-conv` (opt-in) lowers each to a channel concat of its inputs and a 1x1 conv
+over it that weighs them by fitted integers and takes the zero-point difference into its bias: one requantisation of
+an exact accumulator.
+
+```bash
+python3 -m ncpgen lower ssd_mobilenet_v2_coco_quant_postprocess.tflite <dir> --output 253 --add-as-conv --allow-none --relu6-range
+python3 -I models/camera.py addcheck <model.tflite> [--input T] --output T --all      # the error against TFLite's ADD
+```
+
+| model | lowers with `--add-as-conv` | NPUC (root-81d28366) | `ncpgen check` |
+|---|---|---|---|
+| SSD MobileNet v2 | every head alone (`--output` 166..253; 57 to 81 NPU layers, all 10 ADDs from t188 on) | compiles: t166 (box head 0, 57 layers, 39 s), t253 (the last class head, the whole network, 81 layers, 111 s, 13.5 MB) | not yet: "a layer-block whose node only fits with a weight ring" (t166; the big-models work, frame.md 6.11) |
+| SSDLite MobileDet | every head alone (68 to 101 layers), the last ADD (t308, 84 layers) | compiles t0 (box head 0, 68 layers, 51 s); t16, t80, t308 crash NPUC itself (SIGSEGV in NPULIRKernelPack::tryBuildData: the dense depthwise 3x3 stride 2 over 768 channels, "numInputChannels 3072") | not yet: "a concat in SRAM NPUC's forwarding refuses" (an ADD's concat at 80x80 NPUC keeps in DRAM; graph-large2 t2022's case, frame.md 6.11) |
+| face SSD, YOLO-Fastest | refused at their first PAD | - | - |
+| SSDLite (PINTO), EfficientDet-Lite0, MoveNet | refused at their CPU head (QUANTIZE, CAST) | - | - |
+
+The ADD's arithmetic against TFLite's on the models' own activations (person image, noise; each ADD alone, and at the
+cut with the conv's outputs propagated; `$NCPGEN_WORK/camera-add/addcheck/`; docs/format/add.md 6 has the power-of-two
+alternative and NPUC's own conv multipliers for scale):
+
+| model (ADDs measured) | each ADD alone | at the cut: values differing, mean (max) |
+|---|---|---|
+| SSD MobileNet v2 (10 of 10) | 0.296 % off by 1 | 58.6 %, 0.72 LSB (5) |
+| SSDLite MobileDet (15 of 15) | 0.378 % off by 1 | 67.6 %, 1.03 LSB (9) |
+| face SSD MobileNet v2 (10 of 10) | 0.300 % off by 1 | 42.3 %, 0.47 LSB (3) |
+| SSDLite MobileNet v2 PINTO (10 of 10) | 0.219 % off by 1 | 69.5 %, 1.06 LSB (8) |
+| EfficientDet-Lite0 (9 of 42, the backbone) | 0.196 % off by 1 | 43.4 %, 0.49 LSB (4) |
+| MoveNet Lightning (10 of 19, the backbone) | 0.354 % off by 1 | 70.6 %, 1.11 LSB (9) |
+| YOLO-Fastest 192 face v4 (18 of 18) | 0.149 % off by 1 | 63.0 %, 0.83 LSB (4) |
+
+TFLite's ADD equals the exact real sum rounded once on every one of these values, so these are the lowering's own
+differences. A 1-LSB change at 0.3 % of an ADD's values spreads through the later convs; NPUC's 8-bit conv multipliers
+alone move the same cuts more (SSD v2 0.95, MobileDet 1.33, face SSD 0.87 LSB mean). The best power-of-two scheme
+through NPUC's Eltwise would differ on 51 to 66 % of each ADD's values (up to 4 LSB; 2.1 to 4.7 LSB mean at the cut).

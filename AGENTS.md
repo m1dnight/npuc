@@ -53,7 +53,9 @@ single blocks too (6.9). Common models: `models/` (31 of 32 zoo entries exact, t
 resolution model as published). Depthwise is lowered to the dense block-diagonal conv NPUC itself compiles
 (docs/format/depthwise.md; NPUC's own depthwise-optimised path is off on the device and unproven on the NPU). Camera
 models: models/camera.md (person_detect exact as published; per-channel scales as per-channel shifts,
-docs/format/perchannel.md; the harness's setScale hook needs root-40bb3e3f). Not supported yet: channel split/slice, other activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling
+docs/format/perchannel.md; the harness's setScale hook needs root-40bb3e3f). ADD with any scales: `--add-as-conv`
+(opt-in, a concat with the harness's `concat ... mixed` and a 1x1 conv; docs/format/add.md; root-81d28366; NPUC itself
+has no form of it). Not supported yet: channel split/slice, other activations (leaky ReLU, SiLU; the NCP has a LUT memory type), upsampling
 (NPUC's deconvolution crashed in the harness), several outputs, a layer-block only a weight ring fits, strata joined to
 each other. Nothing beyond one example has been run on the NPU; the NPU runs are done elsewhere (the nervesinator
 porting kit).
