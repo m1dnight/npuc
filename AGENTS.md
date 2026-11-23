@@ -17,9 +17,12 @@ the compiler, and it is tested on the host against NPUC.
    it must never emit bytes it has not matched against NPUC.
 4. **Test before every commit.** `tests/run.sh` (no vendor file; must PASS) for any change. For a change to a part
    (`stream.py`, `frame.py`, `weights.py`, `grelu.py`, `npunet.py`): also `tests/regress.sh`, which checks every compiled
-   set in `work/sweep` (only the known misses allowed: graph 93/98, graph-random2 64/66, NPUC's own uninitialised
-   bytes; zoo 1 (efficientdet-lite0-320-p4) and graph-camera 1 (v3003) of the camera-resolution work: models/README.md
-   "Camera resolutions", frame.md 6.11).
+   set in `work/sweep` and classes each network EXACT, REFUSED (ncpgen raises: `gen` writes nothing) or DIFFERS (`gen`
+   would write bytes that are not NPUC's). It fails on any DIFFERS outside its `NPUC_UNINIT` list (NPUC's own
+   uninitialised bytes: graph rc4-*, graph-random2 g120/g134) and on any REFUSED outside its `KNOWN_REFUSED` list
+   (each entry with the NPUC behaviour not modelled). A merge that lifts a refusal must leave the network exact or
+   refused, never DIFFERS (rule 3); a refusal you add must name what NPUC does that ncpgen does not model, and be narrow
+   enough that no exact network becomes refused (the regress run shows it).
    A change meant to change no output (a refactor, a speed-up): `tests/snapshot.py compare` against a snapshot the code
    before it recorded must say IDENTICAL. Say the numbers in the commit message.
 5. **New networks become regression data.** A new sweep goes to `work/sweep/<name>/` (one folder per variant, as
@@ -46,10 +49,13 @@ Python: `python3 -I`, standard library only. The host has docker (arm64 containe
 
 ## Where things stand (2026-11-23)
 
-Byte-exact with NPUC on every compiled network (`tests/regress.sh`) except NPUC's 7 uninitialised-byte eltwises, one
-camera backbone (efficientdet-lite0-320-p4) and one of the fresh camera-size random graphs (graph-camera v3003; frame.md
-6.11). Camera resolutions (192..320 px): SSD MobileNet v1's heads and the SSD v1/v2, MoveNet and MobileDet (to C4)
-backbones exact; NPUC crashes or asserts on MobileDet's and EfficientDet-Lite0's full backbones and PoseNet at 257 px,
+Byte-exact with NPUC on every compiled network (`tests/regress.sh`) except NPUC's 7 uninitialised-byte eltwises and
+the 10 ncpgen refuses, each naming the NPUC behaviour it does not model (regress.sh's KNOWN_REFUSED: hand-edited
+grelu/r files, SSD MobileNet v2's --add-as-conv cuts, efficientdet-lite0-320-p4's partial sums, graph-camera v3003's
+extra load, add-camera3 m5003's joined strata); regress fails on any other refusal and on any wrong file. Camera
+resolutions (192..320 px): SSD MobileNet v1's heads and the SSD v1/v2, MoveNet and MobileDet (to C4) backbones exact,
+MobileDet's box head with --add-as-conv too (camera-add mobiledet-t0; ADD sets at camera sizes, add-camera*: 37/39,
+38/40 and 29/30 at first sight, the 30th refused); NPUC crashes or asserts on MobileDet's and EfficientDet-Lite0's full backbones and PoseNet at 257 px,
 and ncpgen refuses them the same way (models/README.md "Camera resolutions"). Tiling inside a graph follows NPUC's
 policy (frame.graph_policy), NPUC's trim and spill is modelled from its GlobalMemoryAllocator in graphs and chains
 (frame.md 6.12), its layer-block forwarding from its calculators (frame.forwarding), the CMDQ cut in a tiled plan's

@@ -934,20 +934,22 @@ def plan_graph(low, weight_sizes=None):
     # an IM per stored tensor, in the order of its first store in NPUC's layer order (= the NCP's group order for one
     # output; several outputs may reorder the groups, not these: V outputs-random m004)
     xi = {n: j for j, n in enumerate(order)}
-    sts, firstg = {}, {}
+    sts, firstg, firstp = {}, {}, {}
     for k_, (op, i, g) in enumerate(dmas):
         if op.kind == "store":
             pos = (xi.get(gl[g], len(order)), k_)
             if pos < sts.get(op.tensor, (len(order) + 1, 0)):
-                sts[op.tensor], firstg[op.tensor] = pos, g
+                # the producer: the group's layer, or a tiled stratum's output for its tile stores
+                sts[op.tensor], firstg[op.tensor], firstp[op.tensor] = pos, g, getattr(op, "prod", None) or gl[g]
     oint = getattr(P, "out_internal", {})      # the outputs' NPUC shapes (a widened pool's one more column)
     # a DRAM concat's input that another layer loads back from the concat's buffer (stream.py, cat_of): NPUC still
     # gives it a DRAM of its own (its forwarding names it the reader's input DRAM), an IM vector no DMA uses, just
     # before the concat's when it makes the concat's first store (V: add-probe res-c4, res-c8, res-c24, chain3's stem;
-    # not for the one-node inputs its readers share in SRAM: chain3's ADD convs)
+    # a tiled stratum's output by its tile stores, add-probe2 fx3-160-c32-*; not for the one-node inputs its readers
+    # share in SRAM: chain3's ADD convs)
     own = {op.cat_of for op, _, _ in dmas if op.kind == "load" and getattr(op, "cat_of", None)}
     for t in sorted(sts, key=sts.get):
-        p_ = gl[firstg[t]]
+        p_ = firstp[t]
         if p_ in own and p_ not in vim:
             c_, h_, w_ = chw[p_]
             im = _im_vector(c_, h_, w_, c_ * h_ * w_)
@@ -1454,15 +1456,9 @@ def _pol_blocks(nd, ins, outs, nbuf=0):
             b["wk"] = [_pol_blk(C, h + 2 * ph, w + 2 * pw, nC),
                        _pol_blk(sh * sw * C, cdiv(h + 2 * ph, sh), cdiv(w + 2 * pw, sw), nC)]
         b["w"] = nd["per"] if not nbuf else cdiv(nd["per"], co) * nbuf * 16
-        # V (PNodeConvolution::getRequiredPartialSummationBlock 0x346070, requiredPartialSummationBlock 0x336220):
-        # one weight buffer = s*s*p1 x 2 B x ceil(kh/s) ceil(kw/s), p1 = the IFM's planes per IDP (even for s > 1);
         # past 511 a block of 896 B per cell over ceil((w + pt + pb) / s) columns x ceil((h + pl + pr) / s) rows
         # (NPUC adds the vertical pads to the width and the horizontal ones to the height)
-        p1 = rup(cdiv(C, 2), nC) // nC
-        if sh > 1 or sw > 1:
-            p1 = rup(p1, 2)
-        kh, kw = L["k"]
-        if sh * sw * p1 * 2 * cdiv(kh, sh) * cdiv(kw, sw) > POL_NZV:
+        if pol_wbuf(L, C) > POL_NZV:
             b["ps"] = cdiv(cdiv(w + pt + pb, sw), 8) * cdiv(cdiv(h + pl + pr, sh), 4) * POL_PSUM_CELL
     else:
         b["ofm"] = _pol_blk(nd["out"][0], oh, ow)
@@ -1470,6 +1466,40 @@ def _pol_blocks(nd, ins, outs, nbuf=0):
             b["wk"] = [_pol_blk(C, h + 2 * ph, w + 2 * pw, nC)]
             b["nofms"] = True
     return b
+
+
+def pol_wbuf(L, C):
+    """the policy's bytes of one weight buffer of conv L over an IFM of C channels (rounded to 16 behind a conv, as the
+    policy's nodes have it; V: PNodeConvolution::getRequiredPartialSummationBlock 0x346070,
+    requiredPartialSummationBlock 0x336220): s*s*p1 x 2 B x ceil(kh/s) ceil(kw/s), p1 = the IFM's planes per IDP
+    (even for s > 1); past POL_NZV the policy counts a partial-sum block"""
+    nC = cell(C, 1, 1)["n"]
+    sh, sw = L["stride"]
+    p1 = rup(cdiv(C, 2), nC) // nC
+    if sh > 1 or sw > 1:
+        p1 = rup(p1, 2)
+    kh, kw = L["k"]
+    return sh * sw * p1 * 2 * cdiv(kh, sh) * cdiv(kw, sw)
+
+
+# The largest policy weight buffer of a dense depthwise conv in a tiled stratum, with one weight sub-batch, on which
+# ncpgen has been checked exact (V: mobilenet-v2-100-224 and ssd-mobilenet-v2-300, their 3x3 stride-2 depthwise over
+# 144 channels in one-layer strata: 576 B)
+POL_DW_PSUM_SEEN = 576
+
+
+def stratum_psum_unmodelled(L, C, nsub):
+    """None, or why ncpgen refuses conv L (IFM channels C as the policy rounds them, nsub weight sub-batches) in a
+    tiled stratum: NPUC gives a dense depthwise conv whose weights pack in one sub-batch a PARTIAL_SUM chunk all the
+    same when its policy weight buffer passes POL_NZV by more than seen exact (V: efficientdet-lite0-320-p4's l19_dw6,
+    3x3 stride 2 over 240 channels, 960 B, a PARTIAL_SUM of 10752 B on each tile's conv; its rule is not read)"""
+    if L["kind"] != "conv" or L.get("from") != "depthwise_conv2d" or (nsub or 1) > 1:
+        return None
+    wb = pol_wbuf(L, C)
+    if wb <= max(POL_NZV, POL_DW_PSUM_SEEN):
+        return None
+    return ("%s: a dense depthwise conv in a tiled stratum, one weight sub-batch but a policy weight buffer of %d B: "
+            "NPUC's partial sums there are not modelled (efficientdet-lite0-320-p4, frame.md 6.11)" % (L["name"], wb))
 
 
 def _pol_full(nd, nbuf=0, extended=True, ifm_pre=False, ofm_pre=False):
@@ -1948,6 +1978,7 @@ def forwarding(low, pol=None):
         if all(x in branch or x == kn for x in cons.get(r, [])):
             heads[r] = kn
     life, res, nbuf, last = {}, {}, {}, {}
+    owner = {}                              # the block head a tested node belongs to
     for mode in ("is", "cs", "ff"):
         cur, mem0, ok = None, 0, set()
         res[mode], nbuf[mode] = {}, {}
@@ -1976,17 +2007,34 @@ def forwarding(low, pol=None):
             r = _pol_whole(nds[n], mem, ifm_pre=mode != "cs" and p == cur,
                            ofm_pre=mode != "is" and bool(rd) and by[rd[0]]["kind"] == "concat")
             life[n] = r["extended"]
+            owner[n] = cur
             if r["whole"]:
                 ok.add(n)
                 nbuf[mode][n] = last[n] = r["nbuf"]
+    # a block that passes concat in SRAM but fails full forwarding loses its concat in SRAM (concat_cs_ok), and with
+    # it the weight rings the concat-in-SRAM and full-forwarding tests set on its nodes: the input-sharing test's ring
+    # stands (V: add-probe2 ff-*: the expansion conv's weights all resident as input sharing left them, not the
+    # 4-buffer ring of the concat-in-SRAM test; camera-add mobiledet-t0's l51 block); the lifetime stays the last
+    # test's, as everywhere (V: add-camera m3026, its 3x3 conv's weights on its conv only after the failed full
+    # forwarding test). Not when a producer or reader of the concat is tiled, which keeps it in DRAM anyway (V: large
+    # random t2000, the concat-in-SRAM test's ring stands)
+    for n, h in owner.items():
+        if res["cs"].get(h) and not res["ff"].get(h) and \
+                not any(x in tiled for x in ins[heads[h]] + cons.get(heads[h], [])):
+            if n in nbuf["is"]:
+                last[n] = nbuf["is"][n]
+            else:
+                last.pop(n, None)
     return {"life": life, "ok": res, "nbuf": nbuf, "heads": heads, "last": last}
 
 
 def concat_cs_ok(kn, fwd):
-    """the concat-in-SRAM block test (forwarding mode "cs") of the block concat kn ends passes; NPUC keeps the concat
-    in DRAM otherwise (V: large random t2022, fresh camera v3003)"""
+    """the concat-in-SRAM block test (forwarding mode "cs") of the block concat kn ends passes, and so does the full
+    forwarding test (mode "ff": the head's output and the concat held together); NPUC keeps the concat in DRAM
+    otherwise (V: large random t2022, fresh camera v3003: "cs" fails; camera-add mobiledet-t0's l55, "cs" passes and
+    "ff" fails, the only such block of the sweeps)"""
     hs = [h for h, k in fwd["heads"].items() if k == kn]
-    return bool(hs) and fwd["ok"]["cs"].get(hs[0], False)
+    return bool(hs) and fwd["ok"]["cs"].get(hs[0], False) and fwd["ok"]["ff"].get(hs[0], False)
 
 
 def concat_ofm_shared(kn, cons, fwd):
@@ -2112,6 +2160,11 @@ def plan_tiled(low, wsize, fix_npuc=False, nsub=None, policy=None):
             if layers[li]["kind"] != "conv":
                 continue
             L = layers[li]
+            C = shapes[li]["in"][0]
+            why = stratum_psum_unmodelled(L, rup(C, 16) if li and layers[li - 1]["kind"] == "conv" else C,
+                                          nsub.get(li))
+            if why:
+                raise NotImplementedError(why)
             if (nsub.get(li) or 1) > 1:
                 # the PARTIAL_SUM over the tile's MTC input (its padded input, or the space-to-depth input)
                 sz = 0

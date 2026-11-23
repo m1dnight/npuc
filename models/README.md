@@ -159,8 +159,8 @@ Findings on the way (NPUC, V):
 
 The camera models' backbones (models/camera.md) at their published input sizes, our weights, one output each (the
 NPU part to the last feature map; the heads, CPU tails, upsampling and several outputs are other work). They exercise
-NPUC's tiling inside graphs at 192..320 px. **8 entries: 4 exact, 1 differs, 3 that NPUC refuses (ncpgen refuses
-them too).**
+NPUC's tiling inside graphs at 192..320 px. **8 entries: 4 exact, 1 that ncpgen refuses (NPUC behaviour not
+modelled), 3 that NPUC refuses (ncpgen refuses them too).**
 
 | model | NPUC | ncpgen | what NPUC does / why it refuses |
 |---|---|---|---|
@@ -168,7 +168,7 @@ them too).**
 | ssd-mobilenet-v2-300 | PASS | **EXACT** | the 150x150 layers one stratum of 7 row tiles; the 19x19x576 stride-2 depthwise layer with the policy's ring of 12 of 36 passes (frame.md 6.11); spills and trims as NPUC's allocator does them |
 | movenet-backbone-192 | PASS | **EXACT** | MobileNet v2 1.0 at 192 px to conv 1280 |
 | mobiledet-320-c4 | PASS | **EXACT** | MobileDet-EdgeTPU to C4 (20x20x96): Tucker and fused blocks at 160 and 80 px tiled, 15 ADDs' blocks |
-| efficientdet-lite0-320-p4 | PASS | differs | EfficientNet-Lite0 to P4 (20x20x112): NPUC gives a one-layer tiled stratum (the 3x3 stride-2 depthwise over 240 channels, quant 3) a PARTIAL_SUM chunk and partial-sum passes although its weights pack in one sub-batch (the policy's 511-byte rule; not modelled) |
+| efficientdet-lite0-320-p4 | PASS | refuses | EfficientNet-Lite0 to P4 (20x20x112): NPUC gives a one-layer tiled stratum (the 3x3 stride-2 depthwise over 240 channels, quant 3) a PARTIAL_SUM chunk of 10752 B on each tile's conv although its weights pack in one sub-batch (its policy weight buffer 960 B; the same layers at 576 B, in mobilenet-v2-100-224 and ssd-mobilenet-v2-300, have none); its rule is not read, so ncpgen refuses such a conv (`frame.stratum_psum_unmodelled`, frame.md 6.11) |
 | mobiledet-320 | crashes | refuses | its 5x5 depthwise layers over 768 at stride 2 and 960: tryBuildData's stack array (NPUC limits below) |
 | efficientdet-lite0-320 | crashes | refuses | its 5x5 depthwise layers over 1152: the same |
 | posenet-mobilenet-v1-257 | asserts | refuses | conv1 .. dw4 one stratum of 5 row tiles at 257 px whose fourth input tile ends on row 260: "Tile end row exceeds FM shape" (frame.md 6.10) |

@@ -119,13 +119,28 @@ block input feeds the next block's first conv and the ADD). Rules found on `$NCP
   in `Assembly::setForwardingFlag` from a "DRAM" tag on the edge, whose setting was not read; the mirror image of the
   stored branch root rule, which reloads a one-node root and shares a padded one.)
 - **No concat scale folding**: with the labels of section 4, none of the 111 compiles logs "will update the scale".
+- **At camera sizes** (add-probe2 fx3-*, ff-*, the add-camera sets; frame.md 6.11 "Concats kept out of SRAM"):
+  - a residual root that NPUC's stratum coalescing puts into a tiled layer's stratum (MobileDet's stride-2 3x3
+    expansion and its 1x1 projection, coalesced after the forwarding tests): the concat goes to DRAM, its tiles store
+    the root into the concat's buffer, the root's other reader gets a WCONCAT chunk live at it only (loaded from the
+    concat's buffer), NPUC gives the root an IM vector no DMA uses (as the stored inputs above), and the concat's read
+    back keeps the first citizen (fx3-160-c32-e64-e64, -e128);
+  - a block that passes concat in SRAM but fails full forwarding: the concat goes to DRAM (a second citizen at its
+    reader), its nodes keep the input-sharing test's weight ring (ff-40-c64-e128-k5 and three more), and so does a
+    concat of channels not a multiple of 16 whose block fails either test (add-camera2 m4013: a second citizen, not
+    the first citizen of a concat no block holds);
+  - a one-node residual root whose input-sharing block fails is no first citizen: its other reader loads it back from
+    the concat's buffer, as a multi-node root's (add-camera m3026, m3034).
 
 | Set | Networks | ncpgen exact |
 |---|---|---|
 | `add-probe` (`add_sweep.py compile <dir>`): residuals over a computed tensor C = 4..64, two branches, chains of 3, ADD of pools, ReLU, ReLU6, x + x, 40x40, stride 2, quant 3 | 20 | 20 |
 | `add-random` (`--set random --seed 1 --count 40`, unseen when the rules were fixed): 1..3 blocks of residuals, branch pairs and inverted-residual chains, 1 in 5 int8 (quant 3) | 40 | **40** at first sight |
 | `add-random2` (`--seed 101 --count 40`, compiled after everything above) | 40 | **40** at first sight |
-| `add-probe2` (`--set probe2`): residuals at 40..80 px, blocks expanding to 64 or 128 channels | 11 | 11 (the 2 NPUC's forwarding keeps out of SRAM since main's concat rules: section 7) |
+| `add-probe2` (`--set probe2`): residuals at 40..80 px, blocks expanding to 64 or 128 channels; two blocks in a row (fx2-), behind a tiled stride-2 stem (fx3-), blocks passing concat in SRAM but not full forwarding (ff-) | 21 | 21 (the 2 NPUC's forwarding keeps out of SRAM since main's concat rules: section 7; fx3- and ff- after the rules above) |
+| `add-camera` (`--set camera --seed 3001 --count 40`, unseen when compiled): MobileDet-like stems and fused blocks at 64..160 px | 39 (NPUC aborts on m3006) | **37** at first sight (33 before this work's rules), 39 after the last two rules above |
+| `add-camera2` (`--seed 4001 --count 40`, compiled after the add-camera rules) | 40 | **38** at first sight (28 at 7c41ab4), 40 after the second-citizen rule |
+| `add-camera3` (`--seed 5001 --count 30`, compiled and checked after every rule above) | 30 | **29** at first sight, m5003 refused (strata joined: frame.md 6.11 "Not yet"), none wrong |
 
 `tests/golden.txt` holds the 100 NCP hashes of add-probe, add-random and add-random2 (rows `add:probe|random:<name>`);
 `tests/regress.sh add-probe add-random add-random2 add-probe2`.
@@ -180,9 +195,13 @@ root-3504c01f), and MobileDet's box head 0 (t0, 68 layers); MobileDet's later he
 tryBuildData, a memset: the dense depthwise 3x3 stride 2 over 768 channels, "numInputChannels 3072"), not in anything
 of the ADD. ncpgen's weights are exact on the SSD v2 cuts; its streams refuse them ("a layer-block whose node only fits
 with a weight ring": in a residual block's layer-block the dense 3x3 depthwise at 19x19x576 fits only with 18 weight
-buffers; taking the forwarding test's ring there gets t166 generated, but groups 15 to 17 still differ: not modelled) and MobileDet's t0 ("a concat in SRAM NPUC's
-forwarding refuses": the second ADD's concat at 80x80, whose block's 3x3 expansion to 128 channels leaves no room; the
-case of graph-large2 t2022, frame.md 6.11). The other five models stop before their first ADD (PAD, a CPU head).
+buffers; taking the forwarding test's ring there gets t166 generated, but groups 15 to 17 still differ: not modelled;
+with the camera-size rules of section 5 t166's streams are exact, and frame still refuses the three: a load of a
+tensor no layer stores). MobileDet's t0 is **exact** (section 5 "At camera sizes"): its first fused block's root sits in the tiled stem's stratum
+(fx3-), the second ADD's concat at 80x80 fails concat in SRAM (fx-80-c16-e128), the first 20x20 one passes it but fails
+full forwarding (ff-). Between the camera-resolution merge and this, t0 was generated wrong (the 80x80 concat's
+refusal lifted, the first block's rule and the 20x20 one missing): tests/regress.sh now fails on any such case. The
+other five models stop before their first ADD (PAD, a CPU head).
 
 That last case reproduces on add-probe2 fx-80-c16-e128 and -r1 (NPUC: "Concat in SRAM: the optimization cannot be
 performed for the block containing the node ... l2_exp"; at 64x64 it succeeds). **Exact since the merge with main's

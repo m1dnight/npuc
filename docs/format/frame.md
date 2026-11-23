@@ -523,19 +523,30 @@ holding less so far, the bottom on a tie, as a chain stratum's weights (6.5): ss
 - the io batch ids of a graph: the stream part's (NPUC's SetBatchTransferInGroup, cmdq.md 7b), not re-derived from the
   ev2set masks (t1016: a clustered load's 16 parts in one batch, which the masks cannot tell).
 
-**Concats kept out of SRAM** (V: large random t2006, t2022; fresh camera v3003, v3025): NPUC drops a concat from SRAM
-after its static test (`common.concat_in_sram`) when the concat-in-SRAM block test fails (forwarding "cs"), when a
-producer or reader is tiled, or when its readers do not share its OFM (`frame.concat_ofm_shared`: read by several
-layers whose input-sharing block fails; LivenessAnalysis::collectAllChunks, "ConcatInSram was turned off here!", the
-readers' weights then in the DRAM order: t2006's three readers). Read back from DRAM such a concat gets, for one
-reader, a chunk live at that reader only (a second citizen; a concat that never passed the static test keeps the first
-citizen from the concat to its reader: cat2, cat3), and for several readers that share it (their input-sharing block
-passes) one first citizen from the concat to the last reader, loaded by the first (v3025). A tiled stratum's output
-read back by several layers gets their chunks in NPUC's node order (v3003).
+**Concats kept out of SRAM** (V: large random t2006, t2022; fresh camera v3003, v3025; add-probe2 ff-*): NPUC drops a
+concat from SRAM after its static test (`common.concat_in_sram`) when the concat-in-SRAM block test fails (forwarding
+"cs"), when that test passes but the full-forwarding one fails ("ff": the head's output and the concat held together;
+add-probe2 ff-40-c64-e128-k5 and three more, camera-add mobiledet-t0's l55: `frame.concat_cs_ok`), when a producer or
+reader is tiled, or when its readers do not share its OFM (`frame.concat_ofm_shared`: read by several layers whose
+input-sharing block fails; LivenessAnalysis::collectAllChunks, "ConcatInSram was turned off here!", the readers'
+weights then in the DRAM order: t2006's three readers). Dropped by a failed full forwarding, the block's nodes keep the
+weight ring of their input-sharing test, not the concat-in-SRAM test's (the lifetime stays the last test's: add-camera
+m3026; not when the concat has a tiled neighbour: t2000). Read back from DRAM such a concat gets, for one reader, a
+chunk live at that reader only (a second citizen; a concat that never passed the static test keeps the first citizen
+from the concat to its reader: cat2, cat3, and so does one whose producer the stratum coalescing tiles after the tests:
+add-probe2 fx3-160-c32-*), and for several readers that share it (their input-sharing block passes) one first citizen
+from the concat to the last reader, loaded by the first (v3025). A tiled stratum's output read back by several layers
+gets their chunks in NPUC's node order; one that a DRAM concat reads directly (an ADD's residual: its tiles store it
+into the concat's buffer) and one other layer reads, a chunk live at that reader, and NPUC gives it an IM vector of its
+own no DMA uses, before the concat's (fx3-160-c32-*, as add.md 5's stored inputs).
 
-**Not yet**: strata joined to each other, a tiled stratum's output heading a concat's branches, fresh camera v3003 (a
-pool stratum's output read by two 1x1 convs and a tiled 5x5 conv: NPUC loads it for the first reader where ncpgen does
-not). Rate on the first large random set: 40 of 40 (31 before the trim and spill of 6.12, the forwarding model and the
+**Not yet** (refused): strata joined to each other, a tiled stratum's output heading a concat's branches, a tiled
+stratum's output read by several untiled layers and another tiled stratum (fresh camera v3003: a pool stratum's output
+read by two 1x1 convs and a tiled 5x5 conv; NPUC loads it once more for the first reader; one untiled reader beside the
+tiled one is modelled, t1035), a dense depthwise conv in a tiled stratum whose policy weight buffer passes 576 B while
+its weights pack in one sub-batch (efficientdet-lite0-320-p4's l19_dw6, 960 B: NPUC gives each tile's conv a
+PARTIAL_SUM chunk of 10752 B all the same; 576 B is exact, mobilenet-v2-100-224 and ssd-mobilenet-v2-300;
+`frame.stratum_psum_unmodelled`). Rate on the first large random set: 40 of 40 (31 before the trim and spill of 6.12, the forwarding model and the
 items above; 22 before the clustered loads, the shared WCONCAT and the chain rule). **A fresh unseen set**
 (`stream_graphs.py random $NCPGEN_WORK/sweep/graph-large2 2000 40 --set large`, compiled after the work above): 35 of
 39 at first sight (NPUC crashes on t2031, GlobalMemoryAllocator.cpp:860); t2016 and t2029 then fixed by NPUC's
@@ -549,7 +560,7 @@ set at camera sizes** (`stream_graphs.py random $NCPGEN_WORK/sweep/graph-camera 
 300 or 320 px inputs; compiled while the work above went on): of the first 26 NPUC compiled, 23 exact at first sight
 (v3024 refused: a block node passing only with a ring; v3025: a concat in DRAM shared by its readers, with that ring;
 v3003); the rules above then fixed v3024 and v3025, and the 8 compiled after them were all exact at first sight: 33
-of 34 now, v3003 the miss. NPUC fails on 3 more (v3002 and v3030: the tile-end assertion of 6.10, predicted; v3006: "Defragmentation and spilling
+of 34 now, v3003 refused (above). NPUC fails on 3 more (v3002 and v3030: the tile-end assertion of 6.10, predicted; v3006: "Defragmentation and spilling
 failed", which ncpgen's trim and spill predicts too) and 3 did not finish in the harness (v3013, v3019 past its
 300 s limit under load, twice; v3035 no run directory, twice).
 

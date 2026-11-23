@@ -14,7 +14,8 @@ writes for the same lowered network, part by part, checked byte for byte against
         each dir as written by npuc-local.sh (lowered.json + NPUC's net.ncp): every part generated from lowered.json
         and compared with NPUC's: streams, intrinsics, weight blocks, then the whole file (with the parts the generator
         refuses taken from NPUC's file, so that each part is judged alone). Default: NPUC's GReLU bytes; one line per
-        dir and a total.
+        dir, ending with its class (EXACT; REFUSED: a part or the frame raises, gen writes nothing; DIFFERS: gen
+        would write bytes that are not NPUC's), and a total.
   ncpgen.py corpus <dir> [--jobs N]
         compile the regression corpus (CORPUS below) with NPUC into <dir>/<name>/ (npuc-local.sh). Vendor-generated
         bytes: <dir> must be in the work folder or a scratch folder.
@@ -121,8 +122,11 @@ def _cmp_parts(mine, ref, unit):
 
 
 def cmd_check(dirs, grelu="npuc"):
-    """compare every part, then the whole file, with NPUC's compile in each variant dir; 0 when all are exact"""
-    tot = {"streams": 0, "intrinsics": 0, "weights": 0, "file": 0, "pure": 0}
+    """compare every part, then the whole file, with NPUC's compile in each variant dir; 0 when all are exact. Each
+    line ends with the variant's class: EXACT, REFUSED (a part or the frame raises: `gen` writes nothing) or DIFFERS
+    (`gen` would write a file that is not NPUC's: a bug under rule 3, unless NPUC's own file holds uninitialised
+    bytes, tests/regress.sh's NPUC_UNINIT)"""
+    tot = {"streams": 0, "intrinsics": 0, "weights": 0, "file": 0, "pure": 0, "refused": 0, "differs": 0}
     n = 0
     for d in dirs:
         lp, np_ = os.path.join(d, "lowered.json"), os.path.join(d, "net.ncp")
@@ -150,12 +154,17 @@ def cmd_check(dirs, grelu="npuc"):
             pure &= o is None
             res.append("file %s" % ("ok" if o is None else "@%#x (len %d/%d)" % (o, len(whole), len(ref))))
         tot["pure"] += pure
-        print("%-24s %s%s" % (os.path.basename(d.rstrip("/")), " | ".join(res), "  EXACT" if pure else ""))
+        # what `gen` makes of it: nothing when a part or the frame refuses, else a file (exact or not)
+        cls = "EXACT" if pure else "REFUSED" if whole is None or any(v is None for v in parts.values()) else "DIFFERS"
+        if not pure:
+            tot[cls.lower()] += 1
+        print("%-24s %s  %s" % (os.path.basename(d.rstrip("/")), " | ".join(res), cls))
         for x in notes:
             print("    note: " + x)
     print("ncpgen check: %d variants: streams %d, intrinsics %d, weights %d, whole file %d (with NPUC's parts where "
-          "ours are missing), generated entirely by us and exact: %d" % (n, tot["streams"], tot["intrinsics"],
-                                                                        tot["weights"], tot["file"], tot["pure"]))
+          "ours are missing), generated entirely by us and exact: %d, refused: %d, differs: %d"
+          % (n, tot["streams"], tot["intrinsics"], tot["weights"], tot["file"], tot["pure"], tot["refused"],
+             tot["differs"]))
     return 0 if n and tot["pure"] == n else 2
 
 

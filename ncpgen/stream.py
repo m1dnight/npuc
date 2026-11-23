@@ -1425,9 +1425,13 @@ class Plan:
                         psize = {x["name"]: x["planning_size"] for x in weights.weight_layer_info(low)}
                     except ValueError as e:
                         raise Unsupported("weights.py: %s" % e)
+                nsub = {x["name"]: weight_rows(x, self.q)[1] for x in sub if x["kind"] == "conv"}
+                for x in sub:
+                    why = frame.stratum_psum_unmodelled(x, pol["nodes"][x["name"]]["Cr"], nsub.get(x["name"]))
+                    if why:
+                        raise Unsupported(why)
                 tgeo[n] = graph_stratum(sub, [pol["shapes"][x] for x in st["layers"]],
-                                        dict(st, wsize=psize, nsub={x["name"]: weight_rows(x, self.q)[1]
-                                                                    for x in sub if x["kind"] == "conv"}))
+                                        dict(st, wsize=psize, nsub=nsub))
                 nt = len(tgeo[n]["ops"]) - 1
                 na = 2 + len(tgeo[n]["tiles"]) * nt
                 head[n], tail[n] = pos + 1, pos + na - 1     # tile 0's first node .. the vConcat
@@ -1479,7 +1483,10 @@ class Plan:
             if kn in scats:
                 continue
             for i in ins[kn]:
-                if any(by[r]["kind"] != "concat" for r in cons[i]) and head[i] != tail[i]:
+                # (a one-node layer too when it heads the concat's branches and their input-sharing block fails: no
+                # forwarding, its reader loads it back, it is no first citizen; V: add-camera m3026, m3034)
+                if any(by[r]["kind"] != "concat" for r in cons[i]) and \
+                        (head[i] != tail[i] or (fwd["heads"].get(i) == kn and not fwd["ok"]["is"].get(i))):
                     catin[i] = kn
         stored = {}                                         # tensor -> where its producer stores it
         for o in outs:
@@ -1570,7 +1577,8 @@ class Plan:
         for kn in cats:
             rs = {bulb_root(i) for i in ins[kn]}
             r = min(rs)
-            if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r] and closed(kn, r):
+            if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r] and closed(kn, r) \
+                    and r not in catin:     # (loaded back from a DRAM concat's buffer: no input sharing, below)
                 if kn in scats and r in ins[kn]:
                     continue                # the root writes into its SRAM concat's chunk itself (an ADD's conv
                     #                         read by the next block): its readers find it there, never stored
@@ -1603,8 +1611,22 @@ class Plan:
                 # live at it only, allocated after the stratum's own (V: squeezenet11-224-npu, large random t1031: a
                 # conv and an eltwise); heading a concat's branches, one first citizen from the vConcat to the last
                 # reader, loaded by the first and shared (input sharing; V: large random t1016)
-                if not any(all(bulb_root(i) == t for i in ins[kn]) and
-                           bulb_fits(kn, "is") for kn in cats):
+                # (heading a DRAM concat that reads it directly, the residual of an ADD lowered as a conv: the tiles
+                # store it into the concat's buffer, its one other reader gets a chunk live at it only, as above; V:
+                # add-probe2 fx3-160-c32-*, camera-add mobiledet-t0's first fused block)
+                nc = [r for r in rs if by[r]["kind"] != "concat"]
+                if len(nc) > 1 and any(r in tst for r in cons[t]):
+                    # read back by several layers while another tiled stratum reads it from DRAM too: NPUC loads it
+                    # once more for its first reader (fresh camera v3003: a pool stratum, two 1x1 convs and a tiled
+                    # 5x5 conv; frame.md 6.11), how is not modelled (one untiled reader beside the tiled one is:
+                    # large random t1035)
+                    raise Unsupported("%s, a tiled stratum's output, read by %d untiled layers and a tiled one: "
+                                      "NPUC's extra load for its first reader is not modelled" % (t, len(nc)))
+                if len(nc) == 1 and any(r in cats and r not in scats for r in rs):
+                    rch[t, nc[0]] = chunk("WCONCAT", size, [head[nc[0]], head[nc[0]]],
+                                          (2, oidx[tst[t]["layers"][0]], 2, 0))
+                elif not any(all(bulb_root(i) == t for i in ins[kn]) and
+                             bulb_fits(kn, "is") for kn in cats):
                     # (several readers: in NPUC's node order, V: fresh camera v3003's chunk requests, two 1x1 convs
                     # reading a pool stratum)
                     for j, r in enumerate(sorted(rs, key=lambda r: head[r])):
@@ -1623,7 +1645,14 @@ class Plan:
                 ck = chunk(nm, size, [tail[t], max(head[r] for r in rs)], (0, tail[t], 1))
                 rch.update({(t, r): ck for r in rs})
                 wshared.add(t)
-            elif t != src and len(rs) == 1 and t not in tagged:
+            elif t != src and len(rs) == 1 and (t not in tagged or any(x in tst for x in ins[t])) and \
+                    not any(k == t and not (fwd["ok"]["cs"].get(h) and fwd["ok"]["ff"].get(h))
+                            for h, k in fwd["heads"].items()):
+                # (a concat whose producer NPUC tiles after its forwarding tests passed, the stratum coalescing a
+                # one-node branch root into a tiled layer's stratum, keeps the first citizen as one that never
+                # passed the static test; V: add-probe2 fx3-160-c32-*, camera-add mobiledet-t0. One whose block
+                # fails the concat-in-SRAM or the full-forwarding test does not, whatever its channels: V add-camera2
+                # m4013, 24 channels, its block failing full forwarding)
                 rch[t, rs[0]] = chunk(nm, size, [tail[t], head[rs[0]]], (0, tail[t], 1))
             else:
                 for r in rs:

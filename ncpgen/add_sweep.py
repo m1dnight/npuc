@@ -4,8 +4,8 @@ arbitrary scales and zero points, lowered by npunet to a mixed-quantisation chan
 compiled by the NPUC oracle with a harness that reads "concat ... mixed" (root-81d28366 or later). Our own seeded
 weights and quantisations; uint8 models (quant 1, any zero point) and int8 ones (quant 3, zero points 0).
 
-  add_sweep.py write <dir> [--set probe|probe2|random] [--seed S] [--count N]     <dir>/<name>.json per network
-  add_sweep.py compile <dir> [name...] [--set probe|probe2|random] [--seed S] [--count N]
+  add_sweep.py write <dir> [--set probe|probe2|random|camera] [--seed S] [--count N]     <dir>/<name>.json per network
+  add_sweep.py compile <dir> [name...] [--set probe|probe2|random|camera] [--seed S] [--count N]
         write, lower each with --add-as-conv into <dir>/<name>/ (lowered.json, net.npuc), then npuc-local.sh it there
         (NPU_ROOT: the harness run directory)
 Check: python3 -m ncpgen check <dir>/*/ ; the CPU reference against TFLite's ADD: models/camera.py addcheck.
@@ -151,6 +151,33 @@ def probe2_variants():
             s = n.conv("s1", s, 16, k=1, act="relu")
         e = n.conv("exp", s, E, k=3, act="relu")
         n.conv("head", n.add("add", n.conv("proj", e, 16, k=1), s), 8, act="relu")
+    # two fused blocks in a row, as MobileDet's at 80 px (camera-add mobiledet-t0): the second block's residual root
+    # is the first ADD's conv, a one-node layer reading the first ADD's concat
+    for hw, E1, E2 in ((80, 64, 128), (80, 64, 64), (64, 64, 128), (80, 128, 128)):
+        name = "fx2-%d-c16-e%d-e%d" % (hw, E1, E2)
+        n = V[name] = Net(name, hw, hw, 8, 800 + hw + E1 + E2)
+        s = n.conv("s1", n.conv("stem", "image", 16, act="relu"), 16, k=1, act="relu")
+        for i, E in enumerate((E1, E2)):
+            s = n.add("add%d" % i, n.conv("proj%d" % i, n.conv("exp%d" % i, s, E, k=3, act="relu"), 16, k=1), s)
+        n.conv("head", s, 8, act="relu")
+    # the same behind MobileDet's stride-2 expansion (160 px, 32 channels, a 3x3 to 128 channels at stride 2, NPUC
+    # tiles it), its 1x1 projection the first block's root
+    for E1, E2 in ((64, 128), (64, 64)):
+        name = "fx3-160-c32-e%d-e%d" % (E1, E2)
+        n = V[name] = Net(name, 160, 160, 32, 900 + E1 + E2)
+        s = n.conv("s1", n.conv("stem", "image", 128, act="relu", stride=2), 16, k=1)
+        for i, E in enumerate((E1, E2)):
+            s = n.add("add%d" % i, n.conv("proj%d" % i, n.conv("exp%d" % i, s, E, k=3, act="relu"), 16, k=1), s)
+        n.conv("head", s, 8, act="relu")
+    # a residual block whose layer-block passes input sharing and concat in SRAM but not full forwarding (the head's
+    # output and the concat held together): NPUC builds the concat in DRAM (frame.concat_cs_ok)
+    for hw, C, E, k in ((40, 64, 128, 5), (48, 64, 128, 3), (32, 96, 256, 3), (40, 64, 192, 3)):
+        name = "ff-%d-c%d-e%d-k%d" % (hw, C, E, k)
+        n = V[name] = Net(name, hw, hw, 16, 1000 + hw + C + E + k)
+        s = n.conv("s1", n.conv("stem", "image", C, act="relu"), C, k=1, act="relu")
+        s = n.add("add", n.conv("proj", n.conv("exp", n.conv("e1", s, E, k=1, act="relu"), E, k=k, act="relu"), C,
+                                k=1), s)
+        n.conv("head", s, 8, act="relu")
     return V
 
 
@@ -188,9 +215,42 @@ def random_net(name, seed):
     return n
 
 
+def camera_net(name, seed):
+    """a seeded random network at camera-like sizes, as MobileDet's and MobileNet v2's early stages: a stride-2 stem
+    expanding to 32..128 channels (NPUC often tiles it), a 1x1 projection, then 1 to 3 residual blocks (a 3x3 or a
+    1x1 + 3x3 expansion to 32..128 channels and a 1x1 projection back, ADDed to the block input), now and then a
+    stride-2 block between; uint8 with any zero points (1 in 5: int8, quant 3)"""
+    r = random.Random(seed)
+    dtype = "int8" if r.random() < 0.2 else "uint8"
+    hw = r.choice([64, 80, 96, 112, 128, 160])
+    n = Net(name, hw, hw, r.choice([3, 8, 16, 32]), seed, dtype)
+    k = [0]
+
+    def nm(p):
+        k[0] += 1
+        return "%s%d" % (p, k[0])
+
+    C = r.choice([16, 16, 24, 32])
+    t = n.conv(nm("c"), n.conv(nm("c"), "image", r.choice([32, 64, 128]), act="relu", stride=2), C, k=1)
+    for _ in range(r.randint(1, 3)):
+        E = r.choice([32, 48, 64, 96, 128])
+        e = t
+        if r.random() < 0.4:
+            e = n.conv(nm("c"), e, E, k=1, act="relu")
+        e = n.conv(nm("c"), e, E, k=3, act="relu")
+        t = n.add(nm("a"), n.conv(nm("c"), e, C, k=1), t, act=r.choice(["none", "none", "relu"]))
+        if r.random() < 0.25 and min(n.t[t][1:3]) >= 32:
+            C = r.choice([16, 24, 32, 48])
+            t = n.conv(nm("c"), n.conv(nm("c"), t, r.choice([64, 96]), k=3, act="relu", stride=2), C, k=1)
+    n.conv(nm("c"), t, r.choice([8, 16]), act="relu")
+    return n
+
+
 def networks(a):
     if a.set == "random":
         return {"r%03d" % s: random_net("r%03d" % s, s) for s in range(a.seed, a.seed + a.count)}
+    if a.set == "camera":
+        return {"m%04d" % s: camera_net("m%04d" % s, s) for s in range(a.seed, a.seed + a.count)}
     return probe2_variants() if a.set == "probe2" else probe_variants()
 
 
@@ -211,7 +271,7 @@ def main(argv=None):
     ap.add_argument("cmd", choices=("write", "compile"))
     ap.add_argument("dir")
     ap.add_argument("names", nargs="*")
-    ap.add_argument("--set", choices=("probe", "probe2", "random"), default="probe")
+    ap.add_argument("--set", choices=("probe", "probe2", "random", "camera"), default="probe")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--count", type=int, default=40)
     a = ap.parse_args(argv)

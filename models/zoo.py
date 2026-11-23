@@ -1375,7 +1375,8 @@ def status(name, run_check=True):
         line = row[0][len(name):].strip() if row else (out[-1] if out else "?")
         s["ncpgen"] = ("EXACT" if line.endswith("EXACT") else line) + " (%.0f s)" % (time.time() - t0)
         s["ncpgen_notes"] = [l.strip() for l in out if l.strip().startswith("note:")]
-        s["verdict"] = "exact" if line.endswith("EXACT") else "differs"
+        s["verdict"] = ("exact" if line.endswith("EXACT") else "ncpgen-refuses" if line.endswith("REFUSED")
+                        else "differs")
         json.dump(s, open(os.path.join(d, "check.json"), "w"), indent=1)
     return s
 
@@ -1399,8 +1400,9 @@ def cmd_check(names, jobs, md, cached=False):
             for x in s.get("ncpgen_notes", []):
                 print("    " + x)
     v = [s["verdict"] for s in rows]
-    print("zoo check: %d models: exact %d, differs %d, NPUC fails %d, refused by npunet %d, not compiled %d" % (
-        len(v), v.count("exact"), v.count("differs"), v.count("npuc-fails"), v.count("refused"), v.count("not compiled")))
+    print("zoo check: %d models: exact %d, differs %d, refused by ncpgen %d, NPUC fails %d, refused by npunet %d, "
+          "not compiled %d" % (len(v), v.count("exact"), v.count("differs"), v.count("ncpgen-refuses"),
+                               v.count("npuc-fails"), v.count("refused"), v.count("not compiled")))
     return 1 if "differs" in v else 0
 
 
