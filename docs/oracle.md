@@ -42,7 +42,9 @@ line for several outputs too (docs/harness-ops.md 4): **root-38925a6d**; the out
 per-channel lines was root-f7b580ef. With `concat ... mixed` (docs/format/add.md, npunet's `--add-as-conv`):
 root-81d28366 (`npuc-net-7af5e49b`, before the `output` line), the same NCPs on earlier inputs (6 of 6 rechecked: graph
 cat16, cat16-relu, res, graph-random g005, perchannel-probe c40-pc, wzp-probe c16-wzp0); with both: **root-3504c01f** (`npuc-net-2d65d13c`), the same NCPs on 7 add, graph and per-channel inputs
-and 5 several-output ones rechecked (outputs o-add, o-c357, o-big-readback, outputs-random m001, m002).
+and 5 several-output ones rechecked (outputs o-add, o-c357, o-big-readback, outputs-random m001, m002). **root-3504c01f is
+what main's harness sources build** (rebuilt at 083412a) and what `work/n3/root-current` points to: 14 more earlier
+networks (corpus, zoo lenet5, mobilenet-v2-035, resnet8, graph-random, tiling2, weights/cat) recompiled byte for byte.
 `check-symbols.py` checks every import binds in Bionic's lookup scopes before anything runs.
 
 ## 3. Run it

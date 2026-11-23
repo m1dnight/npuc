@@ -43,7 +43,7 @@ the compiler, and it is tested on the host against NPUC.
 | Snapshot (refactors) | `tests/snapshot.py record $NCPGEN_WORK/<name>.json.gz [--code <checkout>]`, then `compare` after the change (`--sample K` for a quick look) |
 | Dump / diff an NCP | `oracle/ncp-dump.py net.ncp --log log.txt [--section isa\|io\|...]` |
 | Ghidra | `oracle/ghidra/run-ghidra.sh decompile <targets.txt>` (one process at a time; JAVA_HOME unset) |
-| Rebuild the harness | `docker run --rm --platform linux/amd64 -v "$PWD":"$PWD" -w "$PWD" python:3.12-slim-bookworm oracle/harness/build.sh` → root-fd659af2 (with `dwconv`; `work/n3/root-current`) |
+| Rebuild the harness | `docker run --rm --platform linux/amd64 -v "$PWD":"$PWD" -w "$PWD" python:3.12-slim-bookworm oracle/harness/build.sh` → root-3504c01f (per-channel lines, `output`, `concat ... mixed`; `work/n3/root-current`; docs/oracle.md 2) |
 
 Python: `python3 -I`, standard library only. The host has docker (arm64 containers run NPUC; amd64 ones run the NDK).
 
