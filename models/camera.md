@@ -48,7 +48,7 @@ first in their rank.
 | 1 | **several outputs** (the detection heads) | 9: SSD v1, SSD v2, MobileDet, SSDLite, EfficientDet, face SSD, PoseNet, MoveNet, YOLO-Fastest | the other agent's work. Each head alone now lowers and compiles (`--output`) |
 | 2 | **the CPU tail** (stop before RESHAPE/CONCAT across anchors, LOGISTIC, DEQUANTIZE, the post-process op) | 9: the 8 with a post-process or decoder + Tiny YOLO v2's DEQUANTIZE | **partly done**: `--output TENSOR` cuts the model at one tensor (tflite_cut). What remains is lowering, not hardware: cut at the set of tensors that feed the first CPU-only op (with several outputs) and keep the rest as a CPU tail graph (npunet's cpu_tail runs only RESHAPE and SOFTMAX today; LOGISTIC, CONCATENATION along an axis, DEQUANTIZE and TFLite_Detection_PostProcess would be host code) |
 | 3 | **ADD with any scales and zero points** | 7: SSD v2, MobileDet, SSDLite, EfficientDet, face SSD, MoveNet, YOLO-Fastest (none of their 124 ADDs has power-of-two scales or zero points NPUC's Eltwise could take; 2 of MoveNet's broadcast) | **done, opt-in** (`--add-as-conv`, a change of the model): NPUC has no form of it (the stock HAL never hands it an ADD; its Eltwise only shifts); npunet lowers it to a concat of the two inputs and a 1x1 conv over it (exact accumulator, one requantisation): **0.15 to 0.38 % of each ADD's values off by 1 LSB** against TFLite's ADD, never more (section "ADD with any scales"; docs/format/add.md). NPUC compiles it, ncpgen exact on 20 probes and 80 of 80 unseen random networks |
-| 3 | **resolution over 224** (tiling inside a graph) | 7: SSD v1/v2 (300), MobileDet, EfficientDet, face SSD (320), SSDLite (300), PoseNet (353x481) | ncpgen follows NPUC's graph tiling; SSD v1's heads: section "SSD detectors" |
+| 3 | **resolution over 224** (tiling inside a graph) | 7: SSD v1/v2 (300), MobileDet, EfficientDet, face SSD (320), SSDLite (300), PoseNet (353x481) | ncpgen follows NPUC's graph tiling; SSD v1's heads exact at 300 px (section "SSD detectors"); the camera backbones in the zoo: section "Camera resolutions in the zoo" |
 | 5 | **per-channel weight scales** | 6: person_detect, SSDLite, EfficientDet, MoveNet, YOLO-Fastest, Tiny YOLO v2 | **done**: NPUC has no per-channel multiplier and the NPU no per-channel slope; `--per-channel-shifts` keeps each channel's power of two in its DRU's shift word (unproven on the NPU), `--fold-per-channel` folds all (docs/format/perchannel.md) |
 | 6 | **uint8 weight zero points other than 128** | 5: SSD v1, SSD v2, MobileDet, face SSD, PoseNet | **done**: NPUC compiles any (MTC 0x1b0's low half), ncpgen exact on 20 probes (`$NCPGEN_WORK/sweep/wzp-probe`, quant 1); npunet takes them in quant 1 (unproven on the NPU: every run had 128) |
 | 7 | a CPU head (QUANTIZE of the input, float input, CAST/SUB/MUL preprocessing) | 4: SSDLite, EfficientDet, MoveNet, Tiny YOLO v2 | not done: a requantisation of the input on the host before the NPU part |
@@ -59,11 +59,11 @@ first in their rank.
 | 11 | depthwise multiplier > 1 | 1: person_detect (TFLite's form of a 1-channel CONV_2D) | **done**: npunet lowers any multiplier to the dense conv |
 | - | LOGISTIC, HARD_SWISH on the NPU | 0: every LOGISTIC is in a CPU tail, no HARD_SWISH | - |
 
-What each model still lacks after this work: person_detect nothing; **SSD v1, PoseNet and (with `--add-as-conv`) SSD
-v2 only several outputs and the CPU tail** (and, for ncpgen's exactness, the graph work at their resolution: below);
-MobileDet the same, and past its 20x20 stage NPUC itself crashes (below); face SSD PAD; SSDLite a CPU head;
-EfficientDet upsampling, a CPU head; MoveNet upsampling, a CPU head; YOLO-Fastest upsampling, PAD; Tiny YOLO v2 a CPU
-head and leaky ReLU.
+What each model still lacks after this work: person_detect nothing; **SSD v1 and PoseNet only several outputs and
+the CPU tail** (SSD v1's heads are exact at 300 px one at a time: below); with `--add-as-conv` SSD v2 the same
+(section "ADD with any scales"), MobileDet the same and past its 20x20 stage NPUC itself crashes; face SSD PAD;
+SSDLite a CPU head; EfficientDet upsampling, a CPU head; MoveNet upsampling, a CPU head; YOLO-Fastest upsampling, PAD;
+Tiny YOLO v2 a CPU head and leaky ReLU.
 
 ## person_detect: exact as published
 
@@ -102,11 +102,13 @@ decoding and NMS).
   once): `$NCPGEN_WORK/sweep/camera/ssd-mobilenet-v1-t99` (box head 0, 24 layers), `-t102` (class head 0, 273
   channels), `-t168` (the last class head: the whole trunk and the extra layers, 36 layers, 11.8 MB NCP). NPUC's logs are gzipped there (675 MB for
   t168).
-- **ncpgen**: the weight blocks are exact on all three (uint8 weight zero points, the 1024-channel depthwise layers as
-  dense convs); the streams and frame refuse them: NPUC tiles the 150x150 and 75x75 layers (nodes 1..8; node 7 in 2
-  row tiles, node 8 in 3) where ncpgen's plan keeps them whole ("NeedsTiling: SRAM 278528 B per core > 256 KiB";
-  29 groups planned against NPUC's 37 for t99, 44 against 58 for t168): the tiling of a chain at 300 px, the
-  big-models work (frame.md 6.11). `tests/regress.sh camera` lists them as its 3 known misses.
+- **ncpgen: exact on all three** (`tests/regress.sh camera`: 5 of 5 with person_detect's two). NPUC's policy at
+  300 px was already ncpgen's (`frame_sweep.py policy`: every node's tiles, the stratum, every memory print): conv1 ..
+  conv8 (the 150x150 and 75x75 layers down to 38x38) one stratum of 4 x 2 tiles, the rest single blocks with 4
+  trim-and-spill copies before the 3x3 depthwise layers at 19x19x512. What ncpgen missed was NPUC's **CMDQ cut of a
+  tile** (cmdq.md 7d): the stratum's estimate, 66570 with the tile's TRIM at 90 per plane slot, passes 61440, so
+  every tile is two groups (16 for the stratum: 37 groups for t99 where ncpgen made 29, 58 for t168). Modelled now
+  (`stream.Plan.cut_tile`, `frame._stratum_cmdq_estimate`, frame.md 6.9).
 - **For the whole detector**: several outputs (the 12 heads in one NCP: the other agent's work) and a lowering change
   for the tail: `tflite_cut` takes one tensor; it should take the set of tensors read by the first CPU-only ops (here
   the 12 heads), lowered.json then carrying several NPU outputs and a CPU tail graph (RESHAPE, CONCATENATION on an

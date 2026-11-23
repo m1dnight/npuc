@@ -1,0 +1,7 @@
+# The "Tile end row exceeds FM shape" assertion (PolicyMemory.cpp:297) NPUC hits after its policy on some tiled
+# strata (tiling2 b04; PoseNet MobileNet v1 at 257 px): where the split node's tile rows come from
+sym:calculateNodeCodegenParameters
+str:Tile end row exceeds FM shape
+sym:KernelNodeTileBackPropagator
+sym:getTileShape
+sym:getTile

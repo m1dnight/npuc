@@ -149,7 +149,7 @@ static_asserts: EltwiseAttr (+0x08, 0x20), ConcatAttr (+0x08, +0x10, 0x28), NPUM
 0x1a0), NodeLayerType, NNGraphNode offsets. The hook is compiled for aarch64 only (the host test's x86_64 stub build
 has no NPUC; it still builds and runs, V).
 
-`concat ... mixed` (added 2026-11-22, root-81d28366): the concat's inputs keep their own zero points (the check that
+`concat ... mixed` (added 2026-11-22, root-81d28366; with the `output` line: root-3504c01f): the concat's inputs keep their own zero points (the check that
 each input has the concat's quantisation is skipped; each input must still be a layer's output). For npunet's
 `--add-as-conv` (docs/format/add.md): a 1x1 conv over the concat weighs each input on its own and takes the zero-point
 difference into its bias. The scales must still agree (NPUC's ConcatScaleFoldingFilter compares them): npunet gives
@@ -171,6 +171,21 @@ npuc-conv-6e2aa54d: npuc.h changed, npuc-probe-85fe33b0); `LINK_CURRENT=0` build
 Same NCPs as root-314e61a6 on every earlier input tried: `oracle/ops/check-ops.sh` 31 PASS (the 20 earlier cases with
 their NCP hashes unchanged, plus 3 stock/dense pairs with equal NCPs, a dwopt case and 4 refusals), and 66 of 66
 stored NCPs (40 corpus, 10 graph-random2, 10 random, 6 tiling3) recompiled byte for byte.
+
+**Several outputs (2026-11-22, docs/format/frame.md 12)**: an "npuc-net 2" file may end with
+`output <n> <blob1> ... <blob_n>`, the network's outputs in the model's order. The HAL marks nothing: NPUC's frontend
+makes every node without successors an output (NNGraphCgObject::appendNewOutData), so the line only declares them and
+npuc-net checks NPUC's rule before compiling (exit 1): every blob no layer reads is listed, no listed blob is read by
+a layer, no name twice, not the input. net.json then has `"outputs": [{"name", "out_shape"}...]` in the file's order
+(NPUC's own order is its log's "generateGraph Network Output:" list, its execution order). Without the line, as
+before. `--intermediate <layer>` (npuc-local.sh `--intermediate`) sets CompileOptions +0xb8, NPUC's off-device way to
+output a blob a layer also reads (isIntermediateOutput): a probe only; NPUC's policy maker crashes on it
+(PBuilder::IDram::build2ndStage, frame.md 12). Build: **root-f7b580ef** (npuc-net-3c235038; npuc-probe-85fe33b0 and
+npuc-conv-6e2aa54d unchanged), `LINK_CURRENT=0`. The same NCPs as root-fd659af2: the 12 outputs probes recompiled with
+the line (and "npuc-net 2" instead of 1 for the conv-only ones) byte for byte, and 37 of 38 stored NCPs sampled from
+corpus, graph, graph-random, graph-random2, random, graph-split and tiling2 (the other: graph rc4-24x12, NPUC's own
+uninitialised descriptor words, which root-fd659af2 does not reproduce either). Merged with main's per-channel lines
+(`wscales`, `slopes`, the setScale hook): **root-38925a6d** (npuc-net-627f953e), the run directory for both.
 
 ## 5. What ncpgen/npunet.py needs to lower TFLite to it (for the orchestrator)
 

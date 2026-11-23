@@ -545,6 +545,14 @@ rows; g134: a 4-channel eltwise's
 second operand load skips a flag: fixed since (that load, the second plane slot of a 4-channel operand, takes the
 network's next flag the group does not use, like META_DATA; V: g134, rc4-*, g120).
 
+**Several outputs (frame.md 12; V: the outputs sweeps, 132 compiles).** Each output's UNFLATTEN and output data node
+take two positions right after the output layer in the node order (its chunk lives to that UNFLATTEN). The groups
+follow NPUC's policy groups rather than the layer order: a layer reading from DRAM starts one, every UNFLATTEN is one,
+any other layer joins the group holding its input in SRAM; the NCP lists them in order (`Plan.emit_order`), each output
+group's stream the single output group's with its own index. A reader skips an identical load only when the layer
+just before loaded the same tensor into the same chunk and did not write its output over it, and never right after an
+UNFLATTEN. One output: the layer order and the unflatten last, as above.
+
 ## 7d. NPUC's "CMDQ seems too big" cut (V: the cut sweep `stream_variants_cut.txt` in `$NCPGEN_WORK/sweep/cut`, 49
 networks; big4; MobileNet's 1024 x 1024 1x1 at 7x7 and 14x14)
 
@@ -578,8 +586,17 @@ concat's DRAM buffer (its chunk stores at its offset there), a reader of the net
 reformat (its chunks' slot loads; their tensor is the layer's input), a kernel over 4 MiB loaded core by core.
 `Plan.group_layers` names each group's layer for frame.py (frame.md 6.8).
 
-Not modelled: a cut tile group (none seen: c512's tiles estimate 58590), a cut layer with pools or eltwise (NPUC would
-need more than 300 pooled plane slots).
+**In a tiled stratum** (`Plan.cut_tile`; V: SSD MobileNet v1's heads at 300 px, `$NCPGEN_WORK/sweep/camera/
+ssd-mobilenet-v1-t99/-t102/-t168`: conv1 .. conv8 one stratum of 4 x 2 tiles, every tile in 2 groups, 16 for the
+stratum): NPUC estimates the stratum's layer block once, from one tile's instructions (every layer's passes and
+plane-slot NFU ops, the tile's TRIM at **90 per plane slot**: 16350 + 44 x 1020 + 45 x 60 + 25 x 102 + 90 = 66570, its
+log's "Heuristically predicted size of CMDQ"; the copy groups of the same compile, 64 trimmed slots, print 22110 =
+16350 + 64 x 90 and n = 682), halves n the same way (115 instructions, n = 70) and cuts every tile's instructions in
+chunks of n, each its own NCP group: tile 0's weight loads go with their passes (chunk 1 loads conv1 .. conv6 and 3 of
+conv7's 8 passes, chunk 2 the rest), the tile's input load stays with its TRIM, its store goes in its last chunk. The
+events and batch ids follow (one counter, nothing reordered). Not modelled (refused): a cut inside a tile's last layer
+(would its store come per chunk?) or before an NFU op reading the tile's input (its loads per chunk?), a cut layer
+with pools or eltwise (NPUC would need more than 300 pooled plane slots). c512's tiles estimate 58590: whole.
 
 ## 8. Unknowns and proposals
 

@@ -7,11 +7,9 @@
 # uninitialised bytes, docs/oracle.md); grelu/r 1/5 (hand-edited net.npuc files whose lowered.json does not describe the
 # compiled network: ncpgen refuses them); graph-large2 2 (the fresh large random set, stream_graphs.py random <dir> 2000
 # 40 --set large: t2006 a spill NPUC survives that our model aborts on, and its weight blocks; t2022 a concat NPUC's
-# forwarding keeps out of SRAM: frame.md 6.11); camera 3 (SSD MobileNet v1's heads at 300 px: NPUC tiles its 150x150
-# and 75x75 layers, ncpgen's plan does not; models/camera.md); camera-add 3 (SSD MobileNet v2 and MobileDet cut with
-# --add-as-conv: a layer-block that needs a weight ring, a concat NPUC's forwarding keeps out of SRAM; models/camera.md);
-# add-probe2 2 (fx-80-c16-e128, -r1: that same concat, reproduced; docs/format/add.md 7).
-# Every other set must be exact. Exit 0 when only those known misses
+# forwarding keeps out of SRAM: frame.md 6.11); camera-add 3 (SSD MobileNet v2 and MobileDet cut with --add-as-conv: a
+# layer-block that needs a weight ring, a concat NPUC's forwarding keeps out of SRAM; models/camera.md); add-probe2 2
+# (fx-80-c16-e128, -r1: that same concat, reproduced; docs/format/add.md 7). Every other set must be exact. Exit 0 when only those known misses
 # remain.
 # The sets are checked in parallel: REGRESS_JOBS (default: the CPU count).
 set -uo pipefail
@@ -22,7 +20,7 @@ if [ $# -gt 0 ]; then sets=("$@"); else
   mapfile -t sets < <(find . -mindepth 3 -name lowered.json -path '*/*/lowered.json' | sed 's|^\./||; s|/[^/]*/lowered.json$||' | sort -u)
 fi
 tot=0; ok=0; bad=0
-declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [graph-large2]=2 [camera]=3 [camera-add]=3 [add-probe2]=2)
+declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [graph-large2]=2 [camera-add]=3 [add-probe2]=2)
 J=${REGRESS_JOBS:-$(sysctl -n hw.ncpu 2> /dev/null || nproc 2> /dev/null || echo 4)}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # one check per set, J at a time; the results are printed in the sets' order

@@ -309,7 +309,8 @@ descriptors and vectors from them.
   stores its own tensor (IDP-major) at its offset in the buffer: the earlier inputs' channel counts x half a plane
   (V: cat2, g030, and the weights part's cat sweep with uneven splits 1+7, 3+5, 5+3, 20+12: 86/86). A tensor holding an SRAM
   concat's segments (a pool of it) stores each segment as a tensor of its own after the earlier ones: per core and
-  segment, 64 B wide, or per core with one plane per segment when they are alike (g141, g169).
+  segment, 64 B wide, or per core with one plane per segment when they are alike (g141, g169; SRAM n_stride 0x40000 -
+  segments x h x w, 0 from SRAM offset 0: outputs-unseen m1015 at 3328, as the tiles' loads of 6.5).
 - **A layer NPUC cuts** (6.9; V: mobilenet-v2-035-dense's 112 -> 1280 conv and 1280 -> 1000 classifier, three groups
   each, and the graph-split sweep, cmdq.md 7d): the chain's descriptors in each chunk group: each pass's weight load at
   the stream's slot (core by core for a kernel over 4 MiB), the slot loads of an input an NFU op reads first, and per
@@ -345,7 +346,11 @@ conv14 and the 1024 -> 1000 classifier in 3 groups each after its conv2 + dw2 st
 same block): the stream part's plan gives the groups (a chunk of pads only is a group without DMA), the DMA order,
 events and batch ids; frame's descriptors follow its DMAs one for one, but a cut layer that ends its block stores per
 chunk (`_range_store`), never pass by pass (its ring of 32 of 63 passes and Cout 1000 would otherwise store pass by
-pass).
+pass). **In a tiled stratum** (`_stratum_cmdq_estimate`, stream's `cut_tile`; V: SSD MobileNet v1's heads at 300
+px, camera t99, t102, t168): the stratum's estimate (one tile's instructions, its TRIM at 90 per plane slot) passes
+61440 and every tile is cut in chunks of n instructions (cmdq.md 7d: conv1 .. conv8 in 4 x 2 tiles, 2 groups a tile);
+the same `_tiled_cut` takes the stream's groups, events and batch ids, the tile descriptors following its DMAs one for
+one (tile 0's weight loads with their passes, the store in the tile's last chunk).
 
 ### 6.10 NPUC's tiling policy, read from its code (`npuc_policy`; V: decompiled, `oracle/ghidra/targets-tiling.txt`)
 
@@ -432,6 +437,16 @@ order, the edge pads, a ring of 5+ slots preferred: 6.4-6.6). Still G: which poo
 2 DRUs per IDP of the partial-sum block for inputs on fewer IDPs, getTile's starts, the leading-edge pad rule, the
 copy's start/end test. `frame_sweep.py policy <dirs>` checks the policy against any compile's log.
 
+**NPUC's tile-end assertions** (`_pol_tile_ends`, run by `npuc_policy` and `graph_policy`; V: decompiled
+calculateNodeCodegenParameters, PolicyMemory.cpp:297-300, `oracle/ghidra/targets-tileend.txt`): after the policy, NPUC
+cuts each stratum's input by the split node's layout (tile i from (first - ov) + (i - 1)(middle - ov), first, middle
+or last long) and asserts that every tile ends inside the map and after its start: "Tile end row exceeds FM shape"
+(tileEndH < H), "Tile end column ..." (W), "Negative tile length". The back-propagated layout gives the rounding
+left-over to the last tile, but a middle tile can pass the map's end: tiling2 b04 (a 5x5 conv's 3 row tiles, the
+second over rows 2..9 of 9), posenet-mobilenet-v1-257 (conv1 .. dw4 in 5 row tiles at 257 px, the fourth over rows
+179..261), the fresh camera set's v3002 and v3030 (rows 216..262 and 208..259 of 257; predicted before their logs were
+read). ncpgen refuses these now; of the 4043 networks of the sweeps none NPUC compiled trips it.
+
 ### 6.11 Tiling inside a graph (`graph_policy`, stream's `graph_stratum`; V: graph-split cat96-64, cat128-128, cat160-64, the zoo's standard-resolution models, the large random set)
 
 **The policy** is 6.10's over the graph's nodes (`graph_policy`): NPUC tsorts the graph and asks
@@ -487,6 +502,15 @@ full forwarding: checkPredAndSuccPreallocation), its OFM not counted when a conc
 forwarding); under one byte: "too fat", no call. The last call's lifetime stands (_pol_whole: extended only when all
 weights fit so, or a ring of 5+ buffers does): t1004's three branch convs of 112 x 112 keep their weights on their
 conv only (WEIGHT live [conv, conv]), which the trim and spill of 6.12 then depends on.
+
+**A whole node's weight ring is the policy's** (V: ssd-mobilenet-v2-300): getBestProcessingParams' nbuf, as a
+chain takes it (6.6): the stream's own rule (weight_ring, the feature maps from the allocator's chunks) gives 18 of 36
+passes for the 19x19x576 stride-2 depthwise layer, NPUC's estimate (its PAD and REFORMAT working blocks live together:
+82944 + 110592 B) leaves room for 12; with 18 the allocator fails at that node and spills where NPUC does not. No other
+graph compile changes. **A graph's first citizens**: a third or later one that overlaps goes to the end of the SRAM
+holding less so far, the bottom on a tie, as a chain stratum's weights (6.5): ssd-mobilenet-v2-300's first stratum
+(conv1 .. dw2 in 7 row tiles), its weights of 1024, 512, 256, 768 and 5376 B at 0, the top, under it, under it, then
+1024 (the old rule put the fifth under the top ones).
 
 **Also modelled** (V: large random t1016, t1018, t1038, t1039):
 - a layer-block's forwarding decided by `frame.forwarding` (the tests above with their prealloc flags; t1038's
@@ -700,3 +724,111 @@ non-zero values per batch 0x1ff, command queue 0xf000, instruction length 6, int
   per-IDP parts of nloads = ceil(Cout/16) equal loads (true for every block weights.py writes).
 - **npunet / npu-run**: use `frame.ncp_layout` (8.4); the input conversion is unchanged.
 - **ncpgen gen**: pass `fix_npuc=True` to `frame()` once P9/P11 confirm section 9.
+
+## 12. Several network outputs (V: the outputs sweep, `stream_graphs.py compile <dir> --set outputs`, 12 compiles in `$NCPGEN_WORK/sweep/outputs`; NPUC's frontend decompiled, `oracle/ghidra/targets-outputs.txt`)
+
+Camera models (SSD, EfficientDet, face and pose detectors) end in several tensors: box and class heads per feature map.
+
+**How an output is marked (V, decompiled).** Nothing in the NNNetwork names an output. Compilation::generateGraph
+(libnpuc_frontend 0x144224, Ghidra addresses) adds every graph node in its node order (addGraphNode), and each node's
+output data node goes through NNGraphCgObject::appendNewOutData (0x171dd0): it becomes a network output when the node
+has **no successor** (its NNGraphNode next list, +0x30/+0x38, is empty) or when NNGraphCgObject::isIntermediateOutput
+(0x173fa8) is true: the node's layer name equals the string at graph object +0xd0, which generateGraph copies from
+CompileOptions +0xb8 (empty: GetInstance zeroes it, setCompileOptions leaves it, nothing on the device path sets it).
+An output gets an UNFLATTEN op (CODEGEN_UNFLATTEN_OUTPUT is 1 in every log) and its data id and layer name are pushed
+on the graph object's output lists (+0x80, +0xb0), logged as "outputOrder: <layer>" and at the end as "generateGraph
+Network Output: <layer> : <i>". So the HAL hands NPUC several outputs simply by building a network whose outputs are
+its sinks (G for nn-eden-drv itself: its builder shows no other mark); a model output that another op also reads can
+only be an NPU output through the intermediate-output knob, and that crashes NPUC (below). The harness's `output`
+line declares the outputs and checks this rule (docs/harness-ops.md 4).
+
+**Order (V: 12/12 "Network Output:" orders).** NPUC's output order is its layer order (common.exec_order over all
+the outputs: the layers they need, the ready layer with the highest breadth-first number first), restricted to the
+outputs. The model's own order (its declaration, a TFLite subgraph's outputs list) plays no part (o-heads2 and
+o-heads2-rev: the same NCP). lowered.json keeps both: `outputs` in the model's order (name, layer, chw, NHWC shape,
+bytes), `npu_outputs` in NPUC's.
+
+**Node order and live ranges (V: the NODE ORDER of the 12 logs).** Right after an output layer's atoms come its
+UNFLATTEN node and its output data node (two positions); the next layer follows. The output's chunk lives to its
+UNFLATTEN (the single-output rule: the last layer's chunk to the unflatten at the end). E.g. o-heads2 (c0, then the
+heads hb, ha): INPUT, PAD c0, CONV c0, CONV hb, UNFLATTEN hb, out hb, PAD ha, CONV ha, UNFLATTEN ha, out ha.
+
+**The NCP's group order: NPUC's policy groups (V: the 12 probes and the 40 development random graphs, its log's
+"Node n, create group g").** One NCP group per layer (as section 6.8) and **one output group per output**, each with
+the 328-byte output intrinsic (section 7) of its own group index, writing its own OT_FMAP vector. Their order follows
+NPUC's policy groups: a layer that reads its input from DRAM (a concat's buffer, a stored root, the network input
+reloaded; an eltwise loading its operands; also when the LIR then skips the identical load: graph add2, g022 and
+graph-split-random s001 log a group for both readers) starts a new group, and so does every output's UNFLATTEN (a group
+of its own); any other layer joins the group holding its input in SRAM (its producer's, or the group whose layer loaded the
+tensor back: a concat branch sharing a reloaded root joins the loader's group, m004), the latest of its inputs' groups.
+The NCP lists the groups in order, each group's layers in NPUC's layer order. So a head reading a feature map in
+SRAM runs right after that map's other readers, before the groups started after it (m004: a pool head on the
+backbone, last in the node order, runs right after its sibling pool), and an output group comes out early when a
+layer after it loads from DRAM (m039: two heads on a concat in DRAM, each loading it: head, its output group, head,
+its output group); with no such load all the output groups come last (the 12 probes). One output: the order is NPUC's
+layer order, the output group last (as always; the policy groups are not applied there).
+
+A layer that reads the same DRAM tensor the same way as the layer just before skips the load (6.8), but not across an
+output's UNFLATTEN (the heads of a DRAM concat, each an output, each load it: V outputs-unseen m1006, m1017), and not
+when the layer just before wrote its output over the loaded copy (V: outputs-unseen2 m2028, the copy at 0 and the
+previous head's output at 0; its partial sums over the copy do not count: graph-split-random s001 skips; G for PAD and
+REFORMAT chunks: no case). The load's SRAM chunk is part of "the same way".
+
+**Vectors.** OT_PIX0..3, IN, the first output's OT_FMAP, an IM per tensor stored to DRAM in the order of its first
+store **in NPUC's layer order** (each output's producer stores it, as the single output's does; the group order above
+does not move them: m004), then **the other outputs' OT_FMAPs** in NPUC's order, then one IM per concat (6.8), the
+WEIGHT / META_DATA blocks **in the NCP's group order** (a moved head moves its block: outputs-unseen m1005, m1014,
+m1016, m1017; `weights.weight_blocks`, the planners keep NPUC's layer order by name), IM 8x8x2. Each OT_FMAP is (W, H,
+C) of its output, size C x H x W (dense CHW). An output that is a pool NPUC widened (6.2) is read back and formatted on
+its internal width, as a chain's (its IM by that width, the intrinsic's W' and the -1 row stride: m1021).
+
+**Concats feeding heads (V: m004, m016, m028, m039, m2028).** A concat that several layers read stays in SRAM only as
+the root of a later concat's branches that all its readers start (a layer-block NPUC's forwarding keeps; V on the
+single-output graphs g021, g141, g169, g172, t1024, t1029, t2023, t2032, all such concats there); read by heads that
+never meet again, or with one reader off the later concat's branches (m2028), it is a DRAM concat
+(its producers store into its buffer, each head loads it), although NPUC logs "Concat in SRAM: layer-block succeeded"
+for it (m039; `common.concat_in_sram`). A concat's branches from a computed root form a layer-block (the root stored
+and loaded back, "Input sharing") only when every reader of the root is on those branches: a root that also feeds a
+head starts none (m028: no layer-block in the log, the branches read the root in SRAM; `stream.Plan.graph`'s
+`closed`, applied to the network input's sharing too).
+- io descriptors: each output's store in its layer's group, its read-back in its output group: the single output's
+  read-back rule per output (section 5: spread, gathered, and for 3, 5 or 7 channels NPUC's STRIDE pattern, IM
+  c_stride -2 x plane: o-c357's three heads all carry it, section 9.1).
+- CMDQ: each output group's stream is the single output group's (load, nop op, the ARM unflatten) with its group
+  index; only the last group ends with `swi 0x8000`.
+- Header counts follow from the above. A concat output reads back from its DRAM buffer (o-cat); a pool, an eltwise
+  output and a residual block's output are stored by their own group (o-pool, o-add, o-res).
+
+**An output that a layer also reads.** Through the HAL: impossible (NPUC outputs only sinks). Through NPUC's knob
+(`npuc-net --intermediate <layer>`, `npuc-local.sh --intermediate`, CompileOptions +0xb8 set by the harness): the
+frontend makes it an output ("outputOrder" lists it), then the policy maker crashes (SIGSEGV in
+PolicyMaker::PBuilder::IDram::build2ndStage, libnpuc_template 0x3920a0) on a chain c0 -> c1 -> c2 with c1 also an
+output and on the same with a second head (`$NCPGEN_WORK/sweep/outputs-inter`, V). npunet refuses such a model.
+
+**Rates.** The probes: 15/15 (the 12 small ones, o-tiled-stem, and the two tiled read-backs since the merge with main's
+tiled read-back). A development set of 40 random detector-like graphs (`stream_graphs.py random <dir> 1
+40 --set outputs`: a stem, 1 to 3 feature maps, 1 to 3 heads each of 1..40 channels, sometimes a residual block or a
+concat in the backbone, pools, adds and concats as outputs; 2 to 8 outputs): 32/40 before the policy groups, the concat
+and the bulb rules, then 40/40. **Unseen** (seeds 1000..1039, `$NCPGEN_WORK/sweep/outputs-unseen`): **33/40** whole
+files on first contact (misses: the WEIGHT order of moved heads 3, the identical-load skip across an UNFLATTEN 2, a
+widened pool output 1, a segment store's n_stride 1), 40/40 after those rules. A second unseen set (seeds 2000..2039,
+`outputs-unseen2`): **39/40** on first contact (m2028: a concat one of whose readers leaves the later concat's
+branches, and a reload over an overwritten copy), 40/40 after. A third unseen set (seeds 3000..3039,
+`outputs-unseen3`, compiled after every rule above): **40/40** on first contact. The SSD-style zoo models
+(models/README.md): 3/3 exact.
+
+**What ncpgen does** (`stream.Plan.graph`, `frame.plan_graph`, `weights.layer_blocks`: every multi-output network goes
+through the graph planners, also when it has only convs and pools): the outputs come from `common.net_outputs`
+(lowered.json's npu_outputs), `exec_order` takes them all, each output's UNFLATTEN and data node take their two
+positions, one output group per output with its read-back and OT vector (`plan["outputs"]`, each with `v_out` and
+`layer`; `intrinsics()` writes each group's own vector). `npunet.py lower --output T [--output T2 ...]` cuts a TFLite
+or npu-net/1 model at those tensors (`tflite_cut`, `graph_cut`: only the ops they need), so a detector's heads become
+the outputs and its reshapes, concatenations and post-process stay on the CPU (one `--output`: the single-output
+path). Tiling inside the graph (6.11) works unchanged under heads
+(o-tiled-stem: a tiled stride-2 stem under two heads; the SSD model at 300 px: its first conv in 2 row tiles; both
+exact). An output whose read-back NPUC cuts in rows (6.5, 6.11's tiled read-back) gets its row tiles as consecutive
+output groups where its single group would be, each writing its rows of the output's OT_FMAP (V: o-tiled-head, a
+96x96x64 head NPUC tiles; o-big-readback, a 128x128x40 1x1 head, a stratum of 2 tiles). A stratum's input that another
+layer also reads is stored for the tiles and that reader loads it back from DRAM into the tensor's own chunk, which
+stays live to it (V: o-big-readback's pool beside the tiled head; no single-output compile had the case). Refused: an
+output a layer also reads, a CPU tail (RESHAPE, SOFTMAX) after several outputs.

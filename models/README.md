@@ -96,6 +96,29 @@ MobileNet v2 lowers and compiles the same way and is exact too (with its adaptat
 DS-CNN is **exact as published** too (its 25x5 global average pool as the identity conv, item 5). micro_speech **fails
 in NPUC**.
 
+## Detection: several outputs (2026-11-22, branch outputs)
+
+**3 SSD models, 3 exact.** Camera models end in several tensors (box and class heads per feature map); NPUC outputs
+every tensor no layer reads, each read back by its own output group (docs/format/frame.md 12), and npunet lowers a
+model with several outputs (npu-net/1 "outputs", a TFLite subgraph's outputs list) to lowered.json's `outputs` (the
+model's order) and `npu_outputs` (NPUC's). `ssd-mobilenet-v1-025-<size>`: SSD with a MobileNet v1 0.25 feature
+extractor as the TF object detection API's ssd_mobilenet_v1 lays it out (13 depthwise-separable blocks, two extra
+layers 1x1 64 and 3x3/2 128, 1x1 linear box and class heads on blocks 11 and 13 and the extra layer, 3/6/6 anchors, 2
+classes with the background), our own seeded weights; the NPU part ends at the six head tensors (the anchor decoding,
+the reshapes, logistic and NMS run on the CPU). Compiled with the harness root-f7b580ef (npuc-net's `output` line)
+into `$NCPGEN_WORK/sweep/zoo-outputs/` (`ZOO_SET=zoo-outputs models/zoo.py compile ...`; kept apart from the shared zoo
+set until the branch is merged).
+
+| model | input | outputs | NPUC | ncpgen | CPU reference |
+|---|---|---|---|---|---|
+| ssd-mobilenet-v1-025-128 | 128x128x3 | 8x8x12, 8x8x6, 4x4x24, 4x4x12, 2x2x24, 2x2x12 | PASS, 970 KB, 7.4 s | **EXACT** (2 s) | 7d8d2fcd1853, 1872 B, 7.4 s |
+| ssd-mobilenet-v1-025-224 | 224x224x3 | 14x14x12, 14x14x6, 7x7x24, 7x7x12, 4x4x24, 4x4x12 | PASS, 970 KB, 6.9 s | **EXACT** (2 s) | dfc39881fa32, 5868 B, 20.8 s |
+| ssd-mobilenet-v1-025-300 | 300x300x3 (SSD's) | 19x19x12, 19x19x6, 10x10x24, 10x10x12, 5x5x24, 5x5x12 | PASS, 978 KB, 7.2 s | **EXACT** (2 s) | c0271203e003, 10998 B, 40.1 s |
+
+NPUC's output order is its layer order (cls1, box1, cls2, box2, cls3, box3 here: of two heads on one map the one
+listed last runs first); the CPU reference (`npunet.py ref ... out0.bin,out1.bin,...`) gives the model's order. At 300
+px the first conv is tiled (2 row tiles inside the graph).
+
 ## Standard resolutions (2026-11-22)
 
 **8 more models at the resolutions they are published at: all 8 exact** (7 as published; mobilenet-v1-050-224 with its

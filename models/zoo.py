@@ -9,7 +9,8 @@ int8 distribution and per-layer scales that keep every activation inside its ran
         <dir>/<model>.json (npu-net/1, ncpgen/npunet.py) and <dir>/<model>.tflite (npunet's graph_to_tflite; kept
         only when npunet lowers the TFLite to the same lowered network as the JSON: "tflite: ok")
   zoo.py compile [--jobs N] [model...]
-        each model into $NCPGEN_WORK/sweep/zoo/<model>/ (default work/sweep/zoo): model.json, npunet lower + NPUC
+        each model into $NCPGEN_WORK/sweep/zoo/<model>/ (default work/sweep/zoo; ZOO_SET=<set> for another set, e.g.
+        zoo-outputs for the several-outputs branch's models): model.json, npunet lower + NPUC
         (oracle/npuc-local.sh: lowered.json, net.npuc, net.ncp, log.txt), then npunet.py ref on a seeded random
         input (input.bin -> expected.bin, ref.txt)
   zoo.py check [--jobs N] [--md] [--cached] [model...]
@@ -45,7 +46,10 @@ sys.path.insert(0, os.path.join(REPO, "ncpgen"))
 import npunet  # noqa: E402
 
 WORK = os.environ.get("NCPGEN_WORK") or os.path.join(REPO, "work")
-ZOO = os.path.join(WORK, "sweep", "zoo")
+# the compiled set: $NCPGEN_WORK/sweep/zoo, or another set's name in ZOO_SET (a branch's new models kept apart from the
+# shared zoo set until merged; golden reads both)
+ZOO_SET = os.environ.get("ZOO_SET") or "zoo"
+ZOO = os.path.join(WORK, "sweep", ZOO_SET)
 NPUC_LOCAL = os.path.join(REPO, "oracle", "npuc-local.sh")
 NPUNET = os.path.join(REPO, "ncpgen", "npunet.py")
 NCPGEN = os.path.join(REPO, "ncpgen", "ncpgen.py")
@@ -114,6 +118,7 @@ class Net:
         self.T = {"input": {"hwc": hwc, "scale": f32(scale), "zp": zp, "rms": rms, "nonneg": False}}
         self.inp = {"name": "input", "shape": shape, "dtype": "int8", "scale": f32(scale), "zero_point": zp}
         self.layers, self.cur, self.cnt = [], "input", {}
+        self.outs = []     # several outputs (detection heads): the graph's "outputs", in the model's order
         self.none = False  # a conv/FC without activation (npunet: --allow-none)
         self.nweights = 0
 
@@ -345,13 +350,18 @@ class Net:
 
     # -- results --
     def graph(self, name):
-        return {"format": "npu-net/1", "name": name, "description": self.desc, "input": dict(self.inp),
-                "layers": self.layers}
+        g = {"format": "npu-net/1", "name": name, "description": self.desc, "input": dict(self.inp),
+             "layers": self.layers}
+        if self.outs:
+            g["outputs"] = list(self.outs)
+        return g
 
     def opts(self):
         return (["--quant", "3"] if self.quant == 3 else []) + (["--allow-none"] if self.none else [])
 
     def out_hwc(self):
+        if self.outs:      # several outputs: "HxWxC+HxWxC+..."
+            return ["+".join("x".join(map(str, self.T[o]["hwc"])) for o in self.outs)]
         return self.T[self.cur]["hwc"]
 
 
@@ -893,6 +903,54 @@ def _squeeze224_npu(n):
     _squeeze(n, 1000, npu_tail=True)
 
 
+def _ssd_mnv1(n, classes=2, anchors=(3, 6, 6)):
+    """SSD with a MobileNet v1 0.25 feature extractor (the TF object detection API's ssd_mobilenet_v1 layout): the
+    13 depthwise-separable blocks, two extra layers (1x1 64, 3x3/2 128), and on three feature maps (block 11: stride
+    16; block 13: stride 32; the extra layer: stride 64) a box head (anchors x 4) and a class head (anchors x classes,
+    background included), 1x1 linear convs; the six head tensors are the network's outputs (box1, cls1, box2, cls2,
+    box3, cls3), the anchor decoding and NMS run on the CPU after them"""
+    n.conv(8, 3, s=2, act="relu6")
+    feats = []
+    for i, (c, s) in enumerate(((16, 1), (32, 2), (32, 1), (64, 2), (64, 1), (128, 2), (128, 1), (128, 1), (128, 1),
+                                (128, 1), (128, 1), (256, 2), (256, 1))):
+        n.dw(3, s, act="relu6")
+        n.conv(c, 1, act="relu6")
+        if i in (10, 12):
+            feats.append(n.cur)
+    n.conv(64, 1, act="relu6", name="extra1")
+    feats.append(n.conv(128, 3, s=2, act="relu6", name="extra2"))
+    for k, (f, a) in enumerate(zip(feats, anchors)):
+        n.outs.append(n.conv(4 * a, 1, act="none", inp=f, name="box%d" % (k + 1)))
+        n.outs.append(n.conv(classes * a, 1, act="none", inp=f, name="cls%d" % (k + 1)))
+
+
+SSD_SRC = ("SSD (Liu et al. 2016) with a MobileNet v1 0.25 feature extractor, the TensorFlow object detection API's "
+           "ssd_mobilenet_v1 layout: box and class heads (1x1 convs) on blocks 11 and 13 and one extra layer, 3/6/6 "
+           "anchors, 2 classes with the background")
+SSD_AD = COMMON[:1] + ["depth multiplier 0.25, 2 classes, two extra feature layers fewer than the published six maps "
+                       "(the smallest maps of a small input)", "the heads are linear: --allow-none",
+                       "the NPU part ends at the six head tensors (the network's outputs); the TFLite model's reshapes, "
+                       "concatenations, logistic and detection post-processing run on the CPU"]
+
+
+@model("ssd-mobilenet-v1-025-128", "ssd-mobilenet-v1-025-128", SSD_SRC, "object detection, 128x128x3, 6 output "
+       "tensors (box and class heads at 8x8, 4x4, 2x2)", adapt=SSD_AD)
+def _ssd_mnv1_128(n):
+    _ssd_mnv1(n)
+
+
+@model("ssd-mobilenet-v1-025-224", "ssd-mobilenet-v1-025-224", SSD_SRC, "object detection, 224x224x3, 6 output "
+       "tensors (box and class heads at 14x14, 7x7, 4x4)", adapt=SSD_AD)
+def _ssd_mnv1_224(n):
+    _ssd_mnv1(n)
+
+
+@model("ssd-mobilenet-v1-025-300", "ssd-mobilenet-v1-025-300", SSD_SRC, "object detection, 300x300x3 (the published "
+       "SSD input), 6 output tensors (box and class heads at 19x19, 10x10, 5x5)", adapt=SSD_AD)
+def _ssd_mnv1_300(n):
+    _ssd_mnv1(n)
+
+
 # the input of each family: shape, quantisation (scale, zero point), quant mode, power-of-two activations
 INPUTS = {
     "lenet5": ((28, 28, 1), 1 / 255, -128, 1, False), "keras-mnist-cnn": ((28, 28, 1), 1 / 255, -128, 1, False),
@@ -911,6 +969,9 @@ INPUTS = {
     "mobilenet-v2-035-224": ((224, 224, 3), 1 / 128, 0, 3, True),
     "resnet18-224": ((224, 224, 3), 1 / 128, 0, 3, True), "resnet18-96": ((96, 96, 3), 1 / 128, 0, 3, True),
     "squeezenet11-224": ((224, 224, 3), 1 / 255, -128, 1, False),
+    "ssd-mobilenet-v1-025-128": ((128, 128, 3), 1 / 128, 0, 1, False),
+    "ssd-mobilenet-v1-025-224": ((224, 224, 3), 1 / 128, 0, 1, False),
+    "ssd-mobilenet-v1-025-300": ((300, 300, 3), 1 / 128, 0, 1, False),
 }
 
 
@@ -1127,7 +1188,8 @@ def golden_rows(work=WORK):
     """(name, spec, options, sha256) for every zoo model whose last `check` was EXACT on the NCP still there"""
     rows = []
     for name in MODELS:
-        d = os.path.join(work, "sweep", "zoo", name)
+        ds = [os.path.join(work, "sweep", z, name) for z in dict.fromkeys(("zoo", ZOO_SET))]
+        d = next((x for x in ds if os.path.exists(os.path.join(x, "check.json"))), ds[0])
         c, ncp = os.path.join(d, "check.json"), os.path.join(d, "net.ncp")
         if not (os.path.exists(c) and os.path.exists(ncp)):
             continue

@@ -5,8 +5,11 @@
 // does) and calls NPUCompiler::compile. Our own code; no vendor byte (it links against the vendor libraries' symbol
 // tables only).
 //
-//   linker64 ./npuc-net --net net.npuc [--out net.ncp]
+//   linker64 ./npuc-net --net net.npuc [--out net.ncp] [--intermediate <layer>]
 //   (LD_LIBRARY_PATH = the run directory; NPUC_LOG_LEVEL, NPUC_GOLDEN... are read by NPUC itself)
+//   --intermediate <layer>: NPUC's one way to output a blob that a layer also reads (CompileOptions +0xb8, compared
+//   with each node's layer name by NNGraphCgObject::isIntermediateOutput; an off-device knob the HAL never sets): a
+//   probe, not the HAL's path (docs/format/frame.md 12)
 //
 // Input, whitespace-separated tokens (one layer per line by convention; lines starting with # are comments):
 //   npuc-net 1
@@ -44,6 +47,12 @@
 //        on the device (NNGraphAttribute::DwOptSupported is false there: it asks for the framework "scaffe" and the
 //        on-device frontend is "stensorflow"); "dwopt" makes DwOptSupported see "scaffe" for this layer (the hook
 //        below), so NPUC's own remaining tests decide whether its depthwise path (group = C) is taken
+//   output <n> <blob1> ... <blob_n>
+//        the network's outputs, the way the HAL hands them to NPUC: nothing marks an output in the NNNetwork; NPUC's
+//        frontend makes every node without successors an output (NNGraphCgObject::appendNewOutData, an UNFLATTEN op
+//        and an output data node each, in its node order; docs/format/frame.md 12). So this line only declares them and
+//        is checked against that rule: every blob read by no layer must be listed, and a listed blob must be read by
+//        no layer (unless it is the --intermediate one). Without the line: as before (a note for each unread blob)
 // In an "npuc-net 2" file every reader must declare the scale and zero point its input blob already has (NPUC does not
 // rescale between layers on this path); "npuc-net 1" files are read exactly as before (the new lines refused there).
 //
@@ -415,11 +424,14 @@ static void print_shapes(const std::shared_ptr<NNLayer> &l)
 int main(int argc, char **argv)
 {
 	const char *netf = nullptr, *out = "net.ncp";
+	std::string inter;  // --intermediate: the layer whose blob NPUC also outputs (CompileOptions +0xb8)
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--net") && i + 1 < argc)
 			netf = argv[++i];
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc)
 			out = argv[++i];
+		else if (!strcmp(argv[i], "--intermediate") && i + 1 < argc)
+			inter = argv[++i];
 		else {
 			fprintf(stderr, "npuc-net: bad argument %s\n", argv[i]);
 			return 1;
@@ -497,11 +509,29 @@ int main(int argc, char **argv)
 	printf("CompileOptions::GetInstance() = %p\n", opts);
 	std::string jl;  // the per-layer JSON, assembled while the layers are built (no tmpfile: Bionic's wants /data/local/tmp)
 	bool first = true;
+	std::vector<std::string> outs;  // the "output" line's blobs (empty: none declared)
 	while (!tk.bad && tk.more()) {
 		std::string kw = tk.str();
 		if (kw == "end")
 			break;
-		if (kw == "soc") {
+		if (kw == "output") {
+			if (ver < 2) {
+				tk.fail("'output' needs an \"npuc-net 2\" file");
+				break;
+			}
+			if (!outs.empty()) {
+				tk.fail("output: one line");
+				break;
+			}
+			long n = tk.num(1, 64, "number of outputs");
+			for (long j = 0; j < n && !tk.bad; j++) {
+				std::string o = tk.str();
+				for (auto &x : outs)
+					if (x == o)
+						tk.fail("output: " + o + " twice");
+				outs.push_back(o);
+			}
+		} else if (kw == "soc") {
 			soc = (int)tk.num(0, 3, "soc");
 		} else if (kw == "quant") {
 			quant = (int)tk.num(1, 3, "quant");
@@ -927,6 +957,57 @@ int main(int argc, char **argv)
 		printf("npuc-net: FAIL (input: %s)\n", tk.bad ? tk.why.c_str() : "no layer after the input");
 		return 1;
 	}
+	// the outputs: NPUC's rule (appendNewOutData: a node without successors, or the --intermediate layer), checked
+	// against the declared ones
+	auto readers = [&](const std::string &b) {
+		int n = 0;
+		for (auto &m : layers)
+			for (auto &in : m->inputs)
+				n += in == b && m->name != b;
+		return n;
+	};
+	if (!inter.empty() && (!blobs.count(inter) || inter == layers.front()->name)) {
+		printf("npuc-net: FAIL (--intermediate %s: not a layer of the network)\n", inter.c_str());
+		return 1;
+	}
+	for (auto &o : outs) {
+		if (!blobs.count(o) || o == layers.front()->name) {
+			printf("npuc-net: FAIL (output %s: not a layer of the network)\n", o.c_str());
+			return 1;
+		}
+		if (readers(o) && o != inter) {
+			printf("npuc-net: FAIL (output %s is read by %d layer(s): NPUC outputs only the blobs no layer reads "
+			       "(NNGraphCgObject::appendNewOutData); the HAL marks nothing else)\n", o.c_str(), readers(o));
+			return 1;
+		}
+	}
+	if (!outs.empty())
+		for (size_t j = 1; j < layers.size(); j++) {
+			const std::string &b = layers[j]->name;
+			bool listed = false;
+			for (auto &o : outs)
+				listed = listed || o == b;
+			if (!readers(b) && !listed) {
+				printf("npuc-net: FAIL (blob %s is read by no layer, so NPUC makes it a network output, but the output "
+				       "line does not list it)\n", b.c_str());
+				return 1;
+			}
+		}
+	if (!inter.empty()) {
+		bool listed = outs.empty();
+		for (auto &o : outs)
+			listed = listed || o == inter;
+		if (!listed) {
+			printf("npuc-net: FAIL (--intermediate %s is not in the output line)\n", inter.c_str());
+			return 1;
+		}
+		// NNGraphCgObject::isIntermediateOutput compares the layer's name with this string (CompileOptions +0xb8,
+		// copied to the graph object by Compilation::generateGraph); setCompileOptions leaves it alone
+		*reinterpret_cast<std::string *>(static_cast<char *>(opts) + CompileOptionsOff::strB8) = inter;
+		printf("intermediate output: %s (CompileOptions +0xb8; read by %d layer(s))\n", inter.c_str(), readers(inter));
+	}
+	for (auto &o : outs)
+		printf("output %s %dx%dx%d (declared)\n", o.c_str(), blobs[o].c, blobs[o].h, blobs[o].w);
 
 	NNNetwork net;
 	STEP("append layers");
@@ -935,7 +1016,7 @@ int main(int argc, char **argv)
 			printf("npuc-net: FAIL (append %s: duplicate)\n", l->name.c_str());
 			return 2;
 		}
-	if (ver >= 2) {
+	if (ver >= 2 && outs.empty()) {
 		// a blob no layer reads, other than the last, would become an extra network output
 		for (auto &l : layers) {
 			bool used = l->name == last;
@@ -1000,7 +1081,20 @@ int main(int argc, char **argv)
 	           " \"layers\": [", out, buf.size, soc, quant, layers.front()->name.c_str(), is.c, is.h, is.w, last.c_str(),
 	        os.c, os.h, os.w);
 	fputs(jl.c_str(), j);
-	fprintf(j, "]}\n");
+	fprintf(j, "]");
+	if (!outs.empty()) {
+		// the declared outputs, in the file's order (NPUC's own order is its node order: its log's "Network Output:")
+		fprintf(j, ",\n \"outputs\": [");
+		for (size_t k = 0; k < outs.size(); k++) {
+			const Shape &b = blobs[outs[k]];
+			fprintf(j, "%s{\"name\": \"%s\", \"out_shape\": [1, %d, %d, %d]}", k ? ", " : "", outs[k].c_str(), b.c,
+			        b.h, b.w);
+		}
+		fprintf(j, "]");
+	}
+	if (!inter.empty())
+		fprintf(j, ",\n \"intermediate\": \"%s\"", inter.c_str());
+	fprintf(j, "}\n");
 	if (fclose(j) != 0) {
 		printf("npuc-net: FAIL (cannot write %s)\n", pj.c_str());
 		return 2;
