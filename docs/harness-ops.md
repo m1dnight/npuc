@@ -50,9 +50,12 @@ self-test. Image `python:3.12-slim-bookworm`, amd64, `sha256:313cf8f1…` (pulle
   InnerProduct and ReLU do not call theirs.
 - **On-device fillers** (CompileOptions +0x138 = 1: BiasON, KernelON, ScaleON, ShiftON, ZeroPoint, FusedActivation,
   Data): Bias/Kernel/Scale/Shift act only when `NNLayer.type == "Convolution"` (memcmp with 0xc0df0), ZeroPoint and
-  FusedActivation only on node types 8 and 9 (ZeroPoint also needs CompileOptions +0xec == 2). **No graph filter chain
-  runs on this path** (no MergeActivation, ConcatScaleFolding, AddDummyConv… in any log), and the off-device
-  NNGraphNodeMultipleInputFiller (Eltwise) is not in the chain.
+  FusedActivation only on node types 8 and 9 (ZeroPoint also needs CompileOptions +0xec == 2). No MergeActivation or
+  AddDummyConv filter runs on this path (none in any log), and the off-device NNGraphNodeMultipleInputFiller (Eltwise)
+  is not in the chain. **ConcatScaleFoldingFilter does run** (V, 2026-11-22, docs/format/add.md 3): a concat whose
+  conv predecessors' output scales differ from its own gives them its scale (their multipliers recomputed, zero points
+  kept), a pool predecessor gets a scale conv; it was a no-op on every concat before (equal scales), hence "Graph
+  BEFORE/AFTER ConcatScaleFoldingFilter" with nothing changed in their logs.
 
 ## 3. The ops
 
@@ -77,10 +80,12 @@ self-test. Image `python:3.12-slim-bookworm`, amd64, `sha256:313cf8f1…` (pulle
   scales +0x10; loadConcatAttrForConcatLayer @0x175378), shapes of every input and the output set by npuc-net (the
   HAL's NNConcatLayer::computeOutputShape is its own, not in NPUC). After appending, npuc-net calls NPUC's exported
   `NNNetwork::mergeConcatLayer()` as nn-eden-drv's buildNNNetwork does last (it only merges Concat chains).
-- NPUC never reads ConcatAttr on this path (getConcatParam throws). The data filler makes each input a
+- NPUC's graph code never reads ConcatAttr on this path (getConcatParam throws). The data filler makes each input a
   `ChannelSlicedFeatureNode` of the output: **channels only, in input order** (V: swapping the inputs swaps the two
-  convs' DRAMOUTSET offsets 0 / 0x800 = channel 8 of a CHW 16x16 map; concat-q3 vs concat-swap-q3). No rescale (no
-  ConcatScaleFolding on device): every input must already be in the output's quantisation.
+  convs' DRAMOUTSET offsets 0 / 0x800 = channel 8 of a CHW 16x16 map; concat-q3 vs concat-swap-q3). The frontend's
+  ConcatScaleFoldingFilter reads its output scale (ConcatAttr +0x10, element 0) and gives conv predecessors with
+  another scale that scale (a change of their multipliers), pool predecessors a scale conv (docs/format/add.md 3): so
+  every input must already be in the output's scale; zero points are not compared (`concat ... mixed`, section 4).
 - Placement: "Concat in SRAM" needs producer convs with a multiple of 16 output channels (log: "not supported yet for
   2020" otherwise); else a DRAM concatenation ("output DRAM is concatenated in …"). 8+8, 8+8+8 and 16+16 compile.
 - The network input as a concat operand: NPUC writes the Input op straight into a channel slice and its policy maker
@@ -127,7 +132,7 @@ reconstructed), Flatten/Permute/Crop/Slice (their STF param getters throw).
 
 ```
 eltwise <name> <in1> <in2> Add <in1 scale hex> <in1 zp> <in2 scale hex> <in2 zp> <out scale hex> <out zp>
-concat  <name> 1 <n> <in1> ... <in_n> <out scale hex> <out zp>
+concat  <name> 1 <n> <in1> ... <in_n> <out scale hex> <out zp> [mixed]
 relu    <name> <input> <ReLU|ReLU6>
 dwconv  <name> <input> <stock|dwopt> <kh> <kw> <sh> <sw> <SAME|VALID> <act 0|1> <in scale hex> <in zp> <w scale hex> <w zp>
         <out scale hex> <out zp> <weights: C x kh x kw uint8, hex> <C> <bias x C>
@@ -143,6 +148,12 @@ refused in an "npuc-net 1" file, for C = 1, an unknown mode or a wrong weight co
 static_asserts: EltwiseAttr (+0x08, 0x20), ConcatAttr (+0x08, +0x10, 0x28), NPUMultipleInputMemoryData (+0x08, +0xc8,
 0x1a0), NodeLayerType, NNGraphNode offsets. The hook is compiled for aarch64 only (the host test's x86_64 stub build
 has no NPUC; it still builds and runs, V).
+
+`concat ... mixed` (added 2026-11-22, root-81d28366; with the `output` line: root-3504c01f): the concat's inputs keep their own zero points (the check that
+each input has the concat's quantisation is skipped; each input must still be a layer's output). For npunet's
+`--add-as-conv` (docs/format/add.md): a 1x1 conv over the concat weighs each input on its own and takes the zero-point
+difference into its bias. The scales must still agree (NPUC's ConcatScaleFoldingFilter compares them): npunet gives
+both inputs one scale label without changing a multiplier.
 
 **Run directory `$NCPGEN_WORK/n3/root-current`** (built by build-n3.sh in the container): npuc-net-1e694f20, npuc-conv-409e9b04
 (npuc.h changed; its NCP for `--quant 3` is d6cb7f2a, the same as npuc-conv-6595c839's, V), npuc-probe-482be94e;

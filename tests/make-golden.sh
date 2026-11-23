@@ -2,7 +2,8 @@
 # Record tests/golden.txt from compiled sweeps in the work folder (needs NPUC's compiles: oracle/npuc-local.sh outputs in
 # $NCPGEN_WORK/sweep/corpus/<name>/ and $NCPGEN_WORK/sweep/final-chains/<name>/ with specs.txt, and the zoo's models
 # that ncpgen generates exactly: models/zoo.py compile, then check, in $NCPGEN_WORK/sweep/zoo/<model>/), and npunet's stride
-# rewrite networks (tests/rewrite_ref.py --write, compiled in $NCPGEN_WORK/sweep/restride/<case>/ with specs.txt). Hashes
+# rewrite networks (tests/rewrite_ref.py --write, compiled in $NCPGEN_WORK/sweep/restride/<case>/ with specs.txt), and the
+# ADD-as-conv networks (ncpgen/add_sweep.py compile into $NCPGEN_WORK/sweep/add-probe, add-random, add-random2). Hashes
 # only: no vendor byte goes into the repository.
 set -euo pipefail
 . "$(dirname "$0")/../oracle/env.sh"
@@ -25,8 +26,19 @@ for line in open(sp) if os.path.exists(sp) else []:
     name, opts = line.rstrip('\n').split('|')
     d = os.path.join(W, 'sweep/restride', name, 'net.ncp')
     if os.path.exists(d): rows.append(('restride-' + name, 'restride:' + name, opts, hashlib.sha256(open(d, 'rb').read()).hexdigest()))
+import json
+for set_, sub in (('probe', 'add-probe'), ('random', 'add-random'), ('random', 'add-random2')):
+    # ncpgen/add_sweep.py's networks (ADD with any scales, --add-as-conv), the sets ncpgen generates entirely
+    base = os.path.join(W, 'sweep', sub)
+    for name in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        d = os.path.join(base, name, 'net.ncp')
+        if os.path.exists(d):
+            q = json.load(open(os.path.join(base, name, 'lowered.json')))['quant_mode']
+            rows.append(('add-%s-%s' % (set_, name), 'add:%s:%s' % (set_, name), '--quant %d --allow-none --add-as-conv' % q,
+                         hashlib.sha256(open(d, 'rb').read()).hexdigest()))
 with open('tests/golden.txt', 'w') as f:
-    f.write("# name | npuc-variant.py arguments, zoo:<model> (models/zoo.py) or restride:<case> (tests/rewrite_ref.py) | "
+    f.write("# name | npuc-variant.py arguments, zoo:<model> (models/zoo.py), restride:<case> (tests/rewrite_ref.py) or "
+            "add:probe|random:<name> (ncpgen/add_sweep.py) | "
             "lowering options | sha256 of the NCP Samsung's "
             "NPUC 1.36.1.a compiled for it\n")
     f.write('# (our own seeded networks; ncpgen gen --grelu npuc must write the same bytes). Made by tests/make-golden.sh.\n')

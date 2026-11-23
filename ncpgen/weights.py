@@ -446,8 +446,9 @@ def _concat_tiled(name, low, ins, cons):
     if any(x in tiled for x in ins[name] + cons.get(name, [])):
         return True
     _POLICY_DEPTH[0] += 1
-    try:            # its OFM not shared: NPUC turns the concat in SRAM off (frame.concat_ofm_shared; V: t2006)
-        return not frame.concat_ofm_shared(name, cons, frame.forwarding(low, pol))
+    try:            # its block's concat-in-SRAM test fails, or its OFM is not shared: NPUC keeps it in DRAM, its
+        fwd = frame.forwarding(low, pol)        # readers' weights in the DRAM order (V: t2006; add-probe2 fx-80-*)
+        return not frame.concat_cs_ok(name, fwd) or not frame.concat_ofm_shared(name, cons, fwd)
     finally:
         _POLICY_DEPTH[0] -= 1
 

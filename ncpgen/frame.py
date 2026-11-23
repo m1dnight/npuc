@@ -934,13 +934,24 @@ def plan_graph(low, weight_sizes=None):
     # an IM per stored tensor, in the order of its first store in NPUC's layer order (= the NCP's group order for one
     # output; several outputs may reorder the groups, not these: V outputs-random m004)
     xi = {n: j for j, n in enumerate(order)}
-    sts = {}
+    sts, firstg = {}, {}
     for k_, (op, i, g) in enumerate(dmas):
         if op.kind == "store":
             pos = (xi.get(gl[g], len(order)), k_)
-            sts[op.tensor] = min(sts.get(op.tensor, pos), pos)
+            if pos < sts.get(op.tensor, (len(order) + 1, 0)):
+                sts[op.tensor], firstg[op.tensor] = pos, g
     oint = getattr(P, "out_internal", {})      # the outputs' NPUC shapes (a widened pool's one more column)
+    # a DRAM concat's input that another layer loads back from the concat's buffer (stream.py, cat_of): NPUC still
+    # gives it a DRAM of its own (its forwarding names it the reader's input DRAM), an IM vector no DMA uses, just
+    # before the concat's when it makes the concat's first store (V: add-probe res-c4, res-c8, res-c24, chain3's stem;
+    # not for the one-node inputs its readers share in SRAM: chain3's ADD convs)
+    own = {op.cat_of for op, _, _ in dmas if op.kind == "load" and getattr(op, "cat_of", None)}
     for t in sorted(sts, key=sts.get):
+        p_ = gl[firstg[t]]
+        if p_ in own and p_ not in vim:
+            c_, h_, w_ = chw[p_]
+            im = _im_vector(c_, h_, w_, c_ * h_ * w_)
+            vim[p_] = vec(MV_IM, im["av"], (im["w"], im["h"], im["c"]))
         c_, h_, w_ = chw[t]
         hi, wi = oint.get(t, chw[t])[1:]
         im = _im_vector(c_, hi, wi, c_ * h_ * wi)   # an output's by its NPUC width, as a chain's (f036)
@@ -959,6 +970,8 @@ def plan_graph(low, weight_sizes=None):
     vec(MV_IM, 138, (8, 8, 2))
 
     def tvec(t):
+        if t != src and t not in vim:
+            raise NotImplementedError("a load of %s, which no layer stores to DRAM (not modelled)" % t)
         return v_in if t == src else vim[t]
 
     def coff(t, kn):
@@ -1105,19 +1118,26 @@ def plan_graph(low, weight_sizes=None):
         elif hasattr(op, "slots"):
             # an input read slot by slot (its first op an NFU one, 16 plane slots per core or more; or a cut layer's
             # chunks): each load its slots of every IDP, as in a chain (section 6.9)
-            lay = cell(*chw[t])
+            cat_of = getattr(op, "cat_of", None)
+            lay = cell(*chw[cat_of or t])
+            base = coff(cat_of, t) if cat_of else 0
             for op_, _, _ in run:
                 s0, s1 = op_.slots
                 sz = (s1 - s0) * lay["plane"]
                 idps, h, w, cs = _sram_dma(lay["n"], sz // (2 * lay["Wp"]), 2 * lay["Wp"])
-                rows.append((g, 0, _blob(tvec(t), s0 * lay["plane"], 1, idps, h, w, cs=lay["per_idp"] - sz),
+                rows.append((g, 0, _blob(tvec(t), base + s0 * lay["plane"], 1, idps, h, w, cs=lay["per_idp"] - sz),
                              _blob(0, op_.sram, 1, idps, h, w, cs=cs)))
         else:
-            lay = cell(*chw[t])
+            # a concat input another layer reads too, loaded back from the concat's buffer (cat_of: its own layout,
+            # at its channel offset; cmdq.md 7c)
+            cat_of = getattr(op, "cat_of", None)
+            lay = cell(*chw[cat_of or t])
+            base = coff(cat_of, t) if cat_of else 0
             parts = _spread_dmas(lay, len(run) > 1)
             for q, (op_, i_, _) in enumerate(run):
                 vec_, idps, h, w, cs, doff = parts[min(q, len(parts) - 1)]
-                rows.append((g, 0, _blob(tvec(t), doff, 1, idps, h, w), _blob(vec_, op_.sram, 1, idps, h, w, cs=cs)))
+                rows.append((g, 0, _blob(tvec(t), base + doff, 1, idps, h, w),
+                             _blob(vec_, op_.sram, 1, idps, h, w, cs=cs)))
         k = j
     io = []
     for n_, ((op, i, _), (g, d_, sb, db)) in enumerate(zip(dmas, rows)):
@@ -1890,8 +1910,8 @@ def forwarding(low, pol=None):
     t1013: the branch convs' weights live on their conv only). A block succeeds in a mode when every input of its
     concat passed (or is the head: tryProcessLayerBlockEnd). Returns {"life": {node: extended} for the nodes tested,
     "ok": {mode: {head: succeeded}}, "nbuf": {mode: {node: weight buffers it passed with}}, "heads": {head: concat},
-    "last": {node: the weight buffers of its last test, None when it did not stay whole}} (a node's last test sets
-    its processing: a ring it passed with is its ring, V: fresh camera v3024, v3025)."""
+    "last": {node: the weight buffers of the last test it passed}} (a ring a node passed with is its ring, a later
+    test it fails does not undo it: V fresh camera v3024, v3025, add-probe2 fx-80-c16-e128 and -r1)."""
     ins, cons, by, src = topology(low)
     pol = pol or graph_policy(low)
     nds, shp = pol["nodes"], pol["shapes"]
@@ -1956,11 +1976,17 @@ def forwarding(low, pol=None):
             r = _pol_whole(nds[n], mem, ifm_pre=mode != "cs" and p == cur,
                            ofm_pre=mode != "is" and bool(rd) and by[rd[0]]["kind"] == "concat")
             life[n] = r["extended"]
-            last[n] = r["nbuf"] if r["whole"] else None
             if r["whole"]:
                 ok.add(n)
-                nbuf[mode][n] = r["nbuf"]
+                nbuf[mode][n] = last[n] = r["nbuf"]
     return {"life": life, "ok": res, "nbuf": nbuf, "heads": heads, "last": last}
+
+
+def concat_cs_ok(kn, fwd):
+    """the concat-in-SRAM block test (forwarding mode "cs") of the block concat kn ends passes; NPUC keeps the concat
+    in DRAM otherwise (V: large random t2022, fresh camera v3003)"""
+    hs = [h for h, k in fwd["heads"].items() if k == kn]
+    return bool(hs) and fwd["ok"]["cs"].get(hs[0], False)
 
 
 def concat_ofm_shared(kn, cons, fwd):

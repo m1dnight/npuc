@@ -1,0 +1,24 @@
+# ADD with arbitrary scales: which NNAPI ops nn-eden-drv hands NPUC (per-op support, the partition), and what NPUC's
+# eltwise path does with scales (the multiple-input filler, the meta data, the shift transform, the host executor)
+str:vecSupportedByNPU
+str:is not supported by NPU
+str:allOperationsExceptNPU
+str:Try to compile for NPU
+str:numOfEdenOperationForNPU
+str:Create for NPU
+sym:setMultipleInput
+sym:expandFractionalData
+sym:buildMetaDataDram
+sym:EltwiseNode2020
+sym:ncp_eltwise_add
+sym:runEltWiseAdd
+sym:addMetaBlob
+sym:PNodeEltwise
+sym:PNodeAtomicShiftTransform
+sym:PNodeAtomicEltwise
+sym:_ZN3NPU6Interp8Executor5VisitERKNS_15EltwiseInstrDef
+sym:_ZN3NPU6Interp8StringfyE17ncp_eltwise_param
+sym:EltwiseCycle
+sym:NcpEltwiseOp
+sym:createEltwiseNode
+sym:addElemtWiseGraphNode

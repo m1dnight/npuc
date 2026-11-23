@@ -1451,14 +1451,10 @@ class Plan:
         # a concat that passes the static test but not the others goes to DRAM, its single reader's chunk a second
         # citizen live at the reader (V: large random t2022, fresh camera v3003)
         fwd = frame.forwarding(low, pol)
-
-        def cs_ok(kn):
-            hs = [h for h, k in fwd["heads"].items() if k == kn]
-            return bool(hs) and fwd["ok"]["cs"].get(hs[0], False)
         tagged = {kn for kn in cats if concat_in_sram(kn, outs, by, ins, cons)}
         scats = [kn for kn in cats if kn in tagged
                  and not any(x in tst for x in ins[kn] + cons.get(kn, [])) and frame.concat_ofm_shared(kn, cons, fwd)
-                 and cs_ok(kn)]
+                 and frame.concat_cs_ok(kn, fwd)]
         # tensors their readers load from DRAM: the network input, a concat's buffer, a tiled stratum's output read by
         # a layer
         dsrc = [src] + [kn for kn in cats if kn not in scats and kn not in outs]
@@ -1467,12 +1463,24 @@ class Plan:
         eltd = {L["name"] for L in order if L["kind"] == "eltwise" and any(i in dsrc for i in ins[L["name"]])}
         into = {}                                           # producer -> (SRAM concat, its first plane slot)
         for kn in scats:
+            # a producer read by other layers too writes its planes into the concat's chunk all the same, and they
+            # read them there (V: add-probe res-c16..c64, an ADD lowered to a conv over concat(proj(t), t))
             o = 0
             for i in ins[kn]:
-                if len(cons[i]) != 1:
-                    raise Unsupported("%s feeds a concat in SRAM and another layer" % i)
                 into[i] = (kn, o)
                 o += Dist(chs[i]).ppc
+        # a DRAM concat's input that another layer reads too: stored into the concat's buffer as any input; when its
+        # layer is more than one node (a padded or strided conv), its first other reader loads it back from there, at
+        # its channel offset, into its own chunk (NPUC's "disable forwarding" on that edge; V: add-probe res-c4,
+        # res-c8, res-c24, big-c24, chain3's stem); a one-node layer's readers share it in SRAM (chain3's ADD convs).
+        # The mirror image of a stored branch root (roots, below)
+        catin = {}
+        for kn in cats:
+            if kn in scats:
+                continue
+            for i in ins[kn]:
+                if any(by[r]["kind"] != "concat" for r in cons[i]) and head[i] != tail[i]:
+                    catin[i] = kn
         stored = {}                                         # tensor -> where its producer stores it
         for o in outs:
             if by[o]["kind"] != "concat":
@@ -1563,6 +1571,10 @@ class Plan:
             rs = {bulb_root(i) for i in ins[kn]}
             r = min(rs)
             if len(rs) == 1 and r != src and by[r]["kind"] != "concat" and head[r] == tail[r] and closed(kn, r):
+                if kn in scats and r in ins[kn]:
+                    continue                # the root writes into its SRAM concat's chunk itself (an ADD's conv
+                    #                         read by the next block): its readers find it there, never stored
+                    #                         (V: add-probe chain-then-conv)
                 if r in tst:
                     raise Unsupported("tiling in a graph: a concat's branches from a tiled stratum's output")
                 if any(x in tst for x in bulb_nodes(kn)):
@@ -1570,6 +1582,9 @@ class Plan:
                 roots |= rs
         for r in roots:
             stored.setdefault(r, ("im", r))
+        # a root that is an input of a DRAM concat (stored into its buffer): a first citizen as any root, but its
+        # readers share it in SRAM, nothing loads it back (V: add-probe chain3, its ADD convs at the top of SRAM)
+        catroot = {r for r in roots if stored[r][0] == "cat"}
         # where each reader finds a tensor loaded from DRAM: the network input shared by a concat's branches, one
         # chunk live from 0 (V: cat2, cat3, cat-chain); a concat read by one layer, one first citizen from the concat
         # (V: cat2, cat3); else one chunk per reader, live at it only (NPUC's "Hack on LA"; V: add2, res; g006, g022)
@@ -1723,6 +1738,8 @@ class Plan:
                 segs[n] = d["segs"] = segs[i0]
             if n in roots:                                  # a stored bulb root: a first citizen (V: g030),
                 d["out"].batch = (0, tail[n], 0)            # all its slots written once loaded back (V: g021)
+                full[n] = True
+            if n in catin:                                  # loaded back from the concat's buffer: all slots
                 full[n] = True
             tens[n] = d["out"]
             info[n] = d
@@ -1896,7 +1913,9 @@ class Plan:
             n, k = L["name"], L["kind"]
             d = info[n]
             i0 = ins[n][0]
-            firstr = next(x["name"] for x in seq if x["name"] in cons[i0]) if i0 in cons else None
+            firstr = next(x["name"] for x in seq if x["name"] in cons[i0] and (i0 not in catin or
+                                                                             x["kind"] != "concat")) \
+                if i0 in cons else None
             # (the same tensor, the same way, into the same SRAM chunk, which the layer just before did not overwrite
             # with its output: V outputs-unseen2 m2028 loads again; its partial sums do not count, V: graph-split-random
             # s001 skips the load over them, G for its PAD and REFORMAT chunks, which no case has overlapped)
@@ -1911,7 +1930,7 @@ class Plan:
                 a, b = d["in"].off, d["in"].off + d["in"].size
                 first = prev is None or ld != prev[0] or any(o < b and a < o + z for o, z in prev[1])
             else:
-                first = i0 in roots and n == firstr
+                first = ((i0 in roots and i0 not in catroot) or i0 in catin) and n == firstr
             wr = [(c.off, c.size) for c in (d.get("out"),) if c is not None and c.size and c.off is not None]
             return first, (ld, wr)
         # the NCP's group order. One output: NPUC's layer order, the output group last. Several: NPUC's policy groups
@@ -2010,6 +2029,8 @@ class Plan:
             for op in ops:
                 if op.kind == "load" and op.what == "ifm":
                     op.tensor = i0
+                    if i0 in catin:                         # from the concat's buffer, at i0's channel offset
+                        op.tensor, op.cat_of = catin[i0], i0
                 elif op.kind == "store":
                     op.tensor = stored[n][1]
             self.groups += self.cut(ops, ev0) if k != "eltwise" else [ops]

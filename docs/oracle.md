@@ -39,7 +39,11 @@ per-channel lines `wscales` and `slopes` and the setScale hook (docs/format/perc
 (`npuc-net-6673bd35`), the same NCPs on earlier inputs (5 of 5 rechecked: zoo lenet5, resnet8, mobilenet-v1-025,
 squeezenet11-96, a restride net); per-channel probes and `--per-channel-shifts` models need it. With npuc-net's `output`
 line for several outputs too (docs/harness-ops.md 4): **root-38925a6d**; the outputs branch's own build without the
-per-channel lines was root-f7b580ef. `check-symbols.py` checks every import binds in Bionic's lookup scopes before anything runs.
+per-channel lines was root-f7b580ef. With `concat ... mixed` (docs/format/add.md, npunet's `--add-as-conv`):
+root-81d28366 (`npuc-net-7af5e49b`, before the `output` line), the same NCPs on earlier inputs (6 of 6 rechecked: graph
+cat16, cat16-relu, res, graph-random g005, perchannel-probe c40-pc, wzp-probe c16-wzp0); with both: **root-3504c01f** (`npuc-net-2d65d13c`), the same NCPs on 7 add, graph and per-channel inputs
+and 5 several-output ones rechecked (outputs o-add, o-c357, o-big-readback, outputs-random m001, m002).
+`check-symbols.py` checks every import binds in Bionic's lookup scopes before anything runs.
 
 ## 3. Run it
 

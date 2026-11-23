@@ -10,9 +10,14 @@
         SaturatingRoundingDoublingHighMul, RoundingDivideByPOT): the output tensor's bytes, or tensor TENSOR's
   camera.py person [--inputs N]                    person_detect: npunet's CPU reference (folded, and with
         per-channel shifts) against tflref on TFLM's two test images and N seeded random inputs
+  camera.py addcheck <model.tflite> [--input TENSOR] [--output TENSOR] [--inputs N] [--all]
+        ADD with any scales: npunet's --add-as-conv arithmetic (conv_add) against TFLite's ADD (tfl_add), the rest of
+        the model TFLite's: per ADD on the activations TFLite computes, and at the output (the conv's error
+        propagated) on the person image and N seeded random inputs; --all: also the exact real sum (real_add) and
+        the power-of-two alternative through NPUC's Eltwise (pow2_add)
 
 tflref covers what the camera models' NPU parts use: CONV_2D, DEPTHWISE_CONV_2D (any multiplier), AVERAGE_POOL_2D,
-MAX_POOL_2D, RESHAPE, FULLY_CONNECTED; int8 (per-channel or per-tensor weights) and uint8 (per-tensor). Anything else
+MAX_POOL_2D, RESHAPE, FULLY_CONNECTED, ADD (8-bit, no broadcasting), PAD (H and W); int8 (per-channel or per-tensor weights) and uint8 (per-tensor). Anything else
 stops it with the op's name (run it with --stop before that op).
 """
 import argparse
@@ -23,6 +28,7 @@ import random
 import struct
 import sys
 import urllib.request
+from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -198,8 +204,10 @@ def _vals(t):
     return list(struct.unpack("<%d%s" % (n, fmt), t["data"][:n * struct.calcsize(fmt)]))
 
 
-def _conv(tf, o, x, depthwise):
-    """CONV_2D / DEPTHWISE_CONV_2D, reference_integer_ops (per-channel) or reference_ops (uint8 per-tensor): NHWC"""
+def _conv(tf, o, x, depthwise, npuc=False):
+    """CONV_2D / DEPTHWISE_CONV_2D, reference_integer_ops (per-channel) or reference_ops (uint8 per-tensor): NHWC.
+    npuc: NPUC's multiplier instead (one 8-bit slope from float32 scales, round half away: npunet's reference),
+    per-tensor weight scales only"""
     T = tf["tensors"]
     ti, tw, to = T[o["inputs"][0]], T[o["inputs"][1]], T[o["outputs"][0]]
     tb = T[o["inputs"][2]] if len(o["inputs"]) > 2 and o["inputs"][2] >= 0 else None
@@ -226,6 +234,10 @@ def _conv(tf, o, x, depthwise):
     if len(set(tw["zero_point"] or [0])) > 1:
         raise ValueError("per-channel weight zero points")
     mult = [quantize_multiplier(float(si) * float(ws) / float(so)) for ws in wsc]   # in double, as TFLite
+    if npuc:
+        if len(set(wsc)) > 1:
+            raise ValueError("NPUC's multiplier: per-channel weight scales")
+        sl, sf = npunet.npuc_multiplier(_f32(float(si)), _f32(float(wsc[0])), _f32(float(so)))
     lo, hi = _act_range(opt.get("act", "none"), zo, so, to["dtype"])
     y = [0] * (Ho * Wo * Co)
     for oc in range(Co):
@@ -250,7 +262,7 @@ def _conv(tf, o, x, depthwise):
                             for c in range(C):
                                 acc += (x[base + c] - zi) * (w[wb + c] - zw)
                 acc += b[oc]
-                v = mbqm(acc, m, s) + zo
+                v = (npunet.rnd(Fraction(acc * sl, 1 << sf), "half_away") if npuc else mbqm(acc, m, s)) + zo
                 y[(oy * Wo + ox) * Co + oc] = min(hi, max(lo, v))
     return y
 
@@ -302,9 +314,132 @@ def _pool(tf, o, x, avg):
     return y
 
 
-def tflref(tf, x, stop=None):
+def _add_quant(T, o):
+    """an ADD's quantisation: (u8 zero points a, b, out; float32 scales a, b, out; dtype)"""
+    ta, tb, to = (T[t] for t in (o["inputs"][0], o["inputs"][1], o["outputs"][0]))
+    if ta["shape"] != tb["shape"]:
+        raise ValueError("ADD with broadcasting")
+    u = 128 if to["dtype"] == "int8" else 0
+    return ([t["zero_point"][0] + u for t in (ta, tb, to)], [t["scale"][0] for t in (ta, tb, to)], to["dtype"])
+
+
+def tfl_add(tf, o, a, b):
+    """ADD as TFLite's reference kernels (add.cc PrepareGeneralSubOp, reference_ops / reference_integer_ops::Add,
+    8-bit): each input shifted left 20, scaled by QuantizeMultiplierSmallerThanOneExp(s_x / 2 max(s_a, s_b)), summed,
+    then by twice_max / (2^20 s_out), every step SaturatingRoundingDoublingHighMul + RoundingDivideByPOT"""
+    T = tf["tensors"]
+    to = T[o["outputs"][0]]
+    sa, sb, so = (T[t]["scale"][0] for t in (o["inputs"][0], o["inputs"][1], o["outputs"][0]))
+    za, zb, zo = (T[t]["zero_point"][0] for t in (o["inputs"][0], o["inputs"][1], o["outputs"][0]))
+    if T[o["inputs"][0]]["shape"] != T[o["inputs"][1]]["shape"]:
+        raise ValueError("ADD with broadcasting")
+    tm = 2 * max(float(sa), float(sb))
+    ma, ea = quantize_multiplier(float(sa) / tm)
+    mb, eb = quantize_multiplier(float(sb) / tm)
+    mo, eo = quantize_multiplier(tm / ((1 << 20) * float(so)))
+    lo, hi = _act_range(o["opt"].get("act", "none"), zo, so, to["dtype"])
+    y = []
+    for p, q in zip(a, b):
+        s_ = mbqm((p - za) << 20, ma, ea) + mbqm((q - zb) << 20, mb, eb)
+        y.append(min(hi, max(lo, mbqm(s_, mo, eo) + zo)))
+    return y
+
+
+def conv_add(tf, o, a, b):
+    """ADD as npunet --add-as-conv computes it (ncpgen/npunet.py _lower_add_conv, docs/format/add.md): the same
+    add_fit weights and NPUC multiplier, acc = wa (a - z_a) + wb (b - z_b), out = z_out + round half away (acc slope /
+    2^shift), clamped; values in the model's dtype"""
+    T = tf["tensors"]
+    (za, zb, zo), (sa, sb, so), dt = _add_quant(T, o)
+    u = 128 if dt == "int8" else 0
+    fa, fb, fo = (Fraction(_f32(float(v))) for v in (sa, sb, so))
+    same = o["inputs"][0] == o["inputs"][1]
+    rng = lambda z: max(z, 255 - z)
+    ra, rb = (2 * fa / fo, None) if same else (fa / fo, fb / fo)
+    wa, wb, slope, shift, _ = npunet.add_fit(ra, rb, rng(za), rng(zb), 255)
+    act = o["opt"].get("act", "none")
+    lo, hi = _act_range(act, zo - u, so, dt)
+    if act == "relu6" and hi + u < 255:
+        raise ValueError("ADD with RELU6 inside the range (npunet: --relu6-range)")
+    den = 1 << shift
+    y = []
+    for p, q in zip(a, b):
+        acc = wa * (p + u - za) + (0 if same else wb * (q + u - zb))
+        v = npunet.rnd(Fraction(acc * slope, den), "half_away") + zo
+        y.append(min(hi, max(lo, min(255, max(0, v)) - u)))
+    return y
+
+
+def _pad(tf, o, x):
+    """PAD of an NHWC tensor with its zero point (TFLite's quantised PAD: the same quantisation in and out)"""
+    T = tf["tensors"]
+    ti, to = T[o["inputs"][0]], T[o["outputs"][0]]
+    pd = struct.unpack("<8i", T[o["inputs"][1]]["data"][:32])
+    if pd[0] or pd[1] or pd[6] or pd[7] or (ti["scale"], ti["zero_point"]) != (to["scale"], to["zero_point"]):
+        raise ValueError("PAD other than of H and W, or with a rescale")
+    _, H, W, C = ti["shape"]
+    _, Ho, Wo, _ = to["shape"]
+    z = to["zero_point"][0]
+    y = [z] * (Ho * Wo * C)
+    for r in range(H):
+        d0 = ((r + pd[2]) * Wo + pd[4]) * C
+        y[d0:d0 + W * C] = x[r * W * C:(r + 1) * W * C]
+    return y
+
+
+def from_tensor(tf, start):
+    """the model from tensor `start` on: start as its input, the ops that read only it, constants and their outputs
+    (a CPU head such as QUANTIZE or CAST left out)"""
+    T = tf["tensors"]
+    have, ops = {start}, []
+    for o in tf["ops"]:
+        if all(t < 0 or t in have or (T[t]["data"] and t not in have) for t in o["inputs"]) and \
+                any(t in have for t in o["inputs"]):
+            ops.append(o)
+            have |= set(o["outputs"])
+    return dict(tf, ops=ops, inputs=[start])
+
+
+def real_add(tf, o, a, b):
+    """ADD in real arithmetic with one rounding: z_out + round half away ((s_a (a - z_a) + s_b (b - z_b)) / s_out),
+    the float32 scales exact: the ideal both TFLite's kernel and any NPU lowering approximate"""
+    T = tf["tensors"]
+    (za, zb, zo), (sa, sb, so), dt = _add_quant(T, o)
+    u = 128 if dt == "int8" else 0
+    fa, fb, fo = (Fraction(_f32(float(v))) for v in (sa, sb, so))
+    lo, hi = _act_range(o["opt"].get("act", "none"), zo - u, so, dt)
+    return [min(hi, max(lo, npunet.rnd((fa * (p + u - za) + fb * (q + u - zb)) / fo, "half_away") + zo - u))
+            for p, q in zip(a, b)]
+
+
+def pow2_add(tf, o, a, b):
+    """the power-of-two alternative at its best (docs/format/add.md 6): each input requantised by a conv to zero point
+    0 at the common scale 2^-n, the smallest power of two that holds both ranges in int8 (round half away), NPUC's
+    Eltwise sum at 2^-m holding the sum's range (the harness's G arithmetic: saturate(round(...))), then a conv
+    requantising to the ADD's output: three roundings, the multipliers exact (NPUC's 8-bit slope not counted)"""
+    T = tf["tensors"]
+    (za, zb, zo), (sa, sb, so), dt = _add_quant(T, o)
+    u = 128 if dt == "int8" else 0
+    fa, fb, fo = (Fraction(_f32(float(v))) for v in (sa, sb, so))
+    ra_, rb_ = max(za, 255 - za), max(zb, 255 - zb)
+    p2 = lambda x: Fraction(2) ** math.ceil(math.log2(float(x)))
+    si = p2(max(fa * ra_, fb * rb_) / 127)
+    se = p2((fa * ra_ + fb * rb_) / 127)
+    lo, hi = _act_range(o["opt"].get("act", "none"), zo - u, so, dt)
+    sat = lambda v: min(127, max(-128, v))
+    y = []
+    for p, q in zip(a, b):
+        a1 = sat(npunet.rnd(fa * (p + u - za) / si, "half_away"))
+        b1 = sat(npunet.rnd(fb * (q + u - zb) / si, "half_away"))
+        e = sat(npunet.rnd((a1 + b1) * si / se, "half_away"))
+        y.append(min(hi, max(lo, npunet.rnd(e * se / fo, "half_away") + zo - u)))
+    return y
+
+
+def tflref(tf, x, stop=None, add=None, seen=None, npuc_convs=False):
     """the model's int values for its input values (NHWC lists of ints); stop: a tensor index to return instead of
-    the output"""
+    the output; add: the ADD's arithmetic (tfl_add, TFLite's; conv_add, npunet's --add-as-conv); seen(o, a, b, y): a
+    hook called with every ADD's inputs and output; npuc_convs: every conv with NPUC's 8-bit multiplier"""
     T = tf["tensors"]
     vals = {tf["inputs"][0]: list(x)}
     for o in tf["ops"]:
@@ -312,14 +447,20 @@ def tflref(tf, x, stop=None):
         src = vals.get(o["inputs"][0])
         if src is None:
             raise ValueError("%s reads tensor %d before it is computed" % (op, o["inputs"][0]))
-        if op == "CONV_2D":
-            y = _conv(tf, o, src, False)
+        if op == "ADD":
+            y = (add or tfl_add)(tf, o, src, vals[o["inputs"][1]])
+            if seen:
+                seen(o, src, vals[o["inputs"][1]], y)
+        elif op == "CONV_2D":
+            y = _conv(tf, o, src, False, npuc_convs)
         elif op == "DEPTHWISE_CONV_2D":
-            y = _conv(tf, o, src, True)
+            y = _conv(tf, o, src, True, npuc_convs)
         elif op in ("AVERAGE_POOL_2D", "MAX_POOL_2D"):
             y = _pool(tf, o, src, op == "AVERAGE_POOL_2D")
         elif op == "RESHAPE":
             y = list(src)
+        elif op == "PAD":
+            y = _pad(tf, o, src)
         elif op == "FULLY_CONNECTED":
             y = _fc(tf, o, src)
         else:
@@ -403,6 +544,86 @@ def cmd_person(a):
         print("%s: mean |diff| %.2f LSB of the logits, top-1 = TFLite's on %d of %d inputs" % (k, sm / (2 * n), same, n))
 
 
+# ---- ADD with any scales: npunet's --add-as-conv against TFLite's ADD ------------------------------------------------
+def model_input(tf, kind, seed=0):
+    """an input in the model's dtype: "person" (TFLM's person.bmp, nearest-resized, gray in every channel) or seeded
+    uniform noise"""
+    ti = tf["tensors"][tf["inputs"][0]]
+    _, H, W, C = ti["shape"]
+    signed = ti["dtype"] == "int8"
+    if kind == "person":
+        g = bmp_gray(model_path("person_detect.person.bmp"))
+        px = [g[(y * 96 // H) * 96 + x * 96 // W] for y in range(H) for x in range(W)]
+        return [v - 128 if signed else v for v in px for _ in range(C)]
+    r = random.Random(seed)
+    return [r.randrange(-128, 128) if signed else r.randrange(256) for _ in range(H * W * C)]
+
+
+def cmd_addcheck(a):
+    """per ADD and at the cut, each ADD arithmetic against TFLite's (tfl_add), the rest of the model TFLite's: npunet's
+    --add-as-conv (conv_add), the exact real sum (real_add) and the power-of-two alternative (pow2_add)"""
+    tf = npunet.read_tflite(open(a.model, "rb").read())
+    T = tf["tensors"]
+    if a.input is not None:
+        tf = from_tensor(tf, int(a.input) if a.input.isdigit() else next(i for i, t in enumerate(T) if t["name"] == a.input))
+    stop = None
+    if a.output is not None:
+        stop = int(a.output) if a.output.isdigit() else next(i for i, t in enumerate(T) if t["name"] == a.output)
+        tf = npunet.tflite_cut(tf, stop)
+        stop = tf["outputs"][0]
+    adds = [o for o in tf["ops"] if o["op"] == "ADD"]
+    impls = [("conv", conv_add), ("real", real_add), ("pow2", pow2_add)][:3 if a.all else 1]
+    per = {(k, id(o)): [0, 0, 0] for k, _ in impls for o in adds}        # values, differing, max |d|
+
+    def seen(o, x, y_, want):
+        for k, f in impls:
+            d = [abs(g - w) for g, w in zip(f(tf, o, x, y_), want)]
+            st = per[k, id(o)]
+            st[0] += len(d)
+            st[1] += sum(1 for v in d if v)
+            st[2] = max(st[2], max(d))
+    inputs = [("person", model_input(tf, "person"))] + [("random%d" % k, model_input(tf, "random", k))
+                                                         for k in range(a.inputs)]
+    tot = {k: [0, 0, 0, 0] for k, _ in impls}
+    print("addcheck %s: %d ADDs up to tensor %d %r %s" % (os.path.basename(a.model), len(adds), tf["outputs"][0],
+                                                       T[tf["outputs"][0]]["name"][:60], T[tf["outputs"][0]]["shape"]))
+    per_tensor = all(len(set(T[o["inputs"][1]]["scale"])) == 1 for o in tf["ops"]
+                     if o["op"] in ("CONV_2D", "DEPTHWISE_CONV_2D"))
+    runs = impls + ([("npuc", None)] if a.all and per_tensor else [])
+    tot.update({k: [0, 0, 0, 0] for k, _ in runs})
+    for name, x in inputs:
+        want = tflref(tf, x, seen=seen)
+        for k, f in runs:
+            y = tflref(tf, x, npuc_convs=True) if k == "npuc" else tflref(tf, x, add=f)
+            d = [abs(g - w) for g, w in zip(y, want)]
+            nd = sum(1 for v in d if v)
+            t_ = tot[k]
+            t_[0] += len(d)
+            t_[1] += nd
+            t_[2] = max(t_[2], max(d))
+            t_[3] += sum(d)
+            print("  %-8s %-4s at the cut: %d of %d values differ (%.3f %%), max |d| %d LSB, mean |d| %.4f LSB" % (
+                name, k, nd, len(d), 100.0 * nd / len(d), max(d), sum(d) / len(d)))
+    for j, o in enumerate(adds):
+        (za, zb, zo), (sa, sb, so), _ = _add_quant(T, o)
+        print("  ADD %2d %-36s s_a/s_o %.4f s_b/s_o %.4f z %d %d %d:" % (j, T[o["outputs"][0]]["name"][-36:], sa / so,
+                                                                       sb / so, za, zb, zo) +
+              "".join(" %s %.3f %% (max %d)" % (k, 100.0 * per[k, id(o)][1] / per[k, id(o)][0], per[k, id(o)][2])
+                      for k, _ in impls))
+    if "npuc" in tot:
+        t_ = tot["npuc"]
+        print("addcheck npuc: TFLite's ADDs, every conv with NPUC's 8-bit multiplier (for scale): at the cut: %d of %d "
+              "(%.3f %%), max |d| %d, mean |d| %.4f LSB" % (t_[1], t_[0], 100.0 * t_[1] / t_[0], t_[2], t_[3] / t_[0]))
+    for k, _ in impls:
+        n = sum(per[k, id(o)][0] for o in adds)
+        nd = sum(per[k, id(o)][1] for o in adds)
+        t_ = tot[k]
+        print("addcheck %s: every ADD alone: %d of %d values differ (%.3f %%), max |d| %d; at the cut: %d of %d "
+              "(%.3f %%), max |d| %d, mean |d| %.4f LSB" % (
+                  k, nd, n, 100.0 * nd / max(n, 1), max([per[k, id(o)][2] for o in adds] or [0]), t_[1], t_[0],
+                  100.0 * t_[1] / t_[0], t_[2], t_[3] / t_[0]))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="camera.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -416,6 +637,13 @@ def main(argv=None):
     p.add_argument("out")
     p.add_argument("--stop")
     p.set_defaults(fn=cmd_tflref)
+    p = sub.add_parser("addcheck")
+    p.add_argument("model")
+    p.add_argument("--output", help="cut the model at this tensor (index or name)")
+    p.add_argument("--input", help="start the model at this tensor (index or name): a CPU head left out")
+    p.add_argument("--inputs", type=int, default=2, help="seeded random inputs besides the person image")
+    p.add_argument("--all", action="store_true", help="also the exact real sum and the power-of-two alternative")
+    p.set_defaults(fn=cmd_addcheck)
     p = sub.add_parser("person")
     p.add_argument("--inputs", type=int, default=4)
     p.set_defaults(fn=cmd_person)

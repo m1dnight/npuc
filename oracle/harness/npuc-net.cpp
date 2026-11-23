@@ -28,9 +28,13 @@
 //        two different blobs of the same C x H x W; Caffe type "Eltwise". NPUC's Eltwise adds by powers of two only:
 //        every scale must be 2^-n (n = its fractional length, given to NPUC through the hook below) and the three zero
 //        points equal (no zero-point term: quant 3 with zero points 0 is the meaningful case)
-//   concat <name> 1 <n> <in1> ... <in_n> <out scale hex> <out zp>
+//   concat <name> 1 <n> <in1> ... <in_n> <out scale hex> <out zp> [mixed]
 //        channel concatenation (NCHW axis 1, the only one NPUC does), H and W equal; Caffe type "Concat",
-//        nn-eden-drv's ConcatAttr; NPUC places each input as a channel slice, in this order, without rescaling
+//        nn-eden-drv's ConcatAttr; NPUC places each input as a channel slice, in this order, without rescaling.
+//        "mixed": the inputs keep their own quantisations (the bytes are placed as they are; NPUC reads no concat
+//        quantisation on this path) and the out scale and zero point are what its readers declare: npunet's lowering
+//        of an ADD with any scales, a 1x1 conv over the concatenation that weighs each input's channels on its own
+//        and takes the zero-point difference into its bias (docs/format/add.md)
 //   relu <name> <input> <ReLU|ReLU6>
 //        a standalone activation layer (Caffe type "ReLU"/"ReLU6"; NPUC makes it a 1x1 convolution)
 //   dwconv <name> <input> <stock|dwopt> <kh> <kw> <sh> <sw> <SAME|VALID> <act 0|1>
@@ -811,8 +815,15 @@ int main(int argc, char **argv)
 					ins.push_back(tk.str());
 				float so = tk.f32hex("out scale");
 				int zo = (int)tk.num(0, 255, "out zp");
+				// optional "mixed" (no keyword starts so): the inputs keep their own quantisations
+				const bool mixed = tk.more() && tk.t[tk.i] == "mixed";
+				if (mixed)
+					tk.i++;
 				for (auto &in : ins) {
-					qin(tk, name, in, so, zo);  // the bytes are placed as they are: every input in the output's quantisation
+					if (!mixed)
+						qin(tk, name, in, so, zo);  // the bytes are placed as they are: every input in the output's quantisation
+					else if (ver >= 2 && !bq.count(in))
+						tk.fail("concat " + name + ": input " + in + " has no quantisation yet (mixed: a layer's output)");
 					if (!layers.empty() && in == layers.front()->name)
 						tk.fail("concat " + name + ": input " + in + " is the network input (NPUC would write it straight "
 						        "into a channel slice, and its policy maker asserts \"DataNode id isn't found in the NNGraph "
@@ -827,7 +838,8 @@ int main(int argc, char **argv)
 				ca->outScale = {so};
 				attr = ca;
 				hasConcat = true;
-				snprintf(extra, sizeof extra, "axis %d, out scale %.9g zp %d", axis, (double)so, zo);
+				snprintf(extra, sizeof extra, "axis %d, out scale %.9g zp %d%s", axis, (double)so, zo,
+				         mixed ? ", mixed (each input keeps its own quantisation)" : "");
 			} else {
 				ins.push_back(tk.str());
 				type = tk.str();

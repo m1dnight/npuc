@@ -71,12 +71,13 @@ CORPUS = ([("f1-k%d" % k, "--in 16,16,8 --conv 8,%d" % k, "") for k in (1, 3, 5,
 GRELU = {"fixed": True, "robust": "robust", "npuc": False}
 
 
-def lower_model(path, quant=1, allow_none=False):
-    """lowered.json's dict for a model file: a lowered.json as it is, else npunet's lowering of the JSON or TFLite"""
+def lower_model(path, quant=1, allow_none=False, add_conv=False):
+    """lowered.json's dict for a model file: a lowered.json as it is, else npunet's lowering of the JSON or TFLite
+    (add_conv: npunet's --add-as-conv)"""
     d = json.load(open(path)) if path.endswith(".json") else None
     if d is not None and d.get("format") == "npu-lowered/1":
         return d
-    return npunet.load_model(path, quant, False, allow_none)
+    return npunet.load_model(path, quant, False, allow_none, add_conv=add_conv)
 
 
 def generate(low, grelu="fixed", ref_parts=None, fix_npuc=False):
@@ -158,9 +159,9 @@ def cmd_check(dirs, grelu="npuc"):
     return 0 if n and tot["pure"] == n else 2
 
 
-def cmd_gen(src, out, quant, allow_none, grelu, fix_npuc=False):
+def cmd_gen(src, out, quant, allow_none, grelu, fix_npuc=False, add_conv=False):
     """write the NCP of a model; 0, or 2 when a part refuses it"""
-    low = lower_model(src, quant, allow_none)
+    low = lower_model(src, quant, allow_none, add_conv)
     parts, whole, notes = generate(low, grelu=grelu, fix_npuc=fix_npuc)
     for x in notes:
         print("ncpgen: " + x)
@@ -213,6 +214,8 @@ def main(argv=None):
     p.add_argument("--allow-none", action="store_true")
     p.add_argument("--grelu", choices=GRELU, default="fixed")
     p.add_argument("--fix-npuc", action="store_true")
+    p.add_argument("--add-as-conv", action="store_true", help="npunet's lowering of an ADD with any scales "
+                   "(docs/format/add.md)")
     p = sub.add_parser("check", help="every part against NPUC's compiles")
     p.add_argument("dirs", nargs="*")
     p.add_argument("--grelu", choices=GRELU, default="npuc")   # NPUC's own bytes are compared: its own table
@@ -221,7 +224,7 @@ def main(argv=None):
     p.add_argument("--jobs", type=int, default=4)
     a = ap.parse_args(argv)
     if a.cmd == "gen":
-        return cmd_gen(a.model, a.out, a.quant, a.allow_none, a.grelu, a.fix_npuc)
+        return cmd_gen(a.model, a.out, a.quant, a.allow_none, a.grelu, a.fix_npuc, a.add_as_conv)
     if a.cmd == "check":
         return cmd_check(a.dirs, grelu=a.grelu)
     return cmd_corpus(a.dir, a.jobs)

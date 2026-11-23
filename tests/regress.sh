@@ -8,7 +8,9 @@
 # compiled network: ncpgen refuses them); zoo 1 (efficientdet-lite0-320-p4: a stride-2 stratum's partial sums NPUC
 # allocates beyond its weights' sub-batches; models/README.md "Camera resolutions"); graph-camera 1 (the fresh random set
 # at camera sizes, stream_graphs.py random <dir> 3000 40 --set camera: v3003, a pool stratum's output NPUC loads for its
-# first reader; frame.md 6.11). Every other set must be exact. Exit 0 when only those known misses remain.
+# first reader; frame.md 6.11); camera-add 4 (SSD MobileNet v2 and MobileDet cut with --add-as-conv: a layer-block that
+# needs a weight ring, a concat NPUC's forwarding keeps out of SRAM, both generated now but not exact; models/camera.md,
+# docs/format/add.md 7). Every other set must be exact. Exit 0 when only those known misses remain.
 # The sets are checked in parallel: REGRESS_JOBS (default: the CPU count).
 set -uo pipefail
 . "$(dirname "$0")/../oracle/env.sh"
@@ -18,7 +20,7 @@ if [ $# -gt 0 ]; then sets=("$@"); else
   mapfile -t sets < <(find . -mindepth 3 -name lowered.json -path '*/*/lowered.json' | sed 's|^\./||; s|/[^/]*/lowered.json$||' | sort -u)
 fi
 tot=0; ok=0; bad=0
-declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=1 [graph-camera]=1)
+declare -A KNOWN=([graph]=5 [graph-random2]=2 [grelu/r]=4 [zoo]=1 [graph-camera]=1 [camera-add]=4)
 J=${REGRESS_JOBS:-$(sysctl -n hw.ncpu 2> /dev/null || nproc 2> /dev/null || echo 4)}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 # one check per set, J at a time; the results are printed in the sets' order
